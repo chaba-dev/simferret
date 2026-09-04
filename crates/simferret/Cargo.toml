@@ -1,0 +1,10 @@
+[package]
+name = "simferret"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "simferret"
+path = "src/main.rs"

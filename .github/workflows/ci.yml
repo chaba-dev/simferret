@@ -10,15 +10,39 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    name: Validate repository
+  flake:
+    name: Flake
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
-      - name: Check flake
-        run: nix flake check
-      - name: Fetch locked Cargo dependencies
-        run: nix develop --command cargo fetch --locked
-      - name: Check shell syntax
-        run: bash -n .agents/dev .agents/setup
+      - run: nix flake check
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - run: nix develop --command cargo fmt --all -- --check
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - run: bash -n .agents/dev .agents/setup
+      - run: nix develop --command cargo clippy --workspace --all-targets --all-features -- --deny warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - run: nix develop --command cargo test --workspace --all-targets --all-features
