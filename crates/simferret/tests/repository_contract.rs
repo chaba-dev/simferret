@@ -133,8 +133,17 @@ fn implementation_ownership_and_development_entry_points_are_explicit() {
     assert!(index.contains("the implementation checklist must use exactly one"));
 
     let readme = normalized(&read("README.md"));
-    assert!(readme.contains(".agents/setup"));
-    assert!(readme.contains("nix develop"));
+    for command in [
+        "nix --extra-experimental-features 'nix-command flakes' develop",
+        "nix --extra-experimental-features 'nix-command flakes' flake check",
+        ".agents/dev cargo fmt --all -- --check",
+        ".agents/dev cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings",
+        ".agents/dev cargo test --locked --workspace --all-targets --all-features",
+        "bash -n .agents/dev .agents/setup",
+        ".agents/dev jj status",
+    ] {
+        assert!(readme.contains(command), "README must document {command}");
+    }
 }
 
 #[test]
@@ -146,7 +155,22 @@ fn setup_has_safe_platform_and_identity_boundaries() {
     assert!(setup.contains("git config --get user.name"));
     assert!(setup.contains("git config --get user.email"));
     assert!(!setup.contains("git show"));
-    assert!(setup.contains("if [[ \"$created_jj\" == true ]]"));
+    assert!(!setup.contains(".bash_profile"));
+    assert_eq!(setup.matches("jj metaedit --update-author").count(), 1);
+    assert!(normalized(&setup).contains(
+        "if [[ \"$created_jj\" == true ]]; then .agents/dev jj metaedit --update-author fi"
+    ));
+
+    let installation = setup
+        .find("if [[ ! -x \"$nix_bin\" ]]")
+        .expect("setup must guard Nix installation");
+    let platform = setup
+        .find("if [[ \"$(uname -s)\"")
+        .expect("setup must check the installer platform");
+    assert!(
+        platform > installation,
+        "platform guard must only gate installation"
+    );
 }
 
 #[test]

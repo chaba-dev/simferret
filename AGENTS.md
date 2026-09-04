@@ -16,7 +16,7 @@
 
 - Run repository tools through `.agents/dev` so they use the pinned Nix environment.
 - Keep the Rust toolchain version and extensions centralized in `flake.nix`; do not add a separate `rust-toolchain.toml`.
-- Before committing, run `nix flake check`, Cargo format, Clippy with warnings denied, tests, and shell syntax checks.
+- Before committing, run `nix --extra-experimental-features 'nix-command flakes' flake check`, Cargo format, Clippy with warnings denied, tests, and shell syntax checks.
 
 # RFDs
 

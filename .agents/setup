@@ -5,11 +5,6 @@ repo_root="$(cd "$(dirname "$BASH_SOURCE")/.." && pwd)"
 nix_version="2.35.1"
 nix_sha256="c3fe29778acaa93b5095ee66e36f11ec7c6a284c40970a24cc83ac4f04809db3"
 
-if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
-  echo ".agents/setup supports x86-64 Linux orbs only; install Nix manually on other platforms." >&2
-  exit 1
-fi
-
 if [[ -x "$HOME/.nix-profile/bin/nix" ]]; then
   nix_bin="$HOME/.nix-profile/bin/nix"
 elif command -v nix >/dev/null 2>&1; then
@@ -26,6 +21,11 @@ run_step() {
 }
 
 if [[ ! -x "$nix_bin" ]]; then
+  if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
+    echo ".agents/setup can install Nix only in x86-64 Linux orbs; install Nix before rerunning setup." >&2
+    exit 1
+  fi
+
   if [[ -e /nix ]]; then
     echo "/nix already exists but Nix is unavailable; refusing to change its ownership." >&2
     exit 1
@@ -50,19 +50,6 @@ if [[ -f "$HOME/.nix-profile/etc/profile.d/nix.sh" ]]; then
   # shellcheck disable=SC1091
   source "$HOME/.nix-profile/etc/profile.d/nix.sh"
 fi
-
-profile_begin="# BEGIN simferret Nix development shell"
-profile_end="# END simferret Nix development shell"
-touch "$HOME/.bash_profile"
-sed -i "\|$profile_begin|,\|$profile_end|d" "$HOME/.bash_profile"
-cat >> "$HOME/.bash_profile" <<EOF
-
-$profile_begin
-if [[ -z "\${IN_NIX_SHELL-}" && "\$PWD" == "$repo_root" && -x "$nix_bin" ]]; then
-  eval "\$("$nix_bin" --extra-experimental-features 'nix-command flakes' print-dev-env "$repo_root")"
-fi
-$profile_end
-EOF
 
 cd "$repo_root"
 run_step "Fetching locked Cargo dependencies through the Nix development shell" \
