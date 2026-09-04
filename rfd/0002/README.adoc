@@ -1,6 +1,6 @@
 :authors: Darwin Wu <tough.pasta0068@wunli88.com>
-:state: prediscussion
-:discussion:
+:state: discussion
+:discussion: https://github.com/chaba-dev/simferret/pull/1
 :labels: proof-of-concept, replay, qemu, testing
 
 = RFD 2 Minimal deterministic simulation proof of concept

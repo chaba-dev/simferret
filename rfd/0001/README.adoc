@@ -1,6 +1,6 @@
 :authors: Darwin Wu <tough.pasta0068@wunli88.com>
-:state: prediscussion
-:discussion:
+:state: discussion
+:discussion: https://github.com/chaba-dev/simferret/pull/1
 :labels: architecture, determinism, qemu, rust
 
 = RFD 1 Deterministic execution architecture
