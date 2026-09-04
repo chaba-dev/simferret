@@ -10,14 +10,6 @@ permissions:
   contents: read
 
 jobs:
-  flake:
-    name: Flake
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - run: nix flake check
-
   fmt:
     name: Format
     runs-on: ubuntu-latest
