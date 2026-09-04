@@ -17,6 +17,19 @@ fn normalized(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn adoc_section(text: &str, title: &str) -> String {
+    let heading = format!("== {title}");
+    let lines = text
+        .lines()
+        .skip_while(|line| *line != heading)
+        .skip(1)
+        .take_while(|line| !line.starts_with("== "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!lines.is_empty(), "missing AsciiDoc section: {title}");
+    normalized(&lines)
+}
+
 #[test]
 fn rfd_index_metadata_and_checklists_are_consistent() {
     let root = repository_root();
@@ -84,21 +97,29 @@ fn implementation_checklists_use_phase_terminology() {
 
 #[test]
 fn replay_contract_identifies_builds_outage_and_semantic_outcome() {
-    let architecture = normalized(&read("rfd/0001/README.adoc"));
+    let architecture = read("rfd/0001/README.adoc");
+    let identity = adoc_section(&architecture, "Replay identity");
     assert!(
-        architecture.contains(
+        identity.contains(
             "SimFerret and QEMU executable digests or immutable Nix derivation identities"
         )
     );
 
-    let proof_of_concept = normalized(&read("rfd/0002/README.adoc"));
-    assert!(
-        proof_of_concept
-            .contains("at least one request attempt occurs while the server is stopped")
-    );
-    assert!(proof_of_concept.contains("matching content-addressed external QEMU"));
-    assert!(proof_of_concept.contains("semantic outcome digest"));
-    assert!(!proof_of_concept.contains("final state digest"));
+    let proof_of_concept = read("rfd/0002/README.adoc");
+    for section in ["Assertions", "Acceptance criteria"] {
+        let outage = adoc_section(&proof_of_concept, section);
+        assert!(outage.contains("request attempt"));
+        assert!(outage.contains("server is stopped"));
+        assert!(outage.contains("failed or unavailable"));
+    }
+
+    let determinism = adoc_section(&proof_of_concept, "Determinism contract");
+    assert!(determinism.contains("semantic outcome digest"));
+    assert!(!determinism.contains("final state digest"));
+
+    let artifacts = adoc_section(&proof_of_concept, "Artifacts");
+    assert!(artifacts.contains("matching content-addressed external QEMU"));
+    assert!(artifacts.contains("semantic outcome digest"));
 }
 
 #[test]
@@ -125,6 +146,7 @@ fn setup_has_safe_platform_and_identity_boundaries() {
     assert!(setup.contains("git config --get user.name"));
     assert!(setup.contains("git config --get user.email"));
     assert!(!setup.contains("git show"));
+    assert!(setup.contains("if [[ \"$created_jj\" == true ]]"));
 }
 
 #[test]
@@ -132,11 +154,16 @@ fn ci_actions_are_pinned_and_cargo_checks_are_locked() {
     let ci = read(".github/workflows/ci.yml");
     let commits = read(".github/workflows/commits.yml");
 
+    let mut action_count = 0;
     for workflow in [&ci, &commits] {
         for line in workflow.lines().map(str::trim) {
-            let Some(action) = line.strip_prefix("- uses: ") else {
+            let Some(action) = line
+                .strip_prefix("- uses: ")
+                .or_else(|| line.strip_prefix("uses: "))
+            else {
                 continue;
             };
+            action_count += 1;
             let revision = action
                 .split_once('@')
                 .unwrap_or_else(|| panic!("action must include a revision: {action}"))
@@ -154,6 +181,7 @@ fn ci_actions_are_pinned_and_cargo_checks_are_locked() {
         }
     }
 
+    assert_eq!(action_count, 7, "test must inspect every action reference");
     assert_eq!(ci.matches("nix-2.35.1/install").count(), 3);
     assert!(ci.contains("cargo clippy --locked"));
     assert!(ci.contains("cargo test --locked"));

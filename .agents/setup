@@ -68,8 +68,10 @@ cd "$repo_root"
 run_step "Fetching locked Cargo dependencies through the Nix development shell" \
   .agents/dev cargo fetch --locked
 
+created_jj=false
 if [[ ! -d "$repo_root/.jj" ]]; then
   run_step "Initializing colocated Jujutsu repository" .agents/dev jj git init --colocate
+  created_jj=true
 fi
 
 if ! .agents/dev jj --ignore-working-copy root >/dev/null; then
@@ -103,4 +105,6 @@ if [[ -z "$jj_user_email" ]]; then
   .agents/dev jj config set --repo user.email "$git_user_email"
 fi
 
-.agents/dev jj metaedit --update-author
+if [[ "$created_jj" == true ]]; then
+  .agents/dev jj metaedit --update-author
+fi

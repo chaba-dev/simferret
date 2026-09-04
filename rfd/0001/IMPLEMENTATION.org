@@ -11,11 +11,13 @@ platform.
 
 * Repository foundation
 :PROPERTIES:
-:STATUS: IN_PROGRESS
+:STATUS: DONE
 :END:
 
 - [X] Create the Rust workspace and ~simferret~ binary target.
-- [ ] Implement the command-line contract in RFD 2 Phase 2.
+
+The command-line contract is implemented across RFD 2 Phase 2 for recording and
+Phase 3 for replay.
 
 * Delivery ownership
 

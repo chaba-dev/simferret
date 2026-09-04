@@ -17,8 +17,10 @@ Nix separately, then enter the environment with `nix develop`.
 Run repository commands through the development environment:
 
 ```shell
+nix flake check
 .agents/dev cargo fmt --all -- --check
 .agents/dev cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
 .agents/dev cargo test --locked --workspace --all-targets --all-features
+bash -n .agents/dev .agents/setup
 .agents/dev jj status
 ```

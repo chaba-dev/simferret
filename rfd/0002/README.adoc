@@ -92,7 +92,7 @@ The scenario defines three initial property forms:
   succeeds within a scenario-defined virtual-time or event bound.
 
 Assertion evaluation uses structured events rather than scraping human logs.
-The run fails when either property fails, a required event is absent, replay
+The run fails when any property fails, a required event is absent, replay
 diverges, QEMU exits unexpectedly, or the scenario exceeds its bound.
 
 == Artifacts
@@ -139,9 +139,10 @@ The proof of concept is complete when:
 == Excluded from the proof of concept
 
 The PoC does not support arbitrary customer images, Docker Compose, Kubernetes,
-multiple VMs, multiple virtual CPUs, KVM, external dependencies, custom device
-models, disk faults, network partitions, snapshot branching, reverse debugging,
-coverage guidance, distributed workers, or a web interface.
+multiple VMs, multiple virtual CPUs, KVM, uncontrolled external network or
+service dependencies, custom device models, disk faults, network partitions,
+snapshot branching, reverse debugging, coverage guidance, distributed workers,
+or a web interface.
 
 It is not a performance benchmark. TCG speed is recorded to establish a
 baseline but is not an acceptance criterion unless the scenario cannot complete
