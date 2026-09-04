@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Check flake
+        run: nix flake check
+      - name: Fetch locked Cargo dependencies
+        run: nix develop --command cargo fetch --locked
+      - name: Check shell syntax
+        run: bash -n .agents/dev .agents/setup

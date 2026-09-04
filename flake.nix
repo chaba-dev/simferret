@@ -28,7 +28,10 @@
         };
       in {
         devShells.default = pkgs.mkShell {
-          nativeBuildInputs = [ rustToolchain ];
+          nativeBuildInputs = [
+            rustToolchain
+            pkgs.jujutsu
+          ];
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
         };
       });
