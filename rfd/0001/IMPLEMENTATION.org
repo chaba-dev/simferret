@@ -1,0 +1,54 @@
+#+TITLE: RFD 0001 implementation checklist
+#+STARTUP: showall
+
+Implements [[file:README.adoc][RFD 1: Deterministic execution architecture]].
+
+* Objective
+
+Create the minimal repository and execution boundaries needed for the proof of
+concept in RFD 2 without prematurely implementing the later exploration
+platform.
+
+* Gate 0 — Toolchain feasibility
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Pin and record a QEMU version with TCG, ~icount~, record/replay, QMP, and
+  snapshot support.
+- [ ] Demonstrate that the selected QEMU build can record and replay a minimal
+  one-vCPU Linux guest on a supported development host.
+- [ ] List every configured device and verify whether its state-changing inputs
+  participate in QEMU record/replay.
+- [ ] Document licensing and distribution boundaries between the Rust control
+  plane and QEMU.
+
+* Gate 1 — Rust control-plane skeleton
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Create one Rust workspace and a minimal ~simferret~ CLI.
+- [ ] Represent a versioned scenario, run identity, choice plan, and normalized
+  event without introducing separate crates before their boundaries are needed.
+- [ ] Start, stop, and inspect QEMU through a narrow process and QMP adapter.
+- [ ] Ensure seeded choices use stable ordering and are independent of host wall
+  time and asynchronous task wake order.
+
+* Gate 2 — Reproducibility artifacts
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Persist the complete replay identity defined by the RFD.
+- [ ] Store the QEMU replay log, scenario, generated choice plan, guest events,
+  assertion results, and process logs under one run identifier.
+- [ ] Reject or explicitly mark incompatible replay inputs.
+- [ ] Emit one copy-and-paste command for replaying a recorded run.
+
+* Exit criteria
+
+- [ ] RFD 2 can depend only on these documented boundaries rather than invoking
+  QEMU throughout fixture or scenario code.
+- [ ] No custom VMM or broad QEMU fork exists without recorded evidence that an
+  upstream interface was insufficient.
