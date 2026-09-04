@@ -1,0 +1,160 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+fn repository_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repository root should exist")
+}
+
+fn read(relative: &str) -> String {
+    fs::read_to_string(repository_root().join(relative))
+        .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"))
+}
+
+fn normalized(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn rfd_index_metadata_and_checklists_are_consistent() {
+    let root = repository_root();
+    let rfd_root = root.join("rfd");
+    let index = read("rfd/README.adoc");
+
+    assert!(!rfd_root.join("README.md").exists());
+
+    for entry in fs::read_dir(&rfd_root).expect("rfd directory should be readable") {
+        let entry = entry.expect("RFD entry should be readable");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !entry.path().is_dir()
+            || name.len() != 4
+            || !name.chars().all(|character| character.is_ascii_digit())
+        {
+            continue;
+        }
+
+        let document = entry.path().join("README.adoc");
+        assert!(document.is_file(), "RFD {name} must use README.adoc");
+        assert!(
+            index.contains(&format!("link:{name}/README.adoc[")),
+            "RFD {name} must be linked from the index"
+        );
+
+        let implementation_count = ["IMPLEMENTATION.org", "IMPLEMENTATION.md"]
+            .iter()
+            .filter(|filename| entry.path().join(filename).is_file())
+            .count();
+        assert_eq!(
+            implementation_count, 1,
+            "RFD {name} must have exactly one implementation checklist"
+        );
+
+        let text = fs::read_to_string(document).expect("RFD document should be readable");
+        let state = text
+            .lines()
+            .find_map(|line| line.strip_prefix(":state: "))
+            .expect("RFD must declare state");
+        let discussion = text
+            .lines()
+            .find_map(|line| line.strip_prefix(":discussion:"))
+            .expect("RFD must declare discussion metadata")
+            .trim();
+        if state == "discussion" {
+            assert!(
+                discussion.starts_with("https://github.com/chaba-dev/simferret/pull/"),
+                "RFD {name} in discussion must link its pull request"
+            );
+        }
+    }
+}
+
+#[test]
+fn implementation_checklists_use_phase_terminology() {
+    for path in ["rfd/0001/IMPLEMENTATION.org", "rfd/0002/IMPLEMENTATION.org"] {
+        let text = read(path);
+        let has_gate = text
+            .split(|character: char| !character.is_ascii_alphabetic())
+            .any(|word| matches!(word.to_ascii_lowercase().as_str(), "gate" | "gates"));
+        assert!(!has_gate, "{path} must use phase terminology");
+    }
+}
+
+#[test]
+fn replay_contract_identifies_builds_outage_and_semantic_outcome() {
+    let architecture = normalized(&read("rfd/0001/README.adoc"));
+    assert!(
+        architecture.contains(
+            "SimFerret and QEMU executable digests or immutable Nix derivation identities"
+        )
+    );
+
+    let proof_of_concept = normalized(&read("rfd/0002/README.adoc"));
+    assert!(
+        proof_of_concept
+            .contains("at least one request attempt occurs while the server is stopped")
+    );
+    assert!(proof_of_concept.contains("matching content-addressed external QEMU"));
+    assert!(proof_of_concept.contains("semantic outcome digest"));
+    assert!(!proof_of_concept.contains("final state digest"));
+}
+
+#[test]
+fn implementation_ownership_and_development_entry_points_are_explicit() {
+    let implementation = normalized(&read("rfd/0001/IMPLEMENTATION.org"));
+    assert!(implementation.contains("[X] Create the Rust workspace"));
+    assert!(implementation.contains("RFD 2 owns implementation progress and evidence"));
+    assert!(!implementation.contains("Pin and record a QEMU version"));
+
+    let index = normalized(&read("rfd/README.adoc"));
+    assert!(index.contains("the implementation checklist must use exactly one"));
+
+    let readme = normalized(&read("README.md"));
+    assert!(readme.contains(".agents/setup"));
+    assert!(readme.contains("nix develop"));
+}
+
+#[test]
+fn setup_has_safe_platform_and_identity_boundaries() {
+    let setup = read(".agents/setup");
+    assert!(setup.contains("uname -s"));
+    assert!(setup.contains("uname -m"));
+    assert!(setup.contains("refusing to change its ownership"));
+    assert!(setup.contains("git config --get user.name"));
+    assert!(setup.contains("git config --get user.email"));
+    assert!(!setup.contains("git show"));
+}
+
+#[test]
+fn ci_actions_are_pinned_and_cargo_checks_are_locked() {
+    let ci = read(".github/workflows/ci.yml");
+    let commits = read(".github/workflows/commits.yml");
+
+    for workflow in [&ci, &commits] {
+        for line in workflow.lines().map(str::trim) {
+            let Some(action) = line.strip_prefix("- uses: ") else {
+                continue;
+            };
+            let revision = action
+                .split_once('@')
+                .unwrap_or_else(|| panic!("action must include a revision: {action}"))
+                .1
+                .split_whitespace()
+                .next()
+                .expect("action revision should exist");
+            assert_eq!(revision.len(), 40, "action must use a full commit SHA");
+            assert!(
+                revision
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit()),
+                "action must use a hexadecimal commit SHA"
+            );
+        }
+    }
+
+    assert_eq!(ci.matches("nix-2.35.1/install").count(), 3);
+    assert!(ci.contains("cargo clippy --locked"));
+    assert!(ci.contains("cargo test --locked"));
+}
