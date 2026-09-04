@@ -130,8 +130,8 @@ models, disk faults, network partitions, snapshot branching, reverse debugging,
 coverage guidance, distributed workers, or a web interface.
 
 It is not a performance benchmark. TCG speed is recorded to establish a
-baseline but is not an acceptance gate unless the scenario cannot complete in a
-practical development loop.
+baseline but is not an acceptance criterion unless the scenario cannot complete
+in a practical development loop.
 
 == Follow-up decision
 
@@ -144,5 +144,5 @@ none is selected by this RFD.
 
 == Implementation
 
-Delivery gates and evidence are tracked in
+Delivery phases and evidence are tracked in
 link:IMPLEMENTATION.org[RFD 2 implementation checklist].

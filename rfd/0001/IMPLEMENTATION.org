@@ -9,7 +9,7 @@ Create the minimal repository and execution boundaries needed for the proof of
 concept in RFD 2 without prematurely implementing the later exploration
 platform.
 
-* Gate 0 — Toolchain feasibility
+* Phase 0 — Toolchain feasibility
 :PROPERTIES:
 :STATUS: TODO
 :END:
@@ -23,7 +23,7 @@ platform.
 - [ ] Document licensing and distribution boundaries between the Rust control
   plane and QEMU.
 
-* Gate 1 — Rust control-plane skeleton
+* Phase 1 — Rust control-plane skeleton
 :PROPERTIES:
 :STATUS: TODO
 :END:
@@ -35,7 +35,7 @@ platform.
 - [ ] Ensure seeded choices use stable ordering and are independent of host wall
   time and asynchronous task wake order.
 
-* Gate 2 — Reproducibility artifacts
+* Phase 2 — Reproducibility artifacts
 :PROPERTIES:
 :STATUS: TODO
 :END:

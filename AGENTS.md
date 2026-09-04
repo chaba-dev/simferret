@@ -20,5 +20,5 @@
 
 # RFDs
 
-- Follow the lifecycle and source conventions in `rfd/README.md`.
+- Follow the lifecycle and source conventions in `rfd/README.adoc`.
 - Keep design documents in `rfd/NNNN/README.adoc` and implementation progress in the adjacent `IMPLEMENTATION.org` or `IMPLEMENTATION.md` file.

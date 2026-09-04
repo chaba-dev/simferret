@@ -11,12 +11,12 @@ surface.
 
 * Delivery rules
 
-Each gate records its commands and decisive output. A gate is complete only when
+Each phase records its commands and decisive output. A phase is complete only when
 its automated checks pass from a clean checkout in the documented environment.
 New platform features discovered during the PoC are deferred unless they are
 required by an acceptance criterion in the RFD.
 
-* Gate 0 — Manual QEMU replay spike
+* Phase 0 — Manual QEMU replay spike
 :PROPERTIES:
 :STATUS: TODO
 :END:
@@ -29,7 +29,7 @@ required by an acceptance criterion in the RFD.
 - [ ] Save exact commands, durations, versions, and output digests in an evidence
   document beside this checklist.
 
-* Gate 1 — Fixture and event protocol
+* Phase 1 — Fixture and event protocol
 :PROPERTIES:
 :STATUS: TODO
 :END:
@@ -43,7 +43,7 @@ required by an acceptance criterion in the RFD.
 - [ ] Add an intentional response-corruption mode that proves property failures
   propagate to a nonzero result.
 
-* Gate 2 — Rust record path
+* Phase 2 — Rust record path
 :PROPERTIES:
 :STATUS: TODO
 :END:
@@ -58,7 +58,7 @@ required by an acceptance criterion in the RFD.
 - [ ] Print a replay command and return an exit status derived from assertions
   and infrastructure health.
 
-* Gate 3 — Rust replay path
+* Phase 3 — Rust replay path
 :PROPERTIES:
 :STATUS: TODO
 :END:
@@ -70,7 +70,7 @@ required by an acceptance criterion in the RFD.
 - [ ] Compare normalized event, assertion, and final-state artifacts.
 - [ ] Prove two consecutive replays produce byte-identical semantic artifacts.
 
-* Gate 4 — Acceptance and evidence
+* Phase 4 — Acceptance and evidence
 :PROPERTIES:
 :STATUS: TODO
 :END:
