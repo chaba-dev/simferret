@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$BASH_SOURCE")/.." && pwd)"
+nix_bin="$HOME/.nix-profile/bin/nix"
+nix_version="2.35.1"
+nix_sha256="c3fe29778acaa93b5095ee66e36f11ec7c6a284c40970a24cc83ac4f04809db3"
+
+run_step() {
+  local label="$1"
+  shift
+  printf '\n==> %s\n' "$label"
+  time "$@"
+}
+
+if [[ ! -x "$nix_bin" ]]; then
+  run_step "Installing Nix $nix_version" bash -o errexit -o nounset -o pipefail -c '
+    tarball="$(mktemp)"
+    unpack_dir="$(mktemp -d)"
+    trap "rm -f \"$tarball\"; rm -rf \"$unpack_dir\"" EXIT
+    curl --fail --location --proto "=https" --tlsv1.2 \
+      "https://releases.nixos.org/nix/nix-'"$nix_version"'/nix-'"$nix_version"'-x86_64-linux.tar.xz" \
+      --output "$tarball"
+    echo "'"$nix_sha256"'  $tarball" | sha256sum --check --status
+    sudo install -d -m 0755 -o "$USER" -g "$(id -gn)" /nix
+    tar -xJf "$tarball" -C "$unpack_dir"
+    "$unpack_dir"/nix-'"$nix_version"'-x86_64-linux/install --no-daemon
+  '
+fi
+
+# The installer cannot change this script's environment.
+# shellcheck disable=SC1091
+source "$HOME/.nix-profile/etc/profile.d/nix.sh"
+
+profile_begin="# BEGIN simferret Nix development shell"
+profile_end="# END simferret Nix development shell"
+touch "$HOME/.bash_profile"
+sed -i "\|$profile_begin|,\|$profile_end|d" "$HOME/.bash_profile"
+cat >> "$HOME/.bash_profile" <<EOF
+
+$profile_begin
+if [[ -z "\${IN_NIX_SHELL-}" && "\$PWD" == "$repo_root" && -x "$nix_bin" ]]; then
+  eval "\$("$nix_bin" --extra-experimental-features 'nix-command flakes' print-dev-env "$repo_root")"
+fi
+$profile_end
+EOF
+
+cd "$repo_root"
+run_step "Fetching locked Cargo dependencies through the Nix development shell" \
+  .agents/dev cargo fetch --locked

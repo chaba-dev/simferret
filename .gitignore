@@ -1,0 +1,5 @@
+/target/
+/.direnv/
+**/*.rs.bk
+*.pdb
+rust-project.json
