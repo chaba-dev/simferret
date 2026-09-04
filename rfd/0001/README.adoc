@@ -64,10 +64,11 @@ clock time.
 
 A replay is identified by all inputs capable of changing guest execution:
 
-* SimFerret and QEMU versions;
+* SimFerret and QEMU executable digests or immutable Nix derivation identities,
+  plus their reported versions;
 * guest kernel, root filesystem, and application artifact digests;
-* QEMU machine, CPU, memory, firmware, and device configuration;
-* initial disk or VM snapshot;
+* QEMU machine, CPU, memory, firmware digest, and device configuration;
+* initial disk or VM snapshot digest;
 * QEMU record/replay log;
 * SimFerret scenario, seed, choice plan, and configuration.
 

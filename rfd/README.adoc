@@ -36,9 +36,9 @@ searchable topics. The document is the single source of truth for this metadata;
 the index intentionally does not duplicate it.
 
 Implementation progress lives separately in `rfd/NNNN/IMPLEMENTATION.org` or
-`rfd/NNNN/IMPLEMENTATION.md`; an RFD must have exactly one format. The RFD and
-checklist link to each other, keeping the design and decision record stable
-while implementation tasks are checked off.
+`rfd/NNNN/IMPLEMENTATION.md`; the implementation checklist must use exactly one
+of these formats. The RFD and checklist link to each other, keeping the design
+and decision record stable while implementation tasks are checked off.
 
 == States
 

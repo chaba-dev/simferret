@@ -61,8 +61,14 @@ assertion summary, artifact location, and replay command.
 The first execution records QEMU's nondeterministic event log and SimFerret's
 choice plan. Replay starts from the same recorded initial state and consumes
 those artifacts. It is successful only when it reaches normal termination and
-produces the same normalized guest-event sequence, assertion results, and final
-state digest.
+produces the same normalized guest-event sequence, assertion results, and
+semantic outcome digest.
+
+The QEMU replay log establishes reproduction of machine execution under the
+recorded replay identity. Byte-identical normalized event, assertion, and
+semantic outcome artifacts establish observable equivalence. The PoC does not
+claim that the semantic outcome digest represents all guest memory or device
+state.
 
 Timestamps, host process identifiers, temporary paths, and QEMU diagnostic
 noise are not semantic events and are excluded from comparison. Exclusions must
@@ -75,10 +81,13 @@ executions.
 
 == Assertions
 
-The scenario defines two initial property forms:
+The scenario defines three initial property forms:
 
 * safety: every successful response contains the request identifier and payload
   sent by the client;
+* controlled outage: at least one request attempt occurs while the server is
+  stopped and produces a failed or unavailable result within a scenario-defined
+  virtual-time or event bound;
 * bounded liveness: after the controlled restart, at least one matching request
   succeeds within a scenario-defined virtual-time or event bound.
 
@@ -88,7 +97,8 @@ diverges, QEMU exits unexpectedly, or the scenario exceeds its bound.
 
 == Artifacts
 
-Every run directory contains enough information to inspect and replay the run:
+Every run directory contains the run outputs and compatibility identities needed
+to inspect and request replay of the run:
 
 [source,text]
 ----
@@ -103,9 +113,11 @@ runs/<run-id>/
 ----
 
 The manifest records the full replay identity from RFD 1 and digests each
-artifact. The final state digest may initially cover normalized events and all
-explicitly serializable SimFerret state; expanding it to selected guest memory
-or device state is follow-up work if QEMU does not expose a practical digest.
+artifact. Replay also requires matching content-addressed external QEMU,
+firmware, guest-image, application, and initial-state artifacts; the PoC does
+not copy those large dependencies into every run directory. The semantic
+outcome digest covers normalized events and all explicitly serializable
+SimFerret state.
 
 == Acceptance criteria
 
@@ -113,6 +125,8 @@ The proof of concept is complete when:
 
 * one documented command builds or obtains the fixed guest image;
 * one command records the scenario without interactive steps;
+* at least one request attempt occurs while the server is stopped and reports a
+  bounded failed or unavailable result;
 * replay succeeds at least twice from the produced run directory;
 * each replay produces byte-identical normalized event and assertion artifacts;
 * changing the scenario seed changes the request or fault choice plan;

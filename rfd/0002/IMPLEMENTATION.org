@@ -39,7 +39,10 @@ required by an acceptance criterion in the RFD.
 - [ ] Define a versioned framed command and structured-event protocol for the
   controlled host/guest channel.
 - [ ] Define explicit normalization rules for non-semantic event fields.
-- [ ] Test safety and bounded-liveness assertion evaluation outside the VM.
+- [ ] Test safety, controlled-outage, and bounded-liveness assertion evaluation
+  outside the VM.
+- [ ] Require at least one request attempt while the server is stopped and a
+  bounded failed or unavailable result.
 - [ ] Add an intentional response-corruption mode that proves property failures
   propagate to a nonzero result.
 
@@ -54,7 +57,8 @@ required by an acceptance criterion in the RFD.
   sleeps controlling semantic choices.
 - [ ] Terminate and restart the server at an explicit recorded choice point.
 - [ ] Persist the manifest, scenario, choice plan, replay log, normalized events,
-  assertion results, and diagnostic logs atomically under one run identifier.
+  assertion results, semantic outcome digest, and diagnostic logs atomically
+  under one run identifier.
 - [ ] Print a replay command and return an exit status derived from assertions
   and infrastructure health.
 
@@ -67,7 +71,7 @@ required by an acceptance criterion in the RFD.
 - [ ] Launch QEMU from the recorded initial state in replay mode.
 - [ ] Detect early termination, hangs, surplus events, missing events, and event
   divergence with an actionable first-difference report.
-- [ ] Compare normalized event, assertion, and final-state artifacts.
+- [ ] Compare normalized event, assertion, and semantic outcome artifacts.
 - [ ] Prove two consecutive replays produce byte-identical semantic artifacts.
 
 * Phase 4 — Acceptance and evidence
@@ -77,6 +81,8 @@ required by an acceptance criterion in the RFD.
 
 - [ ] Automate the record-and-replay demonstration in a supported environment.
 - [ ] Verify a different seed changes the materialized request or fault plan.
+- [ ] Verify at least one request encounters the stopped server and reports a
+  bounded failed or unavailable result.
 - [ ] Verify artifact or replay-identity tampering is rejected.
 - [ ] Verify intentional fixture corruption fails its safety assertion and CLI
   exit status.
