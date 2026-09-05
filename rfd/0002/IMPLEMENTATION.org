@@ -18,15 +18,15 @@ required by an acceptance criterion in the RFD.
 
 * Phase 0 — Manual QEMU replay spike
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
-- [ ] Select and pin a QEMU version and minimal x86-64 Linux image.
-- [ ] Boot the image under TCG with one vCPU and no uncontrolled network or
+- [X] Select and pin a QEMU version and minimal x86-64 Linux image.
+- [X] Boot the image under TCG with one vCPU and no uncontrolled network or
   mutable host mounts.
-- [ ] Record and replay a fixed guest command using QEMU ~icount~ record/replay.
-- [ ] Verify replay twice and record any unsupported machine or device options.
-- [ ] Save exact commands, durations, versions, and output digests in an evidence
+- [X] Record and replay a fixed guest command using QEMU ~icount~ record/replay.
+- [X] Verify replay twice and record any unsupported machine or device options.
+- [X] Save exact commands, durations, versions, and output digests in an evidence
   document beside this checklist.
 
 * Phase 1 — Fixture and event protocol

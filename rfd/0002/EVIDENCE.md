@@ -1,0 +1,57 @@
+# RFD 2 evidence
+
+## Phase 0 — QEMU replay spike
+
+The phase 0 spike is automated by
+[`scripts/qemu-replay-smoke.sh`](../../scripts/qemu-replay-smoke.sh). The Nix
+flake pins QEMU, a Linux kernel, a static C compiler, `cpio`, and `gzip`. The
+script builds a diskless initramfs containing a single static `/init`, then
+boots it under TCG with one vCPU and these replay-relevant settings:
+
+```text
+-machine pc-i440fx-9.2,accel=tcg
+-cpu qemu64 -smp 1 -m 128M
+-nodefaults -no-user-config -display none -monitor none -serial stdio
+-no-reboot -net none
+-rtc base=2000-01-01T00:00:00,clock=vm
+-kernel <pinned-bzImage> -initrd <generated-initramfs>
+-append "console=ttyS0 quiet loglevel=0 panic=-1 nokaslr random.trust_cpu=off init=/init"
+-icount shift=auto,rr=<record|replay>,rrfile=<replay.bin>
+```
+
+Run it with:
+
+```shell
+.agents/dev ./scripts/qemu-replay-smoke.sh
+```
+
+The command records once, replays the same log twice, requires the guest marker
+`SIMFERRET_PHASE0_OK version=1`, and compares all three serial streams byte for
+byte. It writes executable versions, content digests, durations, serial output,
+and QEMU diagnostics to `.poc/qemu-replay-smoke/`.
+
+An x86-64 Linux run on 2026-09-05 passed with QEMU 11.1.0, Linux 6.18.49,
+and machine type `pc-i440fx-9.2`. Record time was 6.02 seconds; the two replay
+times were 10.07 and 10.02 seconds. The replay log was 6,211,724 bytes. The
+recording and both replay serial streams had the same SHA-256 digest:
+
+```text
+3771b23d96c0b8635c375ecb9e3c39664890e3dc7f5eb06a3317041799f25b66
+```
+
+The pinned kernel digest was
+`d4c2d110cb9b82dad81517cc2f1f3a46d0e31c8937237cf3df59eeffb3d7070b`.
+Two independent builds produced the same initramfs digest,
+`9d8e70a63441ae9a752259bc6a34bddc502c3318b8868b923245b76748da2f33`.
+The generated `evidence.txt` retains nanosecond durations and all artifact
+digests for each invocation.
+
+No block, network, audio, graphics, monitor, host filesystem, or mutable image
+device is present. This avoids the replay filters required by those device
+classes. Serial output is supported by QEMU record/replay. The machine type is
+explicit rather than using QEMU's moving `pc` alias.
+
+This evidence establishes only that the pinned QEMU/kernel/initramfs tuple can
+replay the fixed boot and guest action. It does not establish the RFD's later
+process-control, semantic-event, assertion, or replay-identity acceptance
+criteria.
