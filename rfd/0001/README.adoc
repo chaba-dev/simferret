@@ -1,0 +1,143 @@
+:authors: Darwin Wu <tough.pasta0068@wunli88.com>
+:state: discussion
+:discussion: https://github.com/chaba-dev/simferret/pull/1
+:labels: architecture, determinism, qemu, rust
+
+= RFD 1 Deterministic execution architecture
+
+== Goal
+
+Establish an architecture for running unmodified Linux software in a controlled
+environment where a recorded execution can be reproduced exactly. The first
+implementation should prove the determinism boundary with the least original
+hypervisor work while preserving a path toward state-space exploration.
+
+== Context
+
+Deterministic simulation testing needs three distinct capabilities:
+
+* deterministic execution and replay;
+* exploration of alternative inputs, schedules, and faults;
+* properties that identify invalid system states.
+
+FoundationDB obtains determinism by routing production actors through simulated
+time, network, storage, and process implementations. SimFerret instead aims to
+run software that was not designed for simulation. Its determinism boundary
+must therefore sit below the application and guest operating system.
+
+Antithesis demonstrates this model with a deterministic hypervisor, simulated
+devices, snapshots, guided exploration, and property checking. Reproducing that
+complete platform is not an appropriate first milestone. SimFerret first needs
+to establish that it can control and replay one small whole-system execution.
+
+== Proposal
+
+SimFerret uses Rust for its control plane and QEMU TCG for its initial execution
+engine. QEMU runs one x86-64 Linux guest with one virtual CPU. The Rust process
+starts and controls QEMU through its command-line and QMP interfaces, records
+the complete execution identity, and stores simulation events and results.
+
+The initial boundary is:
+
+[source,text]
+----
+Rust CLI and controller
+  -> scenario and deterministic choice plan
+  -> QMP and controlled guest input
+  -> QEMU TCG record/replay
+  -> one-vCPU Linux guest
+  -> application, workload, and checker processes
+----
+
+QEMU's instruction-counted record/replay mode supplies the first CPU, virtual
+time, interrupt, and supported-device replay implementation. SimFerret does not
+fork QEMU until a concrete missing hook is demonstrated. Any necessary QEMU
+changes remain narrow and are kept separate from the Rust control plane.
+
+The controller may use ordinary asynchronous Rust for process supervision and
+artifact I/O. Decisions that affect a scenario use an explicit seeded PRNG and
+stable ordering. They are materialized into a choice plan before or through a
+controlled input boundary rather than depending on host task wake order or wall
+clock time.
+
+== Replay identity
+
+A replay is identified by all inputs capable of changing guest execution:
+
+* SimFerret and QEMU executable digests or immutable Nix derivation identities,
+  plus their reported versions;
+* guest kernel, root filesystem, and application artifact digests;
+* QEMU machine, CPU, memory, firmware digest, and device configuration;
+* initial disk or VM snapshot digest;
+* QEMU record/replay log;
+* SimFerret scenario, seed, choice plan, and configuration.
+
+A seed alone is not an exact replay contract. It generates SimFerret's choices,
+while QEMU's replay log fixes the instruction positions and ordering of external
+events. SimFerret must reject or clearly mark a replay when its recorded
+identity does not match the available environment.
+
+== Ownership boundaries
+
+The Rust control plane owns scenario parsing, seeded choices, VM lifecycle,
+fault requests, artifacts, event normalization, assertions, and later
+exploration policy. QEMU owns guest CPU execution, virtual machine state, and
+record/replay of supported nondeterministic machine events. A small guest agent
+may translate controlled commands into process lifecycle operations and emit
+structured events, but it must not become an application-specific simulator.
+
+All host communication that can affect the guest is part of the deterministic
+input boundary. Uncontrolled external networks, host filesystems, entropy, and
+wall clocks are excluded from a replayable simulation.
+
+== Initial constraints
+
+The first implementation supports one host architecture, one QEMU version, one
+machine definition, one virtual CPU, and a minimal fixed Linux image. Device
+passthrough, accelerators, and host-mounted mutable filesystems are forbidden.
+These constraints reduce the number of execution paths that can escape QEMU's
+record/replay model.
+
+== Excluded from the first implementation
+
+The architecture does not initially include:
+
+* KVM, MSHV, or hardware-accelerated deterministic execution;
+* Cloud Hypervisor or a custom VMM;
+* arbitrary Docker Compose or Kubernetes deployments;
+* custom deterministic network or block devices;
+* snapshot-tree branching and distributed exploration workers;
+* coverage-guided or reinforcement-learning exploration;
+* time-travel debugging user interfaces;
+* performance, security, or compatibility claims for production use.
+
+These are possible later RFDs after the proof of concept establishes a measured
+baseline and identifies which QEMU facilities are sufficient.
+
+== Alternatives considered
+
+Cloud Hypervisor provides a smaller Rust VMM and useful snapshot and virtio
+boundaries, but currently relies on KVM or MSHV and does not provide deterministic
+CPU execution, instruction-counted virtual time, or whole-system record/replay.
+Choosing it first would make those mechanisms prerequisite to any simulation.
+
+A new Rust VMM would provide maximum control but requires implementing or
+integrating CPU execution, interrupt and timer semantics, deterministic devices,
+snapshots, and replay before validating the product model.
+
+Application-level simulation is much smaller and faster, as FoundationDB shows,
+but requires applications to adopt SimFerret-specific interfaces. That conflicts
+with the goal of running unmodified software.
+
+== Implementation
+
+Architecture setup and validation are tracked in
+link:IMPLEMENTATION.org[RFD 1 implementation checklist]. The first consumer of
+this architecture is link:../0002/README.adoc[RFD 2].
+
+== References
+
+* https://www.qemu.org/docs/master/system/replay.html[QEMU record/replay]
+* https://www.qemu.org/docs/master/devel/replay.html[QEMU record/replay internals]
+* https://antithesis.com/blog/deterministic_hypervisor/[Antithesis deterministic hypervisor overview]
+* https://apple.github.io/foundationdb/testing.html[FoundationDB simulation and testing]

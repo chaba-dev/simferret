@@ -2,9 +2,16 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$BASH_SOURCE")/.." && pwd)"
-nix_bin="$HOME/.nix-profile/bin/nix"
 nix_version="2.35.1"
 nix_sha256="c3fe29778acaa93b5095ee66e36f11ec7c6a284c40970a24cc83ac4f04809db3"
+
+if [[ -x "$HOME/.nix-profile/bin/nix" ]]; then
+  nix_bin="$HOME/.nix-profile/bin/nix"
+elif command -v nix >/dev/null 2>&1; then
+  nix_bin="$(command -v nix)"
+else
+  nix_bin="$HOME/.nix-profile/bin/nix"
+fi
 
 run_step() {
   local label="$1"
@@ -14,6 +21,16 @@ run_step() {
 }
 
 if [[ ! -x "$nix_bin" ]]; then
+  if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
+    echo ".agents/setup can install Nix only in x86-64 Linux orbs; install Nix before rerunning setup." >&2
+    exit 1
+  fi
+
+  if [[ -e /nix ]]; then
+    echo "/nix already exists but Nix is unavailable; refusing to change its ownership." >&2
+    exit 1
+  fi
+
   run_step "Installing Nix $nix_version" bash -o errexit -o nounset -o pipefail -c '
     tarball="$(mktemp)"
     unpack_dir="$(mktemp -d)"
@@ -28,23 +45,66 @@ if [[ ! -x "$nix_bin" ]]; then
   '
 fi
 
-# The installer cannot change this script's environment.
-# shellcheck disable=SC1091
-source "$HOME/.nix-profile/etc/profile.d/nix.sh"
-
-profile_begin="# BEGIN simferret Nix development shell"
-profile_end="# END simferret Nix development shell"
-touch "$HOME/.bash_profile"
-sed -i "\|$profile_begin|,\|$profile_end|d" "$HOME/.bash_profile"
-cat >> "$HOME/.bash_profile" <<EOF
-
-$profile_begin
-if [[ -z "\${IN_NIX_SHELL-}" && "\$PWD" == "$repo_root" && -x "$nix_bin" ]]; then
-  eval "\$("$nix_bin" --extra-experimental-features 'nix-command flakes' print-dev-env "$repo_root")"
+if [[ -f "$HOME/.nix-profile/etc/profile.d/nix.sh" ]]; then
+  # The installer cannot change this script's environment.
+  # shellcheck disable=SC1091
+  source "$HOME/.nix-profile/etc/profile.d/nix.sh"
 fi
-$profile_end
-EOF
 
 cd "$repo_root"
 run_step "Fetching locked Cargo dependencies through the Nix development shell" \
   .agents/dev cargo fetch --locked
+
+jj_user_name="$(.agents/dev jj config get user.name 2>/dev/null || true)"
+jj_user_email="$(.agents/dev jj config get user.email 2>/dev/null || true)"
+set_jj_user_name=false
+set_jj_user_email=false
+
+if [[ -z "$jj_user_name" ]]; then
+  jj_user_name="$(git config --get user.name 2>/dev/null || true)"
+  if [[ -z "$jj_user_name" ]]; then
+    echo "Configure Git or Jujutsu user.name before initializing Jujutsu." >&2
+    exit 1
+  fi
+  set_jj_user_name=true
+fi
+
+if [[ -z "$jj_user_email" ]]; then
+  jj_user_email="$(git config --get user.email 2>/dev/null || true)"
+  if [[ -z "$jj_user_email" ]]; then
+    echo "Configure Git or Jujutsu user.email before initializing Jujutsu." >&2
+    exit 1
+  fi
+  set_jj_user_email=true
+fi
+
+created_jj=false
+if [[ ! -d "$repo_root/.jj" ]]; then
+  run_step "Initializing colocated Jujutsu repository" .agents/dev jj git init --colocate
+  created_jj=true
+fi
+
+if ! .agents/dev jj --ignore-working-copy root >/dev/null; then
+  echo "Existing .jj metadata is invalid; repair it before rerunning setup." >&2
+  exit 1
+fi
+
+colocation_status="$(.agents/dev jj git colocation status)"
+if [[ "$colocation_status" != *"currently colocated"* ]]; then
+  echo "Existing .jj metadata is not colocated with Git; repair it before rerunning setup." >&2
+  exit 1
+fi
+
+if [[ "$set_jj_user_name" == true ]]; then
+  jj_user_name_toml="$(printf '%s' "$jj_user_name" | .agents/dev jq --raw-input --slurp .)"
+  .agents/dev jj config set --repo user.name "$jj_user_name_toml"
+fi
+
+if [[ "$set_jj_user_email" == true ]]; then
+  jj_user_email_toml="$(printf '%s' "$jj_user_email" | .agents/dev jq --raw-input --slurp .)"
+  .agents/dev jj config set --repo user.email "$jj_user_email_toml"
+fi
+
+if [[ "$created_jj" == true ]]; then
+  .agents/dev jj metaedit --update-author
+fi

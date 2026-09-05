@@ -1,0 +1,41 @@
+#+TITLE: RFD 0001 implementation checklist
+#+STARTUP: showall
+
+Implements [[file:README.adoc][RFD 1: Deterministic execution architecture]].
+
+* Objective
+
+Create the minimal repository and execution boundaries needed for the proof of
+concept in RFD 2 without prematurely implementing the later exploration
+platform.
+
+* Repository foundation
+:PROPERTIES:
+:STATUS: DONE
+:END:
+
+- [X] Create the Rust workspace and ~simferret~ binary target.
+
+The command-line contract is implemented across RFD 2 Phase 2 for recording and
+Phase 3 for replay.
+
+* Delivery ownership
+
+RFD 2 owns implementation progress and evidence for this architecture:
+
+* Toolchain feasibility and QEMU device replay support: RFD 2 Phase 0.
+* Fixture and controlled guest protocol: RFD 2 Phase 1.
+* Stable choices, process/QMP control, replay identity, and run artifacts:
+  RFD 2 Phase 2.
+* Compatibility validation and deterministic replay: RFD 2 Phase 3.
+* End-to-end acceptance evidence: RFD 2 Phase 4.
+
+Phase references above refer to
+[[file:../0002/IMPLEMENTATION.org][RFD 2's implementation checklist]].
+
+* Exit criteria
+
+- [ ] RFD 2 can depend only on these documented boundaries rather than invoking
+  QEMU throughout fixture or scenario code.
+- [ ] No custom VMM or broad QEMU fork exists without recorded evidence that an
+  upstream interface was insufficient.

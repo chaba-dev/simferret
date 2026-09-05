@@ -1,0 +1,165 @@
+:authors: Darwin Wu <tough.pasta0068@wunli88.com>
+:state: discussion
+:discussion: https://github.com/chaba-dev/simferret/pull/1
+:labels: proof-of-concept, replay, qemu, testing
+
+= RFD 2 Minimal deterministic simulation proof of concept
+
+== Goal
+
+Deliver a command-line proof of concept that records and exactly replays a small
+Linux execution containing a client, a server, a workload, a checker, and one
+controlled process failure. The result should answer whether the architecture
+in link:../0001/README.adoc[RFD 1] is a viable base for SimFerret before work
+begins on branching exploration or general application support.
+
+== Scenario
+
+The proof of concept uses a fixed minimal Linux guest with one virtual CPU. The
+guest contains a small TCP echo server, a workload client, a checker, and a
+SimFerret guest agent. These fixtures should be simple enough to audit and exist
+only to exercise orchestration rather than demonstrate a useful distributed
+system.
+
+For each generated operation, the client sends an opaque request identifier and
+payload. The server returns both unchanged. The checker asserts that every
+successful response matches its request and records progress as structured
+events.
+
+The scenario performs this sequence:
+
+. boot the guest and establish the controlled agent channel;
+. start the server, client, and checker;
+. execute a seed-derived finite request plan;
+. terminate the server at a recorded choice point;
+. observe bounded failed or unavailable requests;
+. restart the server;
+. observe a subsequent successful matching response;
+. finish the workload and emit assertion results.
+
+The failure validates process control and liveness checking without requiring a
+custom network or storage model. Network partitions, disk corruption, and
+durable state are intentionally later scenarios.
+
+== Command-line contract
+
+The intended interface is approximately:
+
+[source,shell]
+----
+simferret image build
+simferret run --scenario scenarios/echo-process-restart.toml --seed 42
+simferret replay runs/<run-id>
+----
+
+The exact command spelling may change during implementation, but record and
+replay remain separate operations. A successful run prints its run identifier,
+assertion summary, artifact location, and replay command.
+
+== Determinism contract
+
+The first execution records QEMU's nondeterministic event log and SimFerret's
+choice plan. Replay starts from the same recorded initial state and consumes
+those artifacts. It is successful only when it reaches normal termination and
+produces the same normalized guest-event sequence, assertion results, and
+semantic outcome digest.
+
+The QEMU replay log establishes reproduction of machine execution under the
+recorded replay identity. Byte-identical normalized event, assertion, and
+semantic outcome artifacts establish observable equivalence. The PoC does not
+claim that the semantic outcome digest represents all guest memory or device
+state.
+
+Timestamps, host process identifiers, temporary paths, and QEMU diagnostic
+noise are not semantic events and are excluded from comparison. Exclusions must
+be enumerated; the implementation may not silently discard a field merely
+because it differs.
+
+The PoC claims exact replay from a recorded run. It does not claim that running
+the same seed twice without the QEMU replay log produces instruction-identical
+executions.
+
+== Assertions
+
+The scenario defines three initial property forms:
+
+* safety: every successful response contains the request identifier and payload
+  sent by the client;
+* controlled outage: at least one request attempt occurs while the server is
+  stopped and produces a failed or unavailable result within a scenario-defined
+  virtual-time or event bound;
+* bounded liveness: after the controlled restart, at least one matching request
+  succeeds within a scenario-defined virtual-time or event bound.
+
+Assertion evaluation uses structured events rather than scraping human logs.
+The run fails when any property fails, a required event is absent, replay
+diverges, QEMU exits unexpectedly, or the scenario exceeds its bound.
+
+== Artifacts
+
+Every run directory contains the run outputs and compatibility identities needed
+to inspect and request replay of the run:
+
+[source,text]
+----
+runs/<run-id>/
+  manifest.json
+  scenario.toml
+  choices.json
+  replay.bin
+  events.jsonl
+  assertions.json
+  logs/
+----
+
+The manifest records the full replay identity from RFD 1 and digests every other
+run artifact; `manifest.json` does not contain its own digest. Replay also
+requires matching content-addressed external QEMU,
+firmware, guest-image, application, and initial-state artifacts; the PoC does
+not copy those large dependencies into every run directory. The semantic
+outcome digest covers normalized events and all explicitly serializable
+SimFerret state.
+
+== Acceptance criteria
+
+The proof of concept is complete when:
+
+* one documented command builds or obtains the fixed guest image;
+* one command records the scenario without interactive steps;
+* at least one request attempt occurs while the server is stopped and reports a
+  bounded failed or unavailable result;
+* replay succeeds at least twice from the produced run directory;
+* each replay produces byte-identical normalized event and assertion artifacts
+  and a matching semantic outcome digest;
+* changing the scenario seed changes the request or fault choice plan;
+* tampering with a replay identity or artifact is detected before or during
+  replay;
+* an intentionally violated fixture property produces a failing assertion and
+  nonzero CLI exit status;
+* the complete demonstration runs in a documented supported environment.
+
+== Excluded from the proof of concept
+
+The PoC does not support arbitrary customer images, Docker Compose, Kubernetes,
+multiple VMs, multiple virtual CPUs, KVM, uncontrolled external network or
+service dependencies, custom device models, disk faults, network partitions,
+snapshot branching, reverse debugging, coverage guidance, distributed workers,
+or a web interface.
+
+It is not a performance benchmark. TCG speed is recorded to establish a
+baseline but is not an acceptance criterion unless the scenario cannot complete
+in a practical development loop.
+
+== Follow-up decision
+
+Completion produces an evidence record covering replay fidelity, event-log and
+snapshot sizes, record and replay duration, unsupported QEMU devices or inputs,
+observed divergence, and operational friction. That evidence informs a new RFD
+choosing the next increment. Likely candidates are a deterministic network
+fault model, checkpoint branching, or packaging arbitrary container workloads;
+none is selected by this RFD.
+
+== Implementation
+
+Delivery phases and evidence are tracked in
+link:IMPLEMENTATION.org[RFD 2 implementation checklist].
