@@ -8,11 +8,8 @@ authoritative merely because it exists; its `state` says how it should be read.
 |===
 | RFD | Topic
 
-| link:0001/README.adoc[1: Deterministic execution architecture]
-| Rust control plane, QEMU/TCG execution boundary, replay identity, and initial exclusions
-
-| link:0002/README.adoc[2: Minimal deterministic simulation proof of concept]
-| A bounded record/replay demonstration with a toy client, server, and controlled process failure
+| link:0001/README.adoc[1: Deterministic execution proof of concept]
+| Rust/QEMU execution architecture and a bounded record/replay demonstration with a controlled process failure
 |===
 
 == Source format

@@ -25,7 +25,7 @@ assertions. QEMU owns deterministic machine execution and its replay log. All
 guest-affecting host input crosses a recorded boundary; uncontrolled network,
 host filesystems, entropy, and wall clocks are outside the initial replay
 contract. [RFD 1](rfd/0001/README.adoc) records the architecture and
-[RFD 2](rfd/0002/README.adoc) defines the bounded echo/restart proof of concept.
+defines the bounded echo/restart proof of concept.
 
 ## QEMU replay spike
 
