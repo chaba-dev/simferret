@@ -2,12 +2,12 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-output_dir="${SIMFERRET_POC_OUTPUT:-$repo_root/.poc/qemu-replay-smoke}"
+output_root="${SIMFERRET_POC_OUTPUT:-$repo_root/.poc/qemu-replay-smoke}"
 kernel="${SIMFERRET_KERNEL:-}"
 qemu="${QEMU_SYSTEM_X86_64:-qemu-system-x86_64}"
 cc="${CC:-cc}"
-replay_log="$output_dir/replay.bin"
-initramfs="$output_dir/initramfs.cpio.gz"
+qemu_timeout="${SIMFERRET_QEMU_TIMEOUT:-60s}"
+qemu_kill_after="${SIMFERRET_QEMU_KILL_AFTER:-5s}"
 
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
   echo "The phase 0 replay spike supports x86-64 Linux only." >&2
@@ -20,14 +20,18 @@ if [[ -z "$kernel" || ! -f "$kernel" ]]; then
   exit 1
 fi
 
-for command in "$qemu" "$cc" cpio gzip sha256sum timeout; do
+for command in "$qemu" "$cc" cpio gzip mktemp sha256sum timeout; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Required command not found: $command" >&2
     exit 1
   fi
 done
 
-rm -rf "$output_dir"
+umask 022
+mkdir -p "$output_root"
+output_dir="$(mktemp -d "$output_root/run.XXXXXXXX")"
+replay_log="$output_dir/replay.bin"
+initramfs="$output_dir/initramfs.cpio.gz"
 mkdir -p "$output_dir/rootfs/dev"
 
 "$cc" -static -Os -Wall -Wextra -Werror \
@@ -65,7 +69,8 @@ run_qemu() {
   local started finished
 
   started="$(date +%s%N)"
-  timeout 60 "$qemu" "${common_args[@]}" \
+  timeout --kill-after="$qemu_kill_after" "$qemu_timeout" \
+    "$qemu" "${common_args[@]}" \
     -icount "shift=auto,rr=$mode,rrfile=$replay_log" \
     >"$serial_log" 2>"$diagnostic_log"
   finished="$(date +%s%N)"

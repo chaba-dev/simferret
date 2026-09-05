@@ -30,7 +30,8 @@ Run it with:
 The command records once, replays the same log twice, requires the guest marker
 `SIMFERRET_PHASE0_OK version=1`, and compares all three serial streams byte for
 byte. It writes executable versions, content digests, durations, serial output,
-and QEMU diagnostics to `.poc/qemu-replay-smoke/`.
+and QEMU diagnostics to a fresh `run.*` directory under
+`.poc/qemu-replay-smoke/`; previous runs are preserved.
 
 An x86-64 Linux run on 2026-09-05 passed with QEMU 11.1.0, Linux 6.18.49,
 and machine type `pc-i440fx-9.2`. Record time was 6.02 seconds; the two replay
@@ -48,6 +49,13 @@ Two independent builds produced the same initramfs digest,
 `9d8e70a63441ae9a752259bc6a34bddc502c3318b8868b923245b76748da2f33`.
 The generated `evidence.txt` retains nanosecond durations and all artifact
 digests for each invocation.
+
+The runner fixes the build umask at `022` and regression tests verify identical
+initramfs hashes when callers use umasks `022` and `077`. The tests also verify
+that pre-existing output is preserved, mismatched replay bytes and missing guest
+markers fail, and a QEMU process that ignores `SIGTERM` is forcibly terminated.
+Linux CI executes both these focused checks and the real QEMU record/replay
+smoke test, retaining its diagnostics when a failure occurs.
 
 No block, network, audio, graphics, monitor, host filesystem, or mutable image
 device is present. This avoids the replay filters required by those device

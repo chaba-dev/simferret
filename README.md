@@ -39,9 +39,10 @@ On x86-64 Linux:
 .agents/dev ./scripts/qemu-replay-smoke.sh
 ```
 
-Artifacts are written to `.poc/qemu-replay-smoke/`. This spike validates the
-execution-engine boundary only; it does not yet implement the Rust controller,
-guest agent, process restart, or scenario assertions.
+Each invocation writes a fresh run directory under `.poc/qemu-replay-smoke/`
+without deleting earlier evidence. This spike validates the execution-engine
+boundary only; it does not yet implement the Rust controller, guest agent,
+process restart, or scenario assertions.
 
 ## Development
 
