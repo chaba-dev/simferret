@@ -1,5 +1,8 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -28,6 +31,29 @@ fn adoc_section(text: &str, title: &str) -> String {
         .join("\n");
     assert!(!lines.is_empty(), "missing AsciiDoc section: {title}");
     normalized(&lines)
+}
+
+struct TempDirectory(PathBuf);
+
+impl TempDirectory {
+    fn new() -> Self {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should follow the Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "simferret-repository-contract-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("temporary directory should be created");
+        Self(path)
+    }
+}
+
+impl Drop for TempDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]
@@ -120,6 +146,8 @@ fn replay_contract_identifies_builds_outage_and_semantic_outcome() {
     let artifacts = adoc_section(&proof_of_concept, "Artifacts");
     assert!(artifacts.contains("matching content-addressed external QEMU"));
     assert!(artifacts.contains("semantic outcome digest"));
+    assert!(artifacts.contains("digests every other run artifact"));
+    assert!(artifacts.contains("manifest.json` does not contain its own digest"));
 }
 
 #[test]
@@ -186,6 +214,64 @@ fn setup_has_safe_platform_and_identity_boundaries() {
     assert!(setup.contains("jq --raw-input --slurp"));
     assert!(setup.contains("config set --repo user.name \"$jj_user_name_toml\""));
     assert!(setup.contains("config set --repo user.email \"$jj_user_email_toml\""));
+
+    let flake = read("flake.nix");
+    assert!(flake.contains("pkgs.jq"));
+}
+
+#[test]
+fn jj_identity_values_round_trip_as_strings() {
+    let directory = TempDirectory::new();
+    let git = Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&directory.0)
+        .status()
+        .expect("git should run");
+    assert!(git.success(), "git init should succeed");
+
+    let jj = Command::new("jj")
+        .args(["git", "init", "--colocate"])
+        .current_dir(&directory.0)
+        .status()
+        .expect("jj should run");
+    assert!(jj.success(), "jj git init should succeed");
+
+    for (key, value) in [
+        ("user.name", "true"),
+        ("user.email", "\"quoted\"@example.invalid"),
+    ] {
+        let mut jq = Command::new("jq")
+            .args(["--raw-input", "--slurp", "."])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("jq should run");
+        jq.stdin
+            .take()
+            .expect("jq stdin should be piped")
+            .write_all(value.as_bytes())
+            .expect("identity should be written to jq");
+        let encoded = jq.wait_with_output().expect("jq should finish");
+        assert!(encoded.status.success(), "jq should encode identity");
+        let encoded = String::from_utf8(encoded.stdout).expect("jq output should be UTF-8");
+
+        let set = Command::new("jj")
+            .arg("-R")
+            .arg(&directory.0)
+            .args(["config", "set", "--repo", key, encoded.trim()])
+            .status()
+            .expect("jj config set should run");
+        assert!(set.success(), "jj should store encoded identity");
+
+        let get = Command::new("jj")
+            .arg("-R")
+            .arg(&directory.0)
+            .args(["config", "get", key])
+            .output()
+            .expect("jj config get should run");
+        assert!(get.status.success(), "jj should read encoded identity");
+        assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), value);
+    }
 }
 
 #[test]

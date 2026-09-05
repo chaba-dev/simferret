@@ -112,8 +112,9 @@ runs/<run-id>/
   logs/
 ----
 
-The manifest records the full replay identity from RFD 1 and digests each
-artifact. Replay also requires matching content-addressed external QEMU,
+The manifest records the full replay identity from RFD 1 and digests every other
+run artifact; `manifest.json` does not contain its own digest. Replay also
+requires matching content-addressed external QEMU,
 firmware, guest-image, application, and initial-state artifacts; the PoC does
 not copy those large dependencies into every run directory. The semantic
 outcome digest covers normalized events and all explicitly serializable
