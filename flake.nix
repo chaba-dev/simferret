@@ -32,8 +32,16 @@
             rustToolchain
             pkgs.jujutsu
             pkgs.jq
+          ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            pkgs.cpio
+            pkgs.gzip
+            pkgs.pkgsStatic.stdenv.cc
+            pkgs.qemu
           ];
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+          shellHook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+            export SIMFERRET_KERNEL="${pkgs.linuxPackages.kernel}/bzImage"
+          '';
         };
       });
 }

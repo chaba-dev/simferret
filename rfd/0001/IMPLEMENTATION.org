@@ -1,13 +1,13 @@
 #+TITLE: RFD 0001 implementation checklist
 #+STARTUP: showall
 
-Implements [[file:README.adoc][RFD 1: Deterministic execution architecture]].
+Implements [[file:README.adoc][RFD 1: Deterministic execution proof of concept]].
 
 * Objective
 
-Create the minimal repository and execution boundaries needed for the proof of
-concept in RFD 2 without prematurely implementing the later exploration
-platform.
+Prove exact record/replay of one bounded client/server execution with a
+controlled server restart, using the documented Rust/QEMU boundaries, before
+expanding SimFerret's application or fault surface.
 
 * Repository foundation
 :PROPERTIES:
@@ -16,26 +16,96 @@ platform.
 
 - [X] Create the Rust workspace and ~simferret~ binary target.
 
-The command-line contract is implemented across RFD 2 Phase 2 for recording and
-Phase 3 for replay.
+* Delivery rules
 
-* Delivery ownership
+Each phase records its commands and decisive output. A phase is complete only when
+its automated checks pass from a clean checkout in the documented environment.
+New platform features discovered during the PoC are deferred unless they are
+required by an acceptance criterion in the RFD.
 
-RFD 2 owns implementation progress and evidence for this architecture:
+* Phase 0 — Manual QEMU replay spike
+:PROPERTIES:
+:STATUS: DONE
+:END:
 
-* Toolchain feasibility and QEMU device replay support: RFD 2 Phase 0.
-* Fixture and controlled guest protocol: RFD 2 Phase 1.
-* Stable choices, process/QMP control, replay identity, and run artifacts:
-  RFD 2 Phase 2.
-* Compatibility validation and deterministic replay: RFD 2 Phase 3.
-* End-to-end acceptance evidence: RFD 2 Phase 4.
+- [X] Select and pin a QEMU version and minimal x86-64 Linux image.
+- [X] Boot the image under TCG with one vCPU and no uncontrolled network or
+  mutable host mounts.
+- [X] Record and replay a fixed guest command using QEMU ~icount~ record/replay.
+- [X] Verify replay twice and record any unsupported machine or device options.
+- [X] Save exact commands, durations, versions, and output digests in an evidence
+  document beside this checklist.
 
-Phase references above refer to
-[[file:../0002/IMPLEMENTATION.org][RFD 2's implementation checklist]].
+* Phase 1 — Fixture and event protocol
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Implement the minimal echo server, workload client, checker, and guest
+  agent.
+- [ ] Define a versioned framed command and structured-event protocol for the
+  controlled host/guest channel.
+- [ ] Define explicit normalization rules for non-semantic event fields.
+- [ ] Test safety, controlled-outage, and bounded-liveness assertion evaluation
+  outside the VM.
+- [ ] Require at least one request attempt while the server is stopped and a
+  bounded failed or unavailable result.
+- [ ] Add an intentional response-corruption mode that proves property failures
+  propagate to a nonzero result.
+
+* Phase 2 — Rust record path
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Parse the echo restart scenario and generate a stable choice plan from its
+  seed.
+- [ ] Keep QEMU command-line and QMP interaction behind one VM adapter rather
+  than invoking QEMU from fixture or scenario code.
+- [ ] Launch QEMU in record mode and drive the finite scenario without wall-clock
+  sleeps controlling semantic choices.
+- [ ] Terminate and restart the server at an explicit recorded choice point.
+- [ ] Persist the manifest, scenario, choice plan, replay log, normalized events,
+  assertion results, semantic outcome digest, and diagnostic logs atomically
+  under one run identifier.
+- [ ] Print a replay command and return an exit status derived from assertions
+  and infrastructure health.
+
+* Phase 3 — Rust replay path
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Validate artifact digests and environment compatibility before replay.
+- [ ] Launch QEMU from the recorded initial state in replay mode.
+- [ ] Detect early termination, hangs, surplus events, missing events, and event
+  divergence with an actionable first-difference report.
+- [ ] Compare normalized event, assertion, and semantic outcome artifacts.
+- [ ] Prove two consecutive replays produce byte-identical semantic artifacts.
+
+* Phase 4 — Acceptance and evidence
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Automate the record-and-replay demonstration in a supported environment.
+- [ ] Verify a different seed changes the materialized request or fault plan.
+- [ ] Verify at least one request encounters the stopped server and reports a
+  bounded failed or unavailable result.
+- [ ] Verify artifact or replay-identity tampering is rejected.
+- [ ] Verify intentional fixture corruption fails its safety assertion and CLI
+  exit status.
+- [ ] Record record/replay duration, artifact sizes, fidelity limitations, and
+  all observed divergence in ~EVIDENCE.adoc~.
+- [ ] Recommend one next increment without implementing it.
 
 * Exit criteria
 
-- [ ] RFD 2 can depend only on these documented boundaries rather than invoking
-  QEMU throughout fixture or scenario code.
-- [ ] No custom VMM or broad QEMU fork exists without recorded evidence that an
+- [ ] Every acceptance criterion in the RFD has linked automated or captured
+  evidence.
+- [ ] The PoC can be demonstrated from a clean checkout without undocumented
+  interactive setup.
+- [ ] The implementation uses the documented ownership boundaries rather than
+  invoking QEMU throughout fixture or scenario code.
+- [X] No custom VMM or broad QEMU fork exists without recorded evidence that an
   upstream interface was insufficient.
