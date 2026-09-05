@@ -55,6 +55,29 @@ cd "$repo_root"
 run_step "Fetching locked Cargo dependencies through the Nix development shell" \
   .agents/dev cargo fetch --locked
 
+jj_user_name="$(.agents/dev jj config get user.name 2>/dev/null || true)"
+jj_user_email="$(.agents/dev jj config get user.email 2>/dev/null || true)"
+set_jj_user_name=false
+set_jj_user_email=false
+
+if [[ -z "$jj_user_name" ]]; then
+  jj_user_name="$(git config --get user.name 2>/dev/null || true)"
+  if [[ -z "$jj_user_name" ]]; then
+    echo "Configure Git or Jujutsu user.name before initializing Jujutsu." >&2
+    exit 1
+  fi
+  set_jj_user_name=true
+fi
+
+if [[ -z "$jj_user_email" ]]; then
+  jj_user_email="$(git config --get user.email 2>/dev/null || true)"
+  if [[ -z "$jj_user_email" ]]; then
+    echo "Configure Git or Jujutsu user.email before initializing Jujutsu." >&2
+    exit 1
+  fi
+  set_jj_user_email=true
+fi
+
 created_jj=false
 if [[ ! -d "$repo_root/.jj" ]]; then
   run_step "Initializing colocated Jujutsu repository" .agents/dev jj git init --colocate
@@ -72,24 +95,12 @@ if [[ "$colocation_status" != *"currently colocated"* ]]; then
   exit 1
 fi
 
-jj_user_name="$(.agents/dev jj config get user.name 2>/dev/null || true)"
-jj_user_email="$(.agents/dev jj config get user.email 2>/dev/null || true)"
-if [[ -z "$jj_user_name" ]]; then
-  git_user_name="$(git config --get user.name 2>/dev/null || true)"
-  if [[ -z "$git_user_name" ]]; then
-    echo "Configure Git or Jujutsu user.name before committing." >&2
-    exit 1
-  fi
-  .agents/dev jj config set --repo user.name "$git_user_name"
+if [[ "$set_jj_user_name" == true ]]; then
+  .agents/dev jj config set --repo user.name "$jj_user_name"
 fi
 
-if [[ -z "$jj_user_email" ]]; then
-  git_user_email="$(git config --get user.email 2>/dev/null || true)"
-  if [[ -z "$git_user_email" ]]; then
-    echo "Configure Git or Jujutsu user.email before committing." >&2
-    exit 1
-  fi
-  .agents/dev jj config set --repo user.email "$git_user_email"
+if [[ "$set_jj_user_email" == true ]]; then
+  .agents/dev jj config set --repo user.email "$jj_user_email"
 fi
 
 if [[ "$created_jj" == true ]]; then

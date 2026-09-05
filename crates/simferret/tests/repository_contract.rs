@@ -161,15 +161,19 @@ fn setup_has_safe_platform_and_identity_boundaries() {
         "if [[ \"$created_jj\" == true ]]; then .agents/dev jj metaedit --update-author fi"
     ));
 
-    let installation = setup
-        .find("if [[ ! -x \"$nix_bin\" ]]")
-        .expect("setup must guard Nix installation");
-    let platform = setup
-        .find("if [[ \"$(uname -s)\"")
-        .expect("setup must check the installer platform");
+    assert!(normalized(&setup).contains(
+        "if [[ ! -x \"$nix_bin\" ]]; then if [[ \"$(uname -s)\" != \"Linux\" || \"$(uname -m)\" != \"x86_64\" ]]; then"
+    ));
+
+    let identity = setup
+        .find("jj_user_name=")
+        .expect("setup must resolve identity");
+    let initialization = setup
+        .find("jj git init --colocate")
+        .expect("setup must initialize Jujutsu");
     assert!(
-        platform > installation,
-        "platform guard must only gate installation"
+        identity < initialization,
+        "identity must precede JJ initialization"
     );
 }
 
