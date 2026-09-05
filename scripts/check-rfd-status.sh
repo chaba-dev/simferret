@@ -264,11 +264,14 @@ read_rfd() {
     ' "${source}"
 }
 
-printf "%s%-4s  %-13s  %5s  %-35s  %s%s\n" "${color_bold}" "RFD" "State" "Tasks" "Title" "Labels" "${color_reset}"
-printf "%s%-4s  %-13s  %5s  %-35s  %s%s\n" "${color_dim}" "----" "-------------" "-----" "-----------------------------------" "--------------------" "${color_reset}"
-
 failures=0
 found=0
+title_width=35
+row_numbers=()
+row_states=()
+row_tasks=()
+row_titles=()
+row_labels=()
 shopt -s nullglob
 entries=("${rfd_root}"/*)
 shopt -u nullglob
@@ -430,15 +433,30 @@ for entry in "${entries[@]}"; do
 	labels="${remainder%%$'\t'*}"; remainder="${remainder#*$'\t'}"
 	parser_errors="${remainder##*$'\t'}"
 	failures=$((failures + parser_errors))
-	state_field="$(printf '%-13s' "${state:-\(missing\)}")"
-	state_text="$(colorize_state "${state}" "${state_field}")"
-	printf "%-4s  %s  %5s  %-35s  %s\n" "${entry_name}" "${state_text}" "${task_summary}" "${title:-\(missing title\)}" "${labels:-\(missing labels\)}"
+	display_title="${title:-\(missing title\)}"
+	row_numbers+=("${entry_name}")
+	row_states+=("${state}")
+	row_tasks+=("${task_summary}")
+	row_titles+=("${display_title}")
+	row_labels+=("${labels:-\(missing labels\)}")
+	if [[ "${#display_title}" -gt "${title_width}" ]]; then
+		title_width="${#display_title}"
+	fi
 done
 
 if [[ "${found}" -eq 0 ]]; then
 	printf "%sno RFDs found%s in %s\n" "${color_red}" "${color_reset}" "${rfd_root}" >&2
 	exit 1
 fi
+
+printf "%s%-4s  %-13s  %5s  %-*s  %s%s\n" "${color_bold}" "RFD" "State" "Tasks" "${title_width}" "Title" "Labels" "${color_reset}"
+printf "%s%-4s  %-13s  %5s  %-*s  %s%s\n" "${color_dim}" "----" "-------------" "-----" "${title_width}" "$(printf '%*s' "${title_width}" '' | tr ' ' '-')" "--------------------" "${color_reset}"
+for ((i = 0; i < ${#row_numbers[@]}; i++)); do
+	state_field="$(printf '%-13s' "${row_states[i]:-\(missing\)}")"
+	state_text="$(colorize_state "${row_states[i]}" "${state_field}")"
+	printf "%-4s  %s  %5s  %-*s  %s\n" "${row_numbers[i]}" "${state_text}" "${row_tasks[i]}" "${title_width}" "${row_titles[i]}" "${row_labels[i]}"
+done
+
 if [[ "${failures}" -gt 0 ]]; then
 	echo
 	printf "%sRFD status check failed%s with %s issue(s).\n" "${color_red}" "${color_reset}" "${failures}" >&2
