@@ -165,16 +165,27 @@ fn setup_has_safe_platform_and_identity_boundaries() {
         "if [[ ! -x \"$nix_bin\" ]]; then if [[ \"$(uname -s)\" != \"Linux\" || \"$(uname -m)\" != \"x86_64\" ]]; then"
     ));
 
-    let identity = setup
-        .find("jj_user_name=")
-        .expect("setup must resolve identity");
     let initialization = setup
         .find("jj git init --colocate")
         .expect("setup must initialize Jujutsu");
-    assert!(
-        identity < initialization,
-        "identity must precede JJ initialization"
-    );
+    for failure in [
+        "Configure Git or Jujutsu user.name",
+        "Configure Git or Jujutsu user.email",
+    ] {
+        let failure = setup.find(failure).expect("setup must validate identity");
+        assert!(
+            failure < initialization,
+            "identity failures must precede JJ initialization"
+        );
+    }
+
+    let setup = normalized(&setup);
+    assert!(setup.contains(
+        "Existing .jj metadata is not colocated with Git; repair it before rerunning setup.\" >&2 exit 1 fi if [[ \"$set_jj_user_name\" == true ]]"
+    ));
+    assert!(setup.contains("jq --raw-input --slurp"));
+    assert!(setup.contains("config set --repo user.name \"$jj_user_name_toml\""));
+    assert!(setup.contains("config set --repo user.email \"$jj_user_email_toml\""));
 }
 
 #[test]

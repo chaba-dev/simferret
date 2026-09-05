@@ -96,11 +96,13 @@ if [[ "$colocation_status" != *"currently colocated"* ]]; then
 fi
 
 if [[ "$set_jj_user_name" == true ]]; then
-  .agents/dev jj config set --repo user.name "$jj_user_name"
+  jj_user_name_toml="$(printf '%s' "$jj_user_name" | .agents/dev jq --raw-input --slurp .)"
+  .agents/dev jj config set --repo user.name "$jj_user_name_toml"
 fi
 
 if [[ "$set_jj_user_email" == true ]]; then
-  .agents/dev jj config set --repo user.email "$jj_user_email"
+  jj_user_email_toml="$(printf '%s' "$jj_user_email" | .agents/dev jq --raw-input --slurp .)"
+  .agents/dev jj config set --repo user.email "$jj_user_email_toml"
 fi
 
 if [[ "$created_jj" == true ]]; then
