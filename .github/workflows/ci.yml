@@ -25,10 +25,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: make check-rfds
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
           install_url: https://releases.nixos.org/nix/nix-2.35.1/install
-      - run: bash -n .agents/dev .agents/setup
+      - run: bash -n .agents/dev .agents/setup scripts/*.sh
       - run: nix develop --command cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
 
   test:
@@ -40,6 +41,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: make check-rfds
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
           install_url: https://releases.nixos.org/nix/nix-2.35.1/install

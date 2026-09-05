@@ -37,8 +37,21 @@ the index intentionally does not duplicate it.
 
 Implementation progress lives separately in `rfd/NNNN/IMPLEMENTATION.org` or
 `rfd/NNNN/IMPLEMENTATION.md`; the implementation checklist must use exactly one
-of these formats. The RFD and checklist link to each other, keeping the design
-and decision record stable while implementation tasks are checked off.
+of these formats. Its first line is `#+TITLE: RFD NNNN implementation checklist`
+for Org or `# RFD NNNN implementation checklist` for Markdown. The checklist
+contains the standalone sentence `Implements [[file:README.adoc][...]].` for Org
+or `Implements [...](README.adoc).` for Markdown. The RFD links with
+`link:IMPLEMENTATION.org[...]` or
+`link:IMPLEMENTATION.md[...]`. The RFD and checklist thus link to each other,
+keeping the design and decision record stable while implementation tasks are
+checked off. The index at `rfd/README.adoc` links to every RFD with
+`link:NNNN/README.adoc[...]`.
+
+Checklist tasks use `-`, `+`, or `*` bullets followed by `[ ]`, `[x]`, `[X]`,
+or Org's partial `[-]` state. Only `[x]` and `[X]` count as complete. Markdown
+tasks may be indented by up to three spaces; four-space indentation is treated
+as code. Examples that resemble tasks belong in fenced Markdown blocks or Org
+`SRC` or `EXAMPLE` blocks so they are excluded from status totals.
 
 == States
 
