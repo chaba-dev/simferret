@@ -54,6 +54,9 @@ The runner fixes the build umask at `022` and regression tests verify identical
 initramfs hashes when callers use umasks `022` and `077`. The tests also verify
 that pre-existing output is preserved, mismatched replay bytes and missing guest
 markers fail, and a QEMU process that ignores `SIGTERM` is forcibly terminated.
+Timeout overrides must be finite and strictly positive; zero-valued overrides
+are rejected before QEMU starts. The forced-termination regression separately
+verifies that the runner returns status 137 before its outer watchdog expires.
 Linux CI executes both these focused checks and the real QEMU record/replay
 smoke test, retaining its diagnostics when a failure occurs.
 

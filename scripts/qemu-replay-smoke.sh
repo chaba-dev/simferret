@@ -9,10 +9,24 @@ cc="${CC:-cc}"
 qemu_timeout="${SIMFERRET_QEMU_TIMEOUT:-60s}"
 qemu_kill_after="${SIMFERRET_QEMU_KILL_AFTER:-5s}"
 
+validate_positive_duration() {
+  local name="$1"
+  local value="$2"
+  local pattern='^(([0-9]*[1-9][0-9]*)(\.[0-9]+)?|0*\.[0-9]*[1-9][0-9]*)[smhd]?$'
+
+  if [[ ! "$value" =~ $pattern ]]; then
+    echo "$name must be a finite, positive duration (for example, 5s or 0.1s)." >&2
+    exit 1
+  fi
+}
+
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
   echo "The phase 0 replay spike supports x86-64 Linux only." >&2
   exit 1
 fi
+
+validate_positive_duration SIMFERRET_QEMU_TIMEOUT "$qemu_timeout"
+validate_positive_duration SIMFERRET_QEMU_KILL_AFTER "$qemu_kill_after"
 
 if [[ -z "$kernel" || ! -f "$kernel" ]]; then
   echo "SIMFERRET_KERNEL must name the pinned x86-64 Linux bzImage." >&2

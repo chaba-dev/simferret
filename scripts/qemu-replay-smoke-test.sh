@@ -18,6 +18,10 @@ if [[ "${1:-}" == "--version" ]]; then
   exit 0
 fi
 
+if [[ -n "${FAKE_QEMU_STARTED_FILE:-}" ]]; then
+  touch "$FAKE_QEMU_STARTED_FILE"
+fi
+
 mode=""
 replay_log=""
 for argument in "$@"; do
@@ -89,19 +93,48 @@ if run_smoke "$test_root/missing-marker" FAKE_QEMU_BEHAVIOR=missing-marker; then
   exit 1
 fi
 
+for zero_duration in \
+  SIMFERRET_QEMU_TIMEOUT=0 \
+  SIMFERRET_QEMU_KILL_AFTER=0; do
+  started_file="$test_root/${zero_duration%%=*}.started"
+  if run_smoke "$test_root/zero-duration" \
+    FAKE_QEMU_STARTED_FILE="$started_file" "$zero_duration"; then
+    echo "$zero_duration unexpectedly passed" >&2
+    exit 1
+  fi
+  if [[ -e "$started_file" ]]; then
+    echo "$zero_duration started QEMU before validation" >&2
+    exit 1
+  fi
+done
+
+timeout_status_file="$test_root/timeout.status"
 set +e
-timeout --kill-after=1s 3s env \
+# The child shell expands the exported command and status-file paths.
+# shellcheck disable=SC2016
+SMOKE="$smoke" \
+STATUS_FILE="$timeout_status_file" \
   SIMFERRET_KERNEL="$kernel" \
   SIMFERRET_POC_OUTPUT="$test_root/timeout" \
   SIMFERRET_QEMU_TIMEOUT=0.1s \
   SIMFERRET_QEMU_KILL_AFTER=0.1s \
   FAKE_QEMU_BEHAVIOR=hang \
   QEMU_SYSTEM_X86_64="$fake_qemu" \
-  "$smoke" >/dev/null 2>&1
-timeout_status=$?
+  timeout --kill-after=1s 3s bash -c '
+    set +e
+    "$SMOKE" >/dev/null 2>&1
+    printf "%s\n" "$?" > "$STATUS_FILE"
+    exit 0
+  '
+watchdog_status=$?
 set -e
-if [[ "$timeout_status" -eq 0 || "$timeout_status" -eq 124 ]]; then
-  echo "QEMU timeout path was not forcibly bounded" >&2
+if [[ "$watchdog_status" -ne 0 ]]; then
+  echo "outer watchdog had to terminate the smoke test" >&2
+  exit 1
+fi
+if [[ ! -f "$timeout_status_file" ]] || \
+  [[ "$(cat "$timeout_status_file")" -ne 137 ]]; then
+  echo "smoke test did not report QEMU's forced termination status" >&2
   exit 1
 fi
 
