@@ -129,7 +129,8 @@ The proof of concept is complete when:
 * at least one request attempt occurs while the server is stopped and reports a
   bounded failed or unavailable result;
 * replay succeeds at least twice from the produced run directory;
-* each replay produces byte-identical normalized event and assertion artifacts;
+* each replay produces byte-identical normalized event and assertion artifacts
+  and a matching semantic outcome digest;
 * changing the scenario seed changes the request or fault choice plan;
 * tampering with a replay identity or artifact is detected before or during
   replay;

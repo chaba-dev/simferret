@@ -138,6 +138,8 @@ fn replay_contract_identifies_builds_outage_and_semantic_outcome() {
         assert!(outage.contains("server is stopped"));
         assert!(outage.contains("failed or unavailable"));
     }
+    let acceptance = adoc_section(&proof_of_concept, "Acceptance criteria");
+    assert!(acceptance.contains("matching semantic outcome digest"));
 
     let determinism = adoc_section(&proof_of_concept, "Determinism contract");
     assert!(determinism.contains("semantic outcome digest"));
@@ -270,7 +272,8 @@ fn jj_identity_values_round_trip_as_strings() {
             .output()
             .expect("jj config get should run");
         assert!(get.status.success(), "jj should read encoded identity");
-        assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), value);
+        let expected = format!("{value}\n");
+        assert_eq!(get.stdout, expected.as_bytes());
     }
 }
 

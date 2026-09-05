@@ -11,7 +11,7 @@ implementation plans.
 
 The Nix flake provides the pinned Rust toolchain and Jujutsu. On an x86-64 Linux
 Amp orb, run `.agents/setup` once to install Nix when needed and initialize a
-colocated Jujutsu repository. On other Linux architectures and macOS, install
+colocated Jujutsu repository. On aarch64 Linux and macOS, install
 Nix separately, then run `.agents/setup` to fetch dependencies and initialize
 Jujutsu. To enter the environment directly, run
 `nix --extra-experimental-features 'nix-command flakes' develop`.
