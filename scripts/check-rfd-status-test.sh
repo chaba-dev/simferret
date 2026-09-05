@@ -34,6 +34,17 @@ run_failure() {
 	fi
 }
 
+assert_labels_align() {
+	local header_column row_column
+	header_column="$(awk 'NR == 1 { print index($0, "Labels") }' "${output}")"
+	row_column="$(awk 'NR == 3 { print index($0, "software, process") }' "${output}")"
+	if [[ "${header_column}" -eq 0 || "${header_column}" -ne "${row_column}" ]]; then
+		cat "${output}" >&2
+		printf 'Labels column is not vertically aligned\n' >&2
+		exit 1
+	fi
+}
+
 run_missing_directory_failure() {
 	if NO_COLOR=1 RFD_DIR="${test_root}/missing" bash "${checker}" >"${output}" 2>&1; then
 		cat "${output}" >&2; printf 'expected missing RFD directory to fail\n' >&2; exit 1
@@ -85,6 +96,12 @@ EOF
 		;;
 	esac
 }
+
+reset_fixtures; write_valid_rfd prediscussion ""
+sed -i.bak 's/Valid RFD/A title long enough to exceed the minimum column width/' "${rfd_root}/README.adoc" "${rfd_root}/0001/README.adoc"
+rm "${rfd_root}/README.adoc.bak" "${rfd_root}/0001/README.adoc.bak"
+run_success "A title long enough to exceed the minimum column width"
+assert_labels_align
 
 reset_fixtures; write_valid_rfd discussion https://example.com/pull/1
 cat >>"${rfd_root}/0001/IMPLEMENTATION.org" <<'EOF'
