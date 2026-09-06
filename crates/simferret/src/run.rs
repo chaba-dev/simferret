@@ -10,7 +10,7 @@ use flate2::{Compression, GzBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::assertions::AssertionReport;
+use crate::assertions::{AssertionReport, evaluate};
 use crate::protocol::{
     Command, CommandFrame, Event, EventFrame, NormalizedEvent, PROTOCOL_VERSION, RequestPhase,
 };
@@ -176,11 +176,16 @@ fn drive_scenario(
             })?;
         }
     }
+    let host_assertions = evaluate(
+        &controller.raw_events,
+        scenario.outage_event_bound,
+        scenario.liveness_event_bound,
+    );
     let check_events = controller.issue(Command::Check {
         outage_event_bound: scenario.outage_event_bound,
         liveness_event_bound: scenario.liveness_event_bound,
     })?;
-    let assertions = match &check_events[0].event {
+    let guest_assertions = match &check_events[0].event {
         Event::AssertionsEvaluated { report } => report.clone(),
         event => {
             return Err(io::Error::new(
@@ -189,15 +194,22 @@ fn drive_scenario(
             ));
         }
     };
+    if guest_assertions != host_assertions {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guest assertion report does not match host evaluation",
+        ));
+    }
     controller.issue(Command::Shutdown {})?;
     controller.vm.finish_events()?;
-    Ok((controller.events, assertions))
+    Ok((controller.events, host_assertions))
 }
 
 struct Controller<'a> {
     vm: &'a mut dyn RunningVm,
     next_command_id: u64,
     next_event_id: u64,
+    raw_events: Vec<EventFrame>,
     events: Vec<NormalizedEvent>,
 }
 
@@ -207,6 +219,7 @@ impl<'a> Controller<'a> {
             vm,
             next_command_id: 1,
             next_event_id: 1,
+            raw_events: Vec::new(),
             events: Vec::new(),
         }
     }
@@ -240,6 +253,7 @@ impl<'a> Controller<'a> {
                 ));
             }
             self.next_event_id += 1;
+            self.raw_events.push(event.clone());
             self.events.push(event.normalize());
             received.push(event);
         }
@@ -675,6 +689,7 @@ mod tests {
         corrupt: bool,
         running: bool,
         mismatch_request: bool,
+        forged_assertions: bool,
         extra_after_shutdown: bool,
         malformed_after_shutdown: bool,
     }
@@ -683,6 +698,7 @@ mod tests {
         identity: Mutex<Option<VmIdentity>>,
         replace_executable: Option<PathBuf>,
         mismatch_request: bool,
+        forged_assertions: bool,
         extra_after_shutdown: bool,
         malformed_after_shutdown: bool,
     }
@@ -716,6 +732,7 @@ mod tests {
                 corrupt: false,
                 running: false,
                 mismatch_request: self.mismatch_request,
+                forged_assertions: self.forged_assertions,
                 extra_after_shutdown: self.extra_after_shutdown,
                 malformed_after_shutdown: self.malformed_after_shutdown,
             }))
@@ -803,11 +820,17 @@ mod tests {
                     outage_event_bound,
                     liveness_event_bound,
                 } => {
-                    let report = crate::assertions::evaluate(
+                    let mut report = crate::assertions::evaluate(
                         &self.history,
                         *outage_event_bound,
                         *liveness_event_bound,
                     );
+                    if self.forged_assertions {
+                        report.passed = true;
+                        for assertion in &mut report.assertions {
+                            assertion.passed = true;
+                        }
+                    }
                     self.event(frame.command_id, Event::AssertionsEvaluated { report });
                 }
                 Command::Shutdown {} => {
@@ -868,6 +891,7 @@ mod tests {
             corrupt: false,
             running: false,
             mismatch_request: false,
+            forged_assertions: false,
             extra_after_shutdown: false,
             malformed_after_shutdown: false,
         };
@@ -913,6 +937,7 @@ mod tests {
             identity: Mutex::new(Some(identity())),
             replace_executable: Some(executable.clone()),
             mismatch_request: false,
+            forged_assertions: false,
             extra_after_shutdown: false,
             malformed_after_shutdown: false,
         };
@@ -980,6 +1005,26 @@ mod tests {
         assert_eq!(result.exit_code(), 1);
         assert!(result.directory.join("manifest.json").is_file());
         assert!(result.directory.join("assertions.json").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn forged_guest_assertions_are_rejected_without_publishing() {
+        let root = temporary_root("forged-assertions");
+        let options = test_options(&root, true);
+        let mut adapter = fake_adapter(None);
+        adapter.forged_assertions = true;
+        let error = record_with_adapter(&options, &adapter).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("does not match host evaluation"));
+        assert_eq!(
+            fs::read_dir(&options.runs_directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("run-"))
+                .count(),
+            0
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1153,6 +1198,7 @@ mod tests {
             identity: Mutex::new(Some(identity())),
             replace_executable,
             mismatch_request: false,
+            forged_assertions: false,
             extra_after_shutdown: false,
             malformed_after_shutdown: false,
         }
@@ -1180,6 +1226,7 @@ mod tests {
             corrupt: false,
             running: false,
             mismatch_request: mismatch,
+            forged_assertions: false,
             extra_after_shutdown: extra,
             malformed_after_shutdown: malformed,
         }
