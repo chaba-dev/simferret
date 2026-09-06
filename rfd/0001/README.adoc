@@ -1,5 +1,5 @@
 :authors: Darwin Wu <tough.pasta0068@wunli88.com>
-:state: discussion
+:state: committed
 :discussion: https://github.com/chaba-dev/simferret/pull/3
 :labels: architecture, determinism, proof-of-concept, qemu, replay, rust, testing
 

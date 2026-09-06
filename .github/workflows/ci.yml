@@ -56,10 +56,14 @@ jobs:
         with:
           install_url: https://releases.nixos.org/nix/nix-2.35.1/install
       - run: nix develop --command ./scripts/qemu-replay-smoke-test.sh
+      - run: nix develop --command ./scripts/phase4-acceptance-test.sh
       - run: nix develop --command ./scripts/qemu-replay-smoke.sh
+      - run: nix develop --command ./scripts/phase4-acceptance.sh
       - if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-replay-diagnostics
-          path: .poc/qemu-replay-smoke/
+          path: |
+            .poc/qemu-replay-smoke/
+            .poc/phase4-acceptance/
           if-no-files-found: ignore
