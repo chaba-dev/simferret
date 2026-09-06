@@ -53,6 +53,24 @@ outside QEMU, including an intentional response-corruption mode. The
 `guest-agent` and `fixture-server` commands are internal boundaries for the
 phase-2 controller rather than the final user-facing CLI.
 
+## Phase 2 record path
+
+On x86-64 Linux, build the static guest/controller executable and record the
+bounded restart scenario with:
+
+```shell
+.agents/dev cargo build --release --target x86_64-unknown-linux-musl
+.agents/dev ./target/x86_64-unknown-linux-musl/release/simferret run \
+  --scenario scenarios/echo-process-restart.toml --seed 42
+```
+
+The command boots the executable as PID 1 in a fixed one-vCPU QEMU TCG guest,
+drives requests over a recorded serial boundary, stops and restarts the real
+echo-server process at the seed-derived choice point, and evaluates structured
+assertions. A successful run prints its identifier, assertion result, artifact
+directory, and the Phase 3 replay command. Complete runs are atomically
+published under `runs/`; incomplete staging directories are removed.
+
 ## Development
 
 The Nix flake provides the pinned Rust toolchain and Jujutsu. On an x86-64 Linux

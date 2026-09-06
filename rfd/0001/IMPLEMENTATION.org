@@ -55,20 +55,20 @@ required by an acceptance criterion in the RFD.
 
 * Phase 2 — Rust record path
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
-- [ ] Parse the echo restart scenario and generate a stable choice plan from its
+- [X] Parse the echo restart scenario and generate a stable choice plan from its
   seed.
-- [ ] Keep QEMU command-line and QMP interaction behind one VM adapter rather
+- [X] Keep QEMU command-line and QMP interaction behind one VM adapter rather
   than invoking QEMU from fixture or scenario code.
-- [ ] Launch QEMU in record mode and drive the finite scenario without wall-clock
+- [X] Launch QEMU in record mode and drive the finite scenario without wall-clock
   sleeps controlling semantic choices.
-- [ ] Terminate and restart the server at an explicit recorded choice point.
-- [ ] Persist the manifest, scenario, choice plan, replay log, normalized events,
+- [X] Terminate and restart the server at an explicit recorded choice point.
+- [X] Persist the manifest, scenario, choice plan, replay log, normalized events,
   assertion results, semantic outcome digest, and diagnostic logs atomically
   under one run identifier.
-- [ ] Print a replay command and return an exit status derived from assertions
+- [X] Print a replay command and return an exit status derived from assertions
   and infrastructure health.
 
 * Phase 3 — Rust replay path

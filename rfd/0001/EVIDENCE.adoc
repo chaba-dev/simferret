@@ -127,3 +127,60 @@ identifiers rather than copying arbitrary request data. Assertion bounds are
 measured in stable event identifiers, not host time. Process tests concurrently
 drain all pipes, enforce bounded waits, and verify that terminating an agent also
 terminates its fixture child.
+
+== Phase 2 — Rust record path
+
+The x86-64 Linux record path is exercised with the repository's pinned static
+Rust target, QEMU, and kernel:
+
+[source,shell]
+----
+.agents/dev cargo build --release --target x86_64-unknown-linux-musl
+.agents/dev ./target/x86_64-unknown-linux-musl/release/simferret run \
+  --scenario scenarios/echo-process-restart.toml --seed 42
+----
+
+The scenario parser rejects unknown fields and invalid bounds. Its explicitly
+implemented SplitMix64 algorithm materializes the fault index, request IDs, and
+payloads into `choices.json`, so later library changes cannot silently replace
+the run's choices. Seed 42 selected request index 2 of 6 as the fault point.
+
+The controller launched QEMU 11.1.0 in TCG record mode with machine
+`pc-i440fx-9.2`, CPU `qemu64`, one vCPU, 128 MiB of memory, no network, and a
+second ISA serial port as the recorded command/event boundary. QEMU command-line
+construction, process supervision, QMP capability negotiation, and bounded
+startup/event/exit waits are owned by one VM adapter. A typed readiness event
+prevents host input from reaching the emulated serial port before the guest has
+configured it for raw framed I/O. Scenario execution itself contains no sleeps
+or wall-clock decisions.
+
+The real run produced 17 normalized events: two matching requests before the
+fault, one stopped-phase attempt followed by unavailability, a server restart,
+and three matching requests after the restart. Safety passed, controlled outage
+passed with the unavailable result one event after its attempt, and bounded
+liveness passed with matching success two events after restart. The command
+returned zero and printed the run ID, artifact path, assertion summary, and
+`simferret replay <run-directory>` command.
+
+The completed run directory was published with one rename only after QEMU exited
+normally and every artifact had been written. It contained the exact scenario,
+choice plan, 6,250,745-byte QEMU replay log, normalized JSON-lines events,
+assertion report, QEMU and serial diagnostics, and a manifest that digested all
+seven non-manifest artifacts. The semantic outcome digest covering scenario,
+choices, events, and assertions was:
+
+[source,text]
+----
+49ae101c084a591442365568b1a5f0b33b9a2cb47a904e8b65a1f54ad3be7ed3
+----
+
+The recorded initramfs digest was
+`df6be8c7419fe0755827e4f3749bc48c5eca41f60fc87774139fb0d814dda59e`;
+the replay log digest was
+`58bb2af18b9d6dfd5a53c65a3b2cb054ad75c7ecb87081a6206fa738fb2399cc`.
+The existing kernel digest remained
+`d4c2d110cb9b82dad81517cc2f1f3a46d0e31c8937237cf3df59eeffb3d7070b`.
+An adapter-backed regression test independently verifies complete artifact
+publication and every manifest digest without requiring QEMU. Together with the
+scenario and VM-boundary tests, the workspace now has twenty unit tests and
+seven process-level integration tests.
