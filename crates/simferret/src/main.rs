@@ -118,6 +118,35 @@ fn run() -> io::Result<u8> {
             );
             Ok(result.exit_code() as u8)
         }
+        Some(command) if command == "replay" => {
+            let directory = arguments.next().ok_or_else(usage)?;
+            if arguments.next().is_some() {
+                return Err(usage());
+            }
+            let kernel = env::var_os("SIMFERRET_KERNEL")
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "SIMFERRET_KERNEL is not set")
+                })?;
+            let result = simferret::run::replay(&simferret::run::ReplayOptions {
+                directory: PathBuf::from(directory),
+                kernel,
+                executable: env::current_exe()?,
+            })?;
+            println!("replay: verified");
+            println!("run: {}", result.run_id);
+            println!("events: {} byte-identical", result.event_count);
+            println!("semantic outcome: {}", result.semantic_outcome_sha256);
+            println!(
+                "assertions: {}",
+                if result.assertions.passed {
+                    "passed"
+                } else {
+                    "failed"
+                }
+            );
+            Ok(result.exit_code() as u8)
+        }
         _ => Err(usage()),
     }
 }
@@ -132,7 +161,7 @@ fn shell_quote(path: &std::path::Path) -> io::Result<String> {
 fn usage() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: simferret run --scenario PATH --seed N [--runs-dir PATH] | simferret guest-agent | simferret fixture-server ADDRESS echo|corrupt",
+        "usage: simferret run --scenario PATH --seed N [--runs-dir PATH] | simferret replay RUN_DIRECTORY | simferret guest-agent | simferret fixture-server ADDRESS echo|corrupt",
     )
 }
 

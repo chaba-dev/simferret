@@ -17,8 +17,9 @@ const MACHINE: &str = "pc-i440fx-9.2";
 const CPU: &str = "qemu64";
 const MEMORY_MIB: u32 = 128;
 const START_TIMEOUT: Duration = Duration::from_secs(10);
-const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
-const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const EVENT_TIMEOUT: Duration = Duration::from_secs(180);
+const EXIT_TIMEOUT: Duration = Duration::from_secs(180);
 const QMP_MESSAGE_LIMIT: usize = 64 * 1024;
 const PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
 const PROBE_READ_BUDGET: usize = 64 * 1024;
@@ -267,7 +268,7 @@ impl QemuAdapter {
             .stdout
             .take()
             .expect("qemu stdout was configured as piped");
-        let writer = match CommandWriter::new(input, EVENT_TIMEOUT) {
+        let writer = match CommandWriter::new(input, COMMAND_TIMEOUT) {
             Ok(writer) => writer,
             Err(error) => {
                 terminate(&mut child);
