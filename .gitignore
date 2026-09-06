@@ -1,5 +1,6 @@
 /target/
 /.poc/
+/runs/
 /.direnv/
 **/*.rs.bk
 *.pdb
