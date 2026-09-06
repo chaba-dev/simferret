@@ -69,3 +69,61 @@ This evidence establishes only that the pinned QEMU/kernel/initramfs tuple can
 replay the fixed boot and guest action. It does not establish the RFD's later
 process-control, semantic-event, assertion, or replay-identity acceptance
 criteria.
+
+== Phase 1 — Fixture and event protocol
+
+The `simferret guest-agent` entry point reads commands from standard input and
+writes structured events to standard output. Each frame is a four-byte,
+unsigned, big-endian body length followed by UTF-8 JSON. Bodies are limited to
+1 MiB. Every command and event envelope contains `protocol_version` (currently
+`1`) and a stable command or event identifier; unsupported versions, malformed
+JSON, unknown fields, truncated frames, and oversized frames fail the agent.
+Request identifiers and payloads have a combined 64 KiB logical limit so every
+accepted request and corresponding built-in fixture response can be represented
+by an event frame.
+
+Version 1 commands start and stop the echo-server process, make one workload
+request, evaluate assertions, and shut down the agent. Events report server
+lifecycle, every request attempt, matching responses or unavailability, the
+complete assertion report, and agent shutdown. Requests and responses carry an
+opaque request identifier and payload. The server's intentional corruption mode
+changes only the returned payload so the safety checker observes the violation.
+The agent retains the configured endpoint while the server is stopped, so an
+outage command executes the real workload client and records its connection
+failure. A private pipe reports server readiness only after the child process
+successfully binds its socket.
+Addresses are canonical numeric loopback socket addresses with nonzero ports;
+invalid, hostname, wildcard, external, and ephemeral-port inputs are rejected
+before a child starts. A controlled stop succeeds only when the agent terminates
+a live child with `SIGKILL`, while cleanup tolerates an already-exited child.
+The fixture also watches a private parent-owned standard-input pipe and exits if
+the agent terminates before performing normal cleanup.
+
+Normalized events retain the protocol version, stable identifiers, and complete
+event body. Exactly three diagnostic fields are excluded as non-semantic:
+`guest_pid`, `host_received_at_unix_nanos`, and `temporary_path`. Adding another
+exclusion requires changing the typed normalizer rather than silently dropping
+unknown JSON fields.
+
+Run the phase checks with:
+
+[source,shell]
+----
+.agents/dev cargo test --locked --workspace --all-targets --all-features
+.agents/dev cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
+----
+
+On 2026-09-05, all twenty-two tests passed. Fifteen unit tests cover framing, protocol
+version rejection, normalization, the TCP echo/corruption fixture, and all three
+assertion forms. Seven process-level integration tests drive framed commands
+through the real guest agent. The first starts the server, succeeds once, stops
+the server, observes a stopped-phase attempt and bounded unavailable result,
+restarts the server, and observes bounded matching success. The second corrupts
+a response and verifies both a failed safety assertion and agent exit status
+`1`. Additional regressions cover occupied and unusable server addresses, a real
+stopped-phase client call, unexpected child death, request-size boundaries, and
+bounded assertion-report serialization. Assertion details reference stable event
+identifiers rather than copying arbitrary request data. Assertion bounds are
+measured in stable event identifiers, not host time. Process tests concurrently
+drain all pipes, enforce bounded waits, and verify that terminating an agent also
+terminates its fixture child.

@@ -44,6 +44,15 @@ without deleting earlier evidence. This spike validates the execution-engine
 boundary only; it does not yet implement the Rust controller, guest agent,
 process restart, or scenario assertions.
 
+## Phase 1 fixtures
+
+The Rust crate now contains the version-1 framed guest-agent protocol, TCP echo
+server and workload client, event normalization, and the safety, outage, and
+liveness checker. Process-level tests exercise server termination and restart
+outside QEMU, including an intentional response-corruption mode. The
+`guest-agent` and `fixture-server` commands are internal boundaries for the
+phase-2 controller rather than the final user-facing CLI.
+
 ## Development
 
 The Nix flake provides the pinned Rust toolchain and Jujutsu. On an x86-64 Linux

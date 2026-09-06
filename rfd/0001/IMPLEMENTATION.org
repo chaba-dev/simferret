@@ -38,19 +38,19 @@ required by an acceptance criterion in the RFD.
 
 * Phase 1 — Fixture and event protocol
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
-- [ ] Implement the minimal echo server, workload client, checker, and guest
+- [X] Implement the minimal echo server, workload client, checker, and guest
   agent.
-- [ ] Define a versioned framed command and structured-event protocol for the
+- [X] Define a versioned framed command and structured-event protocol for the
   controlled host/guest channel.
-- [ ] Define explicit normalization rules for non-semantic event fields.
-- [ ] Test safety, controlled-outage, and bounded-liveness assertion evaluation
+- [X] Define explicit normalization rules for non-semantic event fields.
+- [X] Test safety, controlled-outage, and bounded-liveness assertion evaluation
   outside the VM.
-- [ ] Require at least one request attempt while the server is stopped and a
+- [X] Require at least one request attempt while the server is stopped and a
   bounded failed or unavailable result.
-- [ ] Add an intentional response-corruption mode that proves property failures
+- [X] Add an intentional response-corruption mode that proves property failures
   propagate to a nonzero result.
 
 * Phase 2 — Rust record path
