@@ -8,6 +8,8 @@ use crate::protocol::MAX_REQUEST_DATA_LENGTH;
 
 pub const SCENARIO_VERSION: u16 = 1;
 pub const CHOICE_PLAN_VERSION: u16 = 1;
+pub const MAX_REQUEST_COUNT: usize = 256;
+pub const MAX_TOTAL_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -60,13 +62,24 @@ impl Scenario {
         if self.name.is_empty() {
             return Err(invalid("scenario name must not be empty"));
         }
-        if self.request_count < 3 {
-            return Err(invalid("request_count must be at least 3"));
+        if !(3..=MAX_REQUEST_COUNT).contains(&self.request_count) {
+            return Err(invalid(format!(
+                "request_count must be between 3 and {MAX_REQUEST_COUNT}"
+            )));
         }
         if self.payload_bytes == 0 || self.payload_bytes > MAX_REQUEST_DATA_LENGTH / 4 {
             return Err(invalid(format!(
                 "payload_bytes must be between 1 and {}",
                 MAX_REQUEST_DATA_LENGTH / 4
+            )));
+        }
+        let total_payload_bytes = self
+            .request_count
+            .checked_mul(self.payload_bytes)
+            .ok_or_else(|| invalid("scenario payload budget overflowed"))?;
+        if total_payload_bytes > MAX_TOTAL_PAYLOAD_BYTES {
+            return Err(invalid(format!(
+                "request_count * payload_bytes must not exceed {MAX_TOTAL_PAYLOAD_BYTES}"
             )));
         }
         if self.outage_event_bound == 0 || self.liveness_event_bound < 2 {
@@ -162,6 +175,28 @@ mod tests {
         assert_eq!(first, scenario.choices(42));
         assert_ne!(first, scenario.choices(43));
         assert!((1..scenario.request_count - 1).contains(&first.fault_request_index));
+        assert_eq!(
+            first,
+            ChoicePlan {
+                version: 1,
+                seed: 42,
+                fault_request_index: 2,
+                requests: [
+                    ("request-0000-28efe333b266f103", "529f0f1357675247"),
+                    ("request-0001-581ce1ff0e4ae394", "f22348245a58bc09"),
+                    ("request-0002-de4431fa3c80db06", "5d6d37451c67e937"),
+                    ("request-0003-ccf635ee9e9e2fa4", "d57d3d0b77b80557"),
+                    ("request-0004-9e54d738297f77ae", "bf195b774a727434"),
+                    ("request-0005-7e348a0e451650be", "e6463e7f89ed6d83"),
+                ]
+                .into_iter()
+                .map(|(request_id, payload)| PlannedRequest {
+                    request_id: request_id.into(),
+                    payload: payload.into(),
+                })
+                .collect(),
+            }
+        );
     }
 
     #[test]
@@ -173,6 +208,15 @@ mod tests {
 
         let mut invalid = scenario();
         invalid.request_count = 2;
+        assert!(invalid.validate().is_err());
+
+        invalid = scenario();
+        invalid.request_count = MAX_REQUEST_COUNT + 1;
+        assert!(invalid.validate().is_err());
+
+        invalid = scenario();
+        invalid.request_count = MAX_REQUEST_COUNT;
+        invalid.payload_bytes = MAX_TOTAL_PAYLOAD_BYTES / MAX_REQUEST_COUNT + 1;
         assert!(invalid.validate().is_err());
     }
 }
