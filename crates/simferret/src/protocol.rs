@@ -59,6 +59,7 @@ pub struct EventFrame {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
+    AgentReady {},
     ServerStarted {
         address: String,
         corrupt_responses: bool,

@@ -25,6 +25,9 @@
             "clippy"
             "rustfmt"
           ];
+          targets = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            "x86_64-unknown-linux-musl"
+          ];
         };
       in {
         devShells.default = pkgs.mkShell {
