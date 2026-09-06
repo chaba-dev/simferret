@@ -1,5 +1,5 @@
-use std::fs;
-use std::io;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,8 @@ use crate::protocol::MAX_REQUEST_DATA_LENGTH;
 
 pub const SCENARIO_VERSION: u16 = 1;
 pub const CHOICE_PLAN_VERSION: u16 = 1;
+pub const MAX_SCENARIO_SOURCE_BYTES: usize = 1024 * 1024;
+pub const MAX_SCENARIO_NAME_BYTES: usize = 256;
 pub const MAX_REQUEST_COUNT: usize = 256;
 pub const MAX_TOTAL_PAYLOAD_BYTES: usize = 1024 * 1024;
 
@@ -43,7 +45,15 @@ pub struct PlannedRequest {
 
 impl Scenario {
     pub fn read(path: &Path) -> io::Result<(Self, Vec<u8>)> {
-        let source = fs::read(path)?;
+        let mut source = Vec::new();
+        File::open(path)?
+            .take(MAX_SCENARIO_SOURCE_BYTES as u64 + 1)
+            .read_to_end(&mut source)?;
+        if source.len() > MAX_SCENARIO_SOURCE_BYTES {
+            return Err(invalid(format!(
+                "scenario source must not exceed {MAX_SCENARIO_SOURCE_BYTES} bytes"
+            )));
+        }
         let text = std::str::from_utf8(&source)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let scenario: Self = toml::from_str(text)
@@ -59,8 +69,10 @@ impl Scenario {
                 self.version
             )));
         }
-        if self.name.is_empty() {
-            return Err(invalid("scenario name must not be empty"));
+        if self.name.is_empty() || self.name.len() > MAX_SCENARIO_NAME_BYTES {
+            return Err(invalid(format!(
+                "scenario name must contain between 1 and {MAX_SCENARIO_NAME_BYTES} bytes"
+            )));
         }
         if !(3..=MAX_REQUEST_COUNT).contains(&self.request_count) {
             return Err(invalid(format!(
@@ -218,5 +230,26 @@ mod tests {
         invalid.request_count = MAX_REQUEST_COUNT;
         invalid.payload_bytes = MAX_TOTAL_PAYLOAD_BYTES / MAX_REQUEST_COUNT + 1;
         assert!(invalid.validate().is_err());
+
+        invalid = scenario();
+        invalid.name = "x".repeat(MAX_SCENARIO_NAME_BYTES + 1);
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn oversized_scenario_source_is_rejected_by_a_bounded_read() {
+        let path = std::env::temp_dir().join(format!(
+            "simferret-oversized-scenario-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, vec![b'x'; MAX_SCENARIO_SOURCE_BYTES + 1]).unwrap();
+        let error = Scenario::read(&path).unwrap_err();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("must not exceed"));
     }
 }
