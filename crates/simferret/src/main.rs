@@ -34,12 +34,6 @@ fn run() -> io::Result<u8> {
             )?;
             Ok(status as u8)
         }
-        Some(command) if command == "guest-init" => {
-            if arguments.next().is_some() {
-                return Err(usage());
-            }
-            Ok(simferret::guest::init()? as u8)
-        }
         Some(command) if command == "fixture-server" => {
             let address = arguments
                 .next()
@@ -118,16 +112,39 @@ fn run() -> io::Result<u8> {
                 }
             );
             println!("artifacts: {}", result.directory.display());
-            println!("replay: simferret replay {}", result.directory.display());
-            Ok(result.assertions.exit_code() as u8)
+            println!(
+                "replay: simferret replay {}",
+                shell_quote(&result.directory.canonicalize()?)?
+            );
+            Ok(result.exit_code() as u8)
         }
         _ => Err(usage()),
     }
 }
 
+fn shell_quote(path: &std::path::Path) -> io::Result<String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "replay path is not UTF-8"))?;
+    Ok(format!("'{}'", path.replace('\'', "'\"'\"'")))
+}
+
 fn usage() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: simferret run --scenario PATH --seed N [--runs-dir PATH] | simferret guest-agent | simferret guest-init | simferret fixture-server ADDRESS echo|corrupt",
+        "usage: simferret run --scenario PATH --seed N [--runs-dir PATH] | simferret guest-agent | simferret fixture-server ADDRESS echo|corrupt",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_path_is_shell_quoted() {
+        assert_eq!(
+            shell_quote(std::path::Path::new("run dir/it's;safe")).unwrap(),
+            "'run dir/it'\"'\"'s;safe'"
+        );
+    }
 }

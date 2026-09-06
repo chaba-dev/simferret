@@ -7,6 +7,12 @@ use std::os::fd::AsRawFd;
 
 #[cfg(target_os = "linux")]
 pub fn init() -> io::Result<i32> {
+    if std::process::id() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "guest init can run only as PID 1 in the SimFerret guest",
+        ));
+    }
     mount("devtmpfs", "/dev", "devtmpfs").map_err(|error| guest_error("mount /dev", error))?;
     mount("proc", "/proc", "proc").map_err(|error| guest_error("mount /proc", error))?;
     mount("sysfs", "/sys", "sysfs").map_err(|error| guest_error("mount /sys", error))?;
@@ -137,5 +143,15 @@ fn bring_up_loopback() -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    #[test]
+    fn guest_init_rejects_non_pid_one_before_privileged_operations() {
+        let error = super::init().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("PID 1"));
     }
 }
