@@ -49,6 +49,10 @@ impl Scenario {
         File::open(path)?
             .take(MAX_SCENARIO_SOURCE_BYTES as u64 + 1)
             .read_to_end(&mut source)?;
+        Self::parse(source)
+    }
+
+    pub fn parse(source: Vec<u8>) -> io::Result<(Self, Vec<u8>)> {
         if source.len() > MAX_SCENARIO_SOURCE_BYTES {
             return Err(invalid(format!(
                 "scenario source must not exceed {MAX_SCENARIO_SOURCE_BYTES} bytes"

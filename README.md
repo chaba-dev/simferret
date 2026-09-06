@@ -75,6 +75,26 @@ directories that require manual removal. The replay identity guarantee assumes
 the documented pinned, immutable Nix QEMU, kernel, and firmware inputs; mutable
 environment overrides are outside the Phase 2 contract.
 
+## Phase 3 replay path
+
+Replay a completed run with the same pinned environment and executable:
+
+```shell
+.agents/dev ./target/x86_64-unknown-linux-musl/release/simferret replay \
+  runs/<run-id>
+```
+
+Before QEMU starts, replay validates the manifest, every artifact digest, the
+materialized choice plan, the rebuilt initial state, and the complete VM
+identity. Record-mode commands cross QEMU's replay-aware second ISA serial port
+as line-delimited JSON, paced by a guest acknowledgement for every byte so
+deferred replay events cannot overrun the UART. Replay sends no host commands:
+QEMU injects the recorded serial input from an isolated replay-log copy. The
+controller validates and compares each normalized event as it arrives, then
+requires byte-identical event and assertion artifacts and a matching semantic
+outcome digest. Divergence reports the first differing, missing, or surplus
+event.
+
 ## Development
 
 The Nix flake provides the pinned Rust toolchain and Jujutsu. On an x86-64 Linux

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,16 +14,36 @@ use crate::assertions::{AssertionReport, evaluate};
 use crate::protocol::{
     Command, CommandFrame, Event, EventFrame, NormalizedEvent, PROTOCOL_VERSION, RequestPhase,
 };
-use crate::scenario::{ChoicePlan, Scenario};
+use crate::scenario::{ChoicePlan, MAX_SCENARIO_SOURCE_BYTES, Scenario};
 use crate::vm::{QemuAdapter, RecordConfig, RunningVm, VmAdapter, VmIdentity, sha256_file};
 
 const MANIFEST_VERSION: u16 = 1;
+const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_SEMANTIC_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DIAGNOSTIC_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REPLAY_LOG_BYTES: usize = 1024 * 1024 * 1024;
+const ARTIFACT_NAMES: [&str; 7] = [
+    "scenario.toml",
+    "choices.json",
+    "replay.bin",
+    "events.jsonl",
+    "assertions.json",
+    "logs/qemu.log",
+    "logs/serial.log",
+];
 static IMAGE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct RunOptions {
     pub scenario: PathBuf,
     pub seed: u64,
     pub runs_directory: PathBuf,
+    pub kernel: PathBuf,
+    pub executable: PathBuf,
+}
+
+pub struct ReplayOptions {
+    pub directory: PathBuf,
     pub kernel: PathBuf,
     pub executable: PathBuf,
 }
@@ -36,6 +56,20 @@ pub struct RunResult {
 }
 
 impl RunResult {
+    pub fn exit_code(&self) -> i32 {
+        self.assertions.exit_code()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReplayResult {
+    pub run_id: String,
+    pub event_count: usize,
+    pub semantic_outcome_sha256: String,
+    pub assertions: AssertionReport,
+}
+
+impl ReplayResult {
     pub fn exit_code(&self) -> i32 {
         self.assertions.exit_code()
     }
@@ -66,6 +100,17 @@ pub fn record(options: &RunOptions) -> io::Result<RunResult> {
     }
     let adapter = QemuAdapter::from_environment()?;
     record_with_adapter(options, &adapter)
+}
+
+pub fn replay(options: &ReplayOptions) -> io::Result<ReplayResult> {
+    if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "replay mode supports x86-64 Linux only",
+        ));
+    }
+    let adapter = QemuAdapter::from_environment()?;
+    replay_with_adapter(options, &adapter)
 }
 
 pub fn record_with_adapter(options: &RunOptions, adapter: &dyn VmAdapter) -> io::Result<RunResult> {
@@ -141,12 +186,211 @@ pub fn record_with_adapter(options: &RunOptions, adapter: &dyn VmAdapter) -> io:
     })
 }
 
+pub fn replay_with_adapter(
+    options: &ReplayOptions,
+    adapter: &dyn VmAdapter,
+) -> io::Result<ReplayResult> {
+    let directory = fs::canonicalize(&options.directory)?;
+    let manifest: Manifest = read_json(&directory.join("manifest.json"), MAX_MANIFEST_BYTES)?;
+    validate_manifest(&directory, &manifest)?;
+    validate_artifacts(&directory, &manifest.artifacts)?;
+
+    let scenario_bytes = read_bounded(&directory.join("scenario.toml"), MAX_SCENARIO_SOURCE_BYTES)?;
+    let (scenario, scenario_bytes) = Scenario::parse(scenario_bytes)?;
+    if scenario.name != manifest.scenario_name {
+        return Err(invalid_data(format!(
+            "scenario name differs from manifest: expected {:?}, found {:?}",
+            manifest.scenario_name, scenario.name
+        )));
+    }
+    let choice_bytes = read_bounded(&directory.join("choices.json"), MAX_SEMANTIC_ARTIFACT_BYTES)?;
+    let choices: ChoicePlan = serde_json::from_slice(&choice_bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let materialized_choices = scenario.choices(manifest.seed);
+    if choices != materialized_choices {
+        return Err(invalid_data(
+            "recorded choice plan does not match the scenario and seed",
+        ));
+    }
+    let expected_event_bytes =
+        read_bounded(&directory.join("events.jsonl"), MAX_SEMANTIC_ARTIFACT_BYTES)?;
+    let expected_events = decode_events(&expected_event_bytes)?;
+    let expected_event_count = scenario
+        .request_count
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(5))
+        .ok_or_else(|| invalid_data("expected event count overflowed"))?;
+    if expected_events.len() != expected_event_count {
+        return Err(invalid_data(format!(
+            "recorded event count is inconsistent with scenario: expected {expected_event_count}, found {}",
+            expected_events.len()
+        )));
+    }
+    for (index, event) in expected_events.iter().enumerate() {
+        if event.protocol_version != PROTOCOL_VERSION || event.event_id != index as u64 + 1 {
+            return Err(invalid_data(format!(
+                "recorded event envelope is invalid at index {index}: {event:#?}"
+            )));
+        }
+    }
+    let expected_assertion_bytes = read_bounded(
+        &directory.join("assertions.json"),
+        MAX_SEMANTIC_ARTIFACT_BYTES,
+    )?;
+    let expected_assertions: AssertionReport = serde_json::from_slice(&expected_assertion_bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if !valid_report(&expected_assertions) {
+        return Err(invalid_data(
+            "recorded assertion report has an invalid shape",
+        ));
+    }
+    let expected_frames = expected_events
+        .iter()
+        .map(|event| EventFrame {
+            protocol_version: event.protocol_version,
+            event_id: event.event_id,
+            command_id: event.command_id,
+            event: event.event.clone(),
+            diagnostics: Default::default(),
+        })
+        .collect::<Vec<_>>();
+    let evaluated_assertions = evaluate(
+        &expected_frames,
+        scenario.outage_event_bound,
+        scenario.liveness_event_bound,
+    );
+    if expected_assertions != evaluated_assertions {
+        return Err(invalid_data(
+            "recorded assertion report does not match recorded events",
+        ));
+    }
+    let recorded_semantic_digest = digest_parts([
+        scenario_bytes.as_slice(),
+        choice_bytes.as_slice(),
+        expected_event_bytes.as_slice(),
+        expected_assertion_bytes.as_slice(),
+    ]);
+    if recorded_semantic_digest != manifest.semantic_outcome_sha256 {
+        return Err(invalid_data(format!(
+            "recorded semantic outcome digest mismatch: expected {}, found {recorded_semantic_digest}",
+            manifest.semantic_outcome_sha256
+        )));
+    }
+
+    let runs_directory = directory
+        .parent()
+        .ok_or_else(|| invalid_data("run directory has no parent"))?;
+    let image = build_guest_image(&options.executable, runs_directory)?;
+    if image.executable_sha256 != manifest.simferret_sha256 {
+        return Err(invalid_data(format!(
+            "SimFerret executable digest differs from recording: expected {}, found {}",
+            manifest.simferret_sha256, image.executable_sha256
+        )));
+    }
+    if sha256_file(&image.path)? != manifest.initial_state_sha256 {
+        return Err(invalid_data(
+            "rebuilt initial state digest differs from recording",
+        ));
+    }
+
+    let runtime = QmpDirectory::create(&format!("replay-{}", manifest.run_id))?;
+    fs::create_dir(runtime.path.join("logs"))?;
+    let replay_log = runtime.path.join("replay.bin");
+    copy_regular_file(
+        &directory.join("replay.bin"),
+        &replay_log,
+        MAX_REPLAY_LOG_BYTES,
+    )?;
+    let expected_replay_digest = &manifest.artifacts["replay.bin"];
+    let copied_replay_digest = sha256_file(&replay_log)?;
+    if &copied_replay_digest != expected_replay_digest {
+        return Err(invalid_data(format!(
+            "replay log changed while preparing replay: expected {expected_replay_digest}, found {copied_replay_digest}"
+        )));
+    }
+    let config = RecordConfig {
+        kernel: fs::canonicalize(&options.kernel)?,
+        initramfs: image.path,
+        replay_log,
+        qmp_socket: runtime.path.join("qmp.sock"),
+        serial_log: runtime.path.join("logs/serial.log"),
+        qemu_log: runtime.path.join("logs/qemu.log"),
+    };
+    let execution = (|| {
+        let mut vm = adapter.launch_replay(&config, &manifest.vm)?;
+        let (events, assertions) =
+            drive_replay_scenario(&scenario, &choices, &expected_events, vm.as_mut())?;
+        let status = vm.wait()?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "QEMU replay exited with {status}"
+            )));
+        }
+        compare_events(&expected_events, &events)?;
+        if assertions != expected_assertions {
+            return Err(invalid_data(format!(
+                "replayed assertion report diverged\nexpected: {expected_assertions:#?}\nactual: {assertions:#?}"
+            )));
+        }
+        let event_bytes = encode_events(&events)?;
+        if event_bytes != expected_event_bytes {
+            return Err(invalid_data(
+                "replayed normalized event encoding is not byte-identical",
+            ));
+        }
+        let assertion_bytes = json_bytes(&assertions)?;
+        if assertion_bytes != expected_assertion_bytes {
+            return Err(invalid_data(
+                "replayed assertion encoding is not byte-identical",
+            ));
+        }
+        let semantic_outcome_sha256 = digest_parts([
+            scenario_bytes.as_slice(),
+            choice_bytes.as_slice(),
+            event_bytes.as_slice(),
+            assertion_bytes.as_slice(),
+        ]);
+        if semantic_outcome_sha256 != manifest.semantic_outcome_sha256 {
+            return Err(invalid_data(format!(
+                "semantic outcome digest diverged: expected {}, found {semantic_outcome_sha256}",
+                manifest.semantic_outcome_sha256
+            )));
+        }
+        Ok(ReplayResult {
+            run_id: manifest.run_id.clone(),
+            event_count: events.len(),
+            semantic_outcome_sha256,
+            assertions,
+        })
+    })();
+    execution.map_err(|error| error_with_diagnostics(error, &runtime.path))
+}
+
 fn drive_scenario(
     scenario: &Scenario,
     choices: &ChoicePlan,
     vm: &mut dyn RunningVm,
 ) -> io::Result<(Vec<NormalizedEvent>, AssertionReport)> {
-    let mut controller = Controller::new(vm);
+    drive_scenario_inner(scenario, choices, vm, true, None)
+}
+
+fn drive_replay_scenario(
+    scenario: &Scenario,
+    choices: &ChoicePlan,
+    expected_events: &[NormalizedEvent],
+    vm: &mut dyn RunningVm,
+) -> io::Result<(Vec<NormalizedEvent>, AssertionReport)> {
+    drive_scenario_inner(scenario, choices, vm, false, Some(expected_events))
+}
+
+fn drive_scenario_inner(
+    scenario: &Scenario,
+    choices: &ChoicePlan,
+    vm: &mut dyn RunningVm,
+    send_commands: bool,
+    expected_events: Option<&[NormalizedEvent]>,
+) -> io::Result<(Vec<NormalizedEvent>, AssertionReport)> {
+    let mut controller = Controller::new(vm, send_commands, expected_events);
     controller.issue(Command::StartServer {
         address: scenario.server_address.clone(),
         corrupt_responses: scenario.corrupt_responses,
@@ -202,6 +446,15 @@ fn drive_scenario(
     }
     controller.issue(Command::Shutdown {})?;
     controller.vm.finish_events()?;
+    if let Some(expected) = &controller.expected_events
+        && controller.events.len() != expected.len()
+    {
+        return Err(invalid_data(format!(
+            "replay ended after {} normalized events; expected {}",
+            controller.events.len(),
+            expected.len()
+        )));
+    }
     Ok((controller.events, host_assertions))
 }
 
@@ -209,16 +462,24 @@ struct Controller<'a> {
     vm: &'a mut dyn RunningVm,
     next_command_id: u64,
     next_event_id: u64,
+    send_commands: bool,
+    expected_events: Option<Vec<NormalizedEvent>>,
     raw_events: Vec<EventFrame>,
     events: Vec<NormalizedEvent>,
 }
 
 impl<'a> Controller<'a> {
-    fn new(vm: &'a mut dyn RunningVm) -> Self {
+    fn new(
+        vm: &'a mut dyn RunningVm,
+        send_commands: bool,
+        expected_events: Option<&[NormalizedEvent]>,
+    ) -> Self {
         Self {
             vm,
             next_command_id: 1,
             next_event_id: 1,
+            send_commands,
+            expected_events: expected_events.map(<[NormalizedEvent]>::to_vec),
             raw_events: Vec::new(),
             events: Vec::new(),
         }
@@ -227,19 +488,30 @@ impl<'a> Controller<'a> {
     fn issue(&mut self, command: Command) -> io::Result<Vec<EventFrame>> {
         let command_id = self.next_command_id;
         self.next_command_id += 1;
-        self.vm.send(&CommandFrame {
-            protocol_version: PROTOCOL_VERSION,
-            command_id,
-            command: command.clone(),
-        })?;
+        if self.send_commands {
+            self.vm.send(&CommandFrame {
+                protocol_version: PROTOCOL_VERSION,
+                command_id,
+                command: command.clone(),
+            })?;
+        }
         let expected_events = if matches!(command, Command::Request { .. }) {
             2
         } else {
             1
         };
         let mut received = Vec::with_capacity(expected_events);
-        for _ in 0..expected_events {
-            let event = self.vm.receive()?;
+        for event_index in 0..expected_events {
+            let event = self.vm.receive().map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed receiving event {}/{} for command {command_id} ({command:?}): {error}",
+                        event_index + 1,
+                        expected_events
+                    ),
+                )
+            })?;
             if event.protocol_version != PROTOCOL_VERSION
                 || event.command_id != command_id
                 || event.event_id != self.next_event_id
@@ -253,64 +525,86 @@ impl<'a> Controller<'a> {
                 ));
             }
             self.next_event_id += 1;
+            validate_response(&command, event_index, &event)?;
+            let normalized = event.normalize();
+            if let Some(expected) = &self.expected_events {
+                let index = self.events.len();
+                match expected.get(index) {
+                    Some(expected) if expected == &normalized => {}
+                    Some(expected) => {
+                        return Err(invalid_data(format!(
+                            "normalized event divergence at index {index}\nexpected: {expected:#?}\nactual: {normalized:#?}"
+                        )));
+                    }
+                    None => {
+                        return Err(invalid_data(format!(
+                            "replay produced surplus normalized event at index {index}\nactual: {normalized:#?}"
+                        )));
+                    }
+                }
+            }
             self.raw_events.push(event.clone());
-            self.events.push(event.normalize());
+            self.events.push(normalized);
             received.push(event);
         }
-        validate_responses(&command, &received)?;
         Ok(received)
     }
 }
 
-fn validate_responses(command: &Command, events: &[EventFrame]) -> io::Result<()> {
-    let valid = match command {
-        Command::StartServer {
-            address,
-            corrupt_responses,
-        } => matches!(
-            events,
-            [EventFrame { event: Event::ServerStarted { address: actual_address, corrupt_responses: actual_corruption }, .. }]
+fn validate_response(command: &Command, event_index: usize, frame: &EventFrame) -> io::Result<()> {
+    let valid = match (command, event_index) {
+        (
+            Command::StartServer {
+                address,
+                corrupt_responses,
+            },
+            0,
+        ) => matches!(
+            &frame.event,
+            Event::ServerStarted { address: actual_address, corrupt_responses: actual_corruption }
                 if socket_addresses_equal(actual_address, address) && actual_corruption == corrupt_responses
         ),
-        Command::StopServer {} => matches!(
-            events,
-            [EventFrame {
-                event: Event::ServerStopped {},
-                ..
-            }]
-        ),
-        Command::Request {
-            request_id,
-            payload,
-            phase,
-        } => {
-            matches!(events.first().map(|frame| &frame.event), Some(Event::RequestAttempted {
+        (Command::StopServer {}, 0) => matches!(frame.event, Event::ServerStopped {}),
+        (
+            Command::Request {
+                request_id,
+                payload,
+                phase,
+            },
+            0,
+        ) => matches!(&frame.event, Event::RequestAttempted {
                 request_id: actual_id, payload: actual_payload, phase: actual_phase,
-            }) if actual_id == request_id && actual_payload == payload && actual_phase == phase)
-                && (matches!(events.get(1).map(|frame| &frame.event),
-                    Some(Event::RequestSucceeded { request_id: actual_id, request_payload, phase: actual_phase, .. })
-                        if actual_id == request_id && request_payload == payload && actual_phase == phase)
-                    || matches!(events.get(1).map(|frame| &frame.event),
-                    Some(Event::RequestUnavailable { request_id: actual_id, phase: actual_phase })
-                        if actual_id == request_id && actual_phase == phase))
+            } if actual_id == request_id && actual_payload == payload && actual_phase == phase),
+        (
+            Command::Request {
+                request_id,
+                payload,
+                phase,
+            },
+            1,
+        ) => {
+            matches!(&frame.event,
+            Event::RequestSucceeded { request_id: actual_id, request_payload, phase: actual_phase, .. }
+                if actual_id == request_id && request_payload == payload && actual_phase == phase)
+                || matches!(&frame.event,
+            Event::RequestUnavailable { request_id: actual_id, phase: actual_phase }
+                if actual_id == request_id && actual_phase == phase)
         }
-        Command::Check { .. } => {
-            matches!(events, [EventFrame { event: Event::AssertionsEvaluated { report }, .. }] if valid_report(report))
+        (Command::Check { .. }, 0) => {
+            matches!(&frame.event, Event::AssertionsEvaluated { report } if valid_report(report))
         }
-        Command::Shutdown {} => matches!(
-            events,
-            [EventFrame {
-                event: Event::AgentStopped {},
-                ..
-            }]
-        ),
+        (Command::Shutdown {}, 0) => matches!(frame.event, Event::AgentStopped {}),
+        _ => false,
     };
     if valid {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("events do not match command {command:?}: {events:?}"),
+            format!(
+                "event {} does not match command {command:?}: {frame:?}",
+                event_index + 1
+            ),
         ))
     }
 }
@@ -385,11 +679,10 @@ struct QmpDirectory {
 
 impl QmpDirectory {
     fn create(run_id: &str) -> io::Result<Self> {
-        let suffix = run_id
-            .rsplit_once('-')
-            .map(|(prefix, _)| &prefix[prefix.len().saturating_sub(16)..])
-            .unwrap_or(run_id);
-        let path = Path::new("/tmp").join(format!("sf-{}-{suffix}", std::process::id()));
+        let digest = sha256_bytes(run_id.as_bytes());
+        let suffix = &digest[..16];
+        let counter = RUNTIME_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = Path::new("/tmp").join(format!("sf-{}-{counter}-{suffix}", std::process::id()));
         fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(Self { path })
     }
@@ -590,19 +883,235 @@ fn pad_four(output: &mut Vec<u8>) {
 }
 
 fn artifact_digests(root: &Path) -> io::Result<BTreeMap<String, String>> {
-    let artifacts = [
-        "scenario.toml",
-        "choices.json",
-        "replay.bin",
-        "events.jsonl",
-        "assertions.json",
-        "logs/qemu.log",
-        "logs/serial.log",
-    ];
-    artifacts
+    ARTIFACT_NAMES
         .into_iter()
         .map(|name| Ok((name.into(), sha256_file(&root.join(name))?)))
         .collect()
+}
+
+fn validate_manifest(directory: &Path, manifest: &Manifest) -> io::Result<()> {
+    if manifest.version != MANIFEST_VERSION {
+        return Err(invalid_data(format!(
+            "unsupported manifest version {}",
+            manifest.version
+        )));
+    }
+    if !valid_run_id(&manifest.run_id) {
+        return Err(invalid_data("manifest contains an invalid run ID"));
+    }
+    if directory.file_name() != Some(std::ffi::OsStr::new(&manifest.run_id)) {
+        return Err(invalid_data(
+            "manifest run ID does not match the run directory name",
+        ));
+    }
+    if manifest.simferret_version != env!("CARGO_PKG_VERSION") {
+        return Err(invalid_data(format!(
+            "SimFerret version differs from recording: expected {}, found {}",
+            manifest.simferret_version,
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+    if manifest.initial_state_sha256 != manifest.vm.initramfs_sha256 {
+        return Err(invalid_data(
+            "manifest initial state does not match VM initramfs identity",
+        ));
+    }
+    for digest in [
+        &manifest.simferret_sha256,
+        &manifest.initial_state_sha256,
+        &manifest.semantic_outcome_sha256,
+    ] {
+        if !valid_sha256(digest) {
+            return Err(invalid_data("manifest contains an invalid SHA-256 digest"));
+        }
+    }
+    Ok(())
+}
+
+fn valid_run_id(run_id: &str) -> bool {
+    let Some((timestamp, seed)) = run_id
+        .strip_prefix("run-")
+        .and_then(|body| body.split_once('-'))
+    else {
+        return false;
+    };
+    timestamp.len() == 32
+        && seed.len() == 16
+        && timestamp
+            .bytes()
+            .chain(seed.bytes())
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_artifacts(directory: &Path, expected: &BTreeMap<String, String>) -> io::Result<()> {
+    if expected.len() != ARTIFACT_NAMES.len()
+        || !ARTIFACT_NAMES
+            .into_iter()
+            .all(|name| expected.contains_key(name))
+    {
+        return Err(invalid_data(
+            "manifest artifact set does not match the replay contract",
+        ));
+    }
+    for (name, digest) in expected {
+        if !valid_sha256(digest) {
+            return Err(invalid_data(format!(
+                "manifest has an invalid digest for {name}"
+            )));
+        }
+        let actual = sha256_regular_file(&directory.join(name), artifact_limit(name))?;
+        if &actual != digest {
+            return Err(invalid_data(format!(
+                "artifact digest mismatch for {name}: expected {digest}, found {actual}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, limit: usize) -> io::Result<T> {
+    let bytes = read_bounded(path, limit)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn read_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    open_regular(path, limit)?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        Err(invalid_data(format!(
+            "artifact exceeds {limit} byte validation limit: {}",
+            path.display()
+        )))
+    } else {
+        Ok(bytes)
+    }
+}
+
+fn artifact_limit(name: &str) -> usize {
+    match name {
+        "scenario.toml" => MAX_SCENARIO_SOURCE_BYTES,
+        "choices.json" | "events.jsonl" | "assertions.json" => MAX_SEMANTIC_ARTIFACT_BYTES,
+        "logs/qemu.log" | "logs/serial.log" => MAX_DIAGNOSTIC_ARTIFACT_BYTES,
+        "replay.bin" => MAX_REPLAY_LOG_BYTES,
+        _ => 0,
+    }
+}
+
+fn open_regular(path: &Path, limit: usize) -> io::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid_data(format!(
+            "replay input is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() > limit as u64 {
+        return Err(invalid_data(format!(
+            "replay input exceeds {limit} byte limit: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+fn sha256_regular_file(path: &Path, limit: usize) -> io::Result<String> {
+    let mut file = open_regular(path, limit)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_usize;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read)
+            .ok_or_else(|| invalid_data("replay input size overflowed"))?;
+        if total > limit {
+            return Err(invalid_data(format!(
+                "replay input exceeds {limit} byte limit: {}",
+                path.display()
+            )));
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn copy_regular_file(source: &Path, destination: &Path, limit: usize) -> io::Result<()> {
+    let source_path = source;
+    let source = open_regular(source_path, limit)?;
+    let mut destination = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let copied = io::copy(&mut source.take(limit as u64 + 1), &mut destination)?;
+    if copied > limit as u64 {
+        return Err(invalid_data(format!(
+            "replay input exceeds {limit} byte limit: {}",
+            source_path.display()
+        )));
+    }
+    destination.sync_all()
+}
+
+fn decode_events(bytes: &[u8]) -> io::Result<Vec<NormalizedEvent>> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| {
+            serde_json::from_str(line).map_err(|error| {
+                invalid_data(format!(
+                    "invalid normalized event at line {}: {error}",
+                    index + 1
+                ))
+            })
+        })
+        .collect()
+}
+
+fn compare_events(expected: &[NormalizedEvent], actual: &[NormalizedEvent]) -> io::Result<()> {
+    for index in 0..expected.len().max(actual.len()) {
+        match (expected.get(index), actual.get(index)) {
+            (Some(expected), Some(actual)) if expected == actual => {}
+            (Some(expected), Some(actual)) => {
+                return Err(invalid_data(format!(
+                    "normalized event divergence at index {index}\nexpected: {expected:#?}\nactual: {actual:#?}"
+                )));
+            }
+            (Some(expected), None) => {
+                return Err(invalid_data(format!(
+                    "replay ended before normalized event index {index}\nexpected: {expected:#?}"
+                )));
+            }
+            (None, Some(actual)) => {
+                return Err(invalid_data(format!(
+                    "replay produced surplus normalized event at index {index}\nactual: {actual:#?}"
+                )));
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 fn write_json(path: PathBuf, value: &impl Serialize) -> io::Result<()> {
@@ -674,9 +1183,10 @@ fn new_run_id(seed: u64) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::protocol::DiagnosticFields;
@@ -689,42 +1199,35 @@ mod tests {
         corrupt: bool,
         running: bool,
         mismatch_request: bool,
+        force_unavailable: bool,
         forged_assertions: bool,
         extra_after_shutdown: bool,
         malformed_after_shutdown: bool,
+        recorded_events: Option<Arc<Mutex<Vec<EventFrame>>>>,
+        playback: bool,
     }
 
     struct FakeAdapter {
-        identity: Mutex<Option<VmIdentity>>,
+        identity: Mutex<VmIdentity>,
         replace_executable: Option<PathBuf>,
         mismatch_request: bool,
+        force_unavailable: bool,
         forged_assertions: bool,
         extra_after_shutdown: bool,
         malformed_after_shutdown: bool,
+        recorded_events: Arc<Mutex<Vec<EventFrame>>>,
     }
 
     struct FailingAdapter;
 
-    impl VmAdapter for FailingAdapter {
-        fn launch_record(&self, config: &RecordConfig) -> io::Result<Box<dyn RunningVm>> {
-            fs::write(&config.qemu_log, b"distinctive startup failure")?;
-            fs::write(&config.serial_log, b"guest boot failed")?;
-            Err(io::Error::other("adapter failed"))
-        }
-    }
-
-    impl VmAdapter for FakeAdapter {
-        fn launch_record(&self, config: &RecordConfig) -> io::Result<Box<dyn RunningVm>> {
-            fs::write(&config.replay_log, b"replay")?;
+    impl FakeAdapter {
+        fn vm(&self, config: &RecordConfig, playback: bool) -> io::Result<FakeVm> {
             fs::write(&config.serial_log, b"serial diagnostics")?;
             fs::write(&config.qemu_log, b"qemu diagnostics")?;
-            let mut identity = self.identity.lock().unwrap().take().unwrap();
+            let mut identity = self.identity.lock().unwrap().clone();
             identity.initramfs_sha256 = sha256_file(&config.initramfs)?;
             identity.kernel.sha256 = sha256_file(&config.kernel)?;
-            if let Some(path) = &self.replace_executable {
-                fs::write(path, b"replacement executable")?;
-            }
-            Ok(Box::new(FakeVm {
+            Ok(FakeVm {
                 identity,
                 queued: VecDeque::new(),
                 history: Vec::new(),
@@ -732,10 +1235,75 @@ mod tests {
                 corrupt: false,
                 running: false,
                 mismatch_request: self.mismatch_request,
+                force_unavailable: self.force_unavailable,
                 forged_assertions: self.forged_assertions,
                 extra_after_shutdown: self.extra_after_shutdown,
                 malformed_after_shutdown: self.malformed_after_shutdown,
-            }))
+                recorded_events: (!playback).then(|| Arc::clone(&self.recorded_events)),
+                playback,
+            })
+        }
+    }
+
+    impl VmAdapter for FailingAdapter {
+        fn launch_record(&self, config: &RecordConfig) -> io::Result<Box<dyn RunningVm>> {
+            fs::write(&config.qemu_log, b"distinctive startup failure")?;
+            fs::write(&config.serial_log, b"guest boot failed")?;
+            Err(io::Error::other("adapter failed"))
+        }
+
+        fn launch_replay(
+            &self,
+            config: &RecordConfig,
+            _expected_identity: &VmIdentity,
+        ) -> io::Result<Box<dyn RunningVm>> {
+            fs::write(&config.qemu_log, b"distinctive replay failure")?;
+            fs::write(&config.serial_log, b"replayed guest failed")?;
+            Err(io::Error::other("replay adapter failed"))
+        }
+    }
+
+    impl VmAdapter for FakeAdapter {
+        fn launch_record(&self, config: &RecordConfig) -> io::Result<Box<dyn RunningVm>> {
+            fs::write(&config.replay_log, b"replay")?;
+            if let Some(path) = &self.replace_executable {
+                fs::write(path, b"replacement executable")?;
+            }
+            Ok(Box::new(self.vm(config, false)?))
+        }
+
+        fn launch_replay(
+            &self,
+            config: &RecordConfig,
+            expected_identity: &VmIdentity,
+        ) -> io::Result<Box<dyn RunningVm>> {
+            let mut vm = self.vm(config, true)?;
+            if &vm.identity != expected_identity {
+                return Err(invalid_data("fake replay environment identity differs"));
+            }
+            let mut events = self.recorded_events.lock().unwrap().clone();
+            if self.force_unavailable {
+                let (request_id, phase) = match &events[2].event {
+                    Event::RequestSucceeded {
+                        request_id, phase, ..
+                    } => (request_id.clone(), *phase),
+                    event => panic!("unexpected fake event for divergence: {event:?}"),
+                };
+                events[2].event = Event::RequestUnavailable { request_id, phase };
+                let report = evaluate(&events, 1, 2);
+                let assertion = events
+                    .iter_mut()
+                    .find(|frame| matches!(frame.event, Event::AssertionsEvaluated { .. }))
+                    .expect("fake recording contains assertion event");
+                assertion.event = Event::AssertionsEvaluated { report };
+            }
+            if self.extra_after_shutdown {
+                let mut extra = events.last().expect("fake recording has events").clone();
+                extra.event_id += 1;
+                events.push(extra);
+            }
+            vm.queued = events.into();
+            Ok(Box::new(vm))
         }
     }
 
@@ -750,6 +1318,9 @@ mod tests {
             };
             self.next_event_id += 1;
             self.history.push(frame.clone());
+            if let Some(recorded_events) = &self.recorded_events {
+                recorded_events.lock().unwrap().push(frame.clone());
+            }
             self.queued.push_back(frame);
         }
     }
@@ -760,6 +1331,9 @@ mod tests {
         }
 
         fn send(&mut self, frame: &CommandFrame) -> io::Result<()> {
+            if self.playback {
+                return Err(io::Error::other("replay wrote a live command"));
+            }
             match &frame.command {
                 Command::StartServer {
                     address,
@@ -796,7 +1370,7 @@ mod tests {
                             phase: *phase,
                         },
                     );
-                    let result = if self.running {
+                    let result = if self.running && !self.force_unavailable {
                         Event::RequestSucceeded {
                             request_id: request_id.clone(),
                             request_payload: payload.clone(),
@@ -891,9 +1465,12 @@ mod tests {
             corrupt: false,
             running: false,
             mismatch_request: false,
+            force_unavailable: false,
             forged_assertions: false,
             extra_after_shutdown: false,
             malformed_after_shutdown: false,
+            recorded_events: None,
+            playback: false,
         };
         let (events, report) = drive_scenario(&scenario, &choices, &mut vm).unwrap();
         assert!(report.passed);
@@ -934,12 +1511,14 @@ mod tests {
         let captured_executable_digest = sha256_file(&executable).unwrap();
         let runs_directory = root.join("runs");
         let adapter = FakeAdapter {
-            identity: Mutex::new(Some(identity())),
+            identity: Mutex::new(identity()),
             replace_executable: Some(executable.clone()),
             mismatch_request: false,
+            force_unavailable: false,
             forged_assertions: false,
             extra_after_shutdown: false,
             malformed_after_shutdown: false,
+            recorded_events: Arc::new(Mutex::new(Vec::new())),
         };
         let result = record_with_adapter(
             &RunOptions {
@@ -974,6 +1553,370 @@ mod tests {
                 .count(),
             0
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn two_replays_verify_identical_semantic_artifacts() {
+        let root = temporary_root("two-replays");
+        let options = test_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        let replay_options = ReplayOptions {
+            directory: recorded.directory.clone(),
+            kernel: options.kernel.clone(),
+            executable: options.executable.clone(),
+        };
+        let replay_log_digest = sha256_file(&recorded.directory.join("replay.bin")).unwrap();
+        let first = replay_with_adapter(&replay_options, &adapter).unwrap();
+        let second = replay_with_adapter(&replay_options, &adapter).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.event_count, 13);
+        assert_eq!(
+            first.semantic_outcome_sha256,
+            serde_json::from_slice::<Manifest>(
+                &fs::read(recorded.directory.join("manifest.json")).unwrap()
+            )
+            .unwrap()
+            .semantic_outcome_sha256
+        );
+        assert_eq!(
+            sha256_file(&recorded.directory.join("replay.bin")).unwrap(),
+            replay_log_digest
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replay_rejects_every_tampered_artifact_before_launch() {
+        let root = temporary_root("tampered-artifacts");
+        let options = test_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        let manifest: Manifest = read_json(
+            &recorded.directory.join("manifest.json"),
+            MAX_MANIFEST_BYTES,
+        )
+        .unwrap();
+        for name in ARTIFACT_NAMES {
+            let path = recorded.directory.join(name);
+            let original = fs::read(&path).unwrap();
+            fs::write(&path, [original.as_slice(), b"tampered"].concat()).unwrap();
+            let error = validate_artifacts(&recorded.directory, &manifest.artifacts).unwrap_err();
+            assert!(error.to_string().contains(name), "{error}");
+            fs::write(path, original).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replay_rejects_self_consistent_digests_for_inconsistent_semantics() {
+        let root = temporary_root("inconsistent-semantics");
+        let options = test_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        let mut manifest: Manifest = read_json(
+            &recorded.directory.join("manifest.json"),
+            MAX_MANIFEST_BYTES,
+        )
+        .unwrap();
+        let mut assertions: AssertionReport = read_json(
+            &recorded.directory.join("assertions.json"),
+            MAX_SEMANTIC_ARTIFACT_BYTES,
+        )
+        .unwrap();
+        assertions.passed = false;
+        assertions.assertions[0].passed = false;
+        assertions.assertions[0].detail = "forged failure".into();
+        let assertion_bytes = json_bytes(&assertions).unwrap();
+        fs::write(recorded.directory.join("assertions.json"), &assertion_bytes).unwrap();
+        manifest
+            .artifacts
+            .insert("assertions.json".into(), sha256_bytes(&assertion_bytes));
+        let scenario_bytes = fs::read(recorded.directory.join("scenario.toml")).unwrap();
+        let choice_bytes = fs::read(recorded.directory.join("choices.json")).unwrap();
+        let event_bytes = fs::read(recorded.directory.join("events.jsonl")).unwrap();
+        manifest.semantic_outcome_sha256 = digest_parts([
+            scenario_bytes.as_slice(),
+            choice_bytes.as_slice(),
+            event_bytes.as_slice(),
+            assertion_bytes.as_slice(),
+        ]);
+        write_json(recorded.directory.join("manifest.json"), &manifest).unwrap();
+
+        let error = replay_with_adapter(
+            &ReplayOptions {
+                directory: recorded.directory,
+                kernel: options.kernel.clone(),
+                executable: options.executable.clone(),
+            },
+            &adapter,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("assertion report does not match recorded events"),
+            "{error}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replay_reports_first_event_divergence() {
+        let root = temporary_root("event-divergence");
+        let options = test_options(&root, false);
+        let mut adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        adapter.force_unavailable = true;
+        let error = replay_with_adapter(
+            &ReplayOptions {
+                directory: recorded.directory,
+                kernel: options.kernel.clone(),
+                executable: options.executable.clone(),
+            },
+            &adapter,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("normalized event divergence at index 2"),
+            "{error}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn first_replay_divergence_is_not_masked_by_surplus_output() {
+        let root = temporary_root("divergence-before-surplus");
+        let options = test_options(&root, false);
+        let mut adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        adapter.force_unavailable = true;
+        adapter.extra_after_shutdown = true;
+        let error = replay_with_adapter(
+            &ReplayOptions {
+                directory: recorded.directory,
+                kernel: options.kernel.clone(),
+                executable: options.executable.clone(),
+            },
+            &adapter,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("normalized event divergence at index 2"),
+            "{error}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn first_request_event_divergence_is_not_masked_by_missing_second_event() {
+        let command = Command::Request {
+            request_id: "request".into(),
+            payload: "actual".into(),
+            phase: RequestPhase::Running,
+        };
+        let actual = EventFrame {
+            protocol_version: PROTOCOL_VERSION,
+            event_id: 1,
+            command_id: 1,
+            event: Event::RequestAttempted {
+                request_id: "request".into(),
+                payload: "actual".into(),
+                phase: RequestPhase::Running,
+            },
+            diagnostics: DiagnosticFields::default(),
+        };
+        let mut expected = actual.normalize();
+        let Event::RequestAttempted { payload, .. } = &mut expected.event else {
+            unreachable!();
+        };
+        *payload = "recorded-alternate".into();
+        let mut vm = fake_vm(false, false, false);
+        vm.playback = true;
+        vm.queued.push_back(actual);
+        let mut controller = Controller::new(&mut vm, false, Some(&[expected]));
+        let error = controller.issue(command).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("normalized event divergence at index 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn replay_rejects_fifo_and_device_symlink_inputs_without_blocking() {
+        let fifo_root = temporary_root("fifo-manifest");
+        let fifo_options = test_options(&fifo_root, false);
+        let fifo_adapter = fake_adapter(None);
+        let fifo_recorded = record_with_adapter(&fifo_options, &fifo_adapter).unwrap();
+        let manifest_path = fifo_recorded.directory.join("manifest.json");
+        fs::remove_file(&manifest_path).unwrap();
+        let manifest_c = std::ffi::CString::new(manifest_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(manifest_c.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        let error = replay_with_adapter(
+            &ReplayOptions {
+                directory: fifo_recorded.directory,
+                kernel: fifo_options.kernel.clone(),
+                executable: fifo_options.executable.clone(),
+            },
+            &FailingAdapter,
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        fs::remove_dir_all(fifo_root).unwrap();
+
+        let symlink_root = temporary_root("device-symlink");
+        let symlink_options = test_options(&symlink_root, false);
+        let symlink_adapter = fake_adapter(None);
+        let symlink_recorded = record_with_adapter(&symlink_options, &symlink_adapter).unwrap();
+        let replay_log = symlink_recorded.directory.join("replay.bin");
+        fs::remove_file(&replay_log).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &replay_log).unwrap();
+        let started = std::time::Instant::now();
+        let error = replay_with_adapter(
+            &ReplayOptions {
+                directory: symlink_recorded.directory,
+                kernel: symlink_options.kernel.clone(),
+                executable: symlink_options.executable.clone(),
+            },
+            &FailingAdapter,
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_ne!(error.to_string(), "replay adapter failed");
+        fs::remove_dir_all(symlink_root).unwrap();
+    }
+
+    #[test]
+    fn replay_errors_retain_qemu_and_serial_diagnostics() {
+        let root = temporary_root("replay-diagnostics");
+        let options = test_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        let error = replay_with_adapter(
+            &ReplayOptions {
+                directory: recorded.directory,
+                kernel: options.kernel.clone(),
+                executable: options.executable.clone(),
+            },
+            &FailingAdapter,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("distinctive replay failure"), "{message}");
+        assert!(message.contains("replayed guest failed"), "{message}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replay_encoding_errors_retain_qemu_and_serial_diagnostics() {
+        let root = temporary_root("replay-encoding-diagnostics");
+        let options = test_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        let event_path = recorded.directory.join("events.jsonl");
+        let event_bytes = fs::read(&event_path).unwrap();
+        let reformatted_events = event_bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .flat_map(|line| {
+                let mut line = line.to_vec();
+                line.insert(line.len() - 1, b' ');
+                line
+            })
+            .collect::<Vec<_>>();
+        fs::write(&event_path, &reformatted_events).unwrap();
+
+        let mut manifest: Manifest = read_json(
+            &recorded.directory.join("manifest.json"),
+            MAX_MANIFEST_BYTES,
+        )
+        .unwrap();
+        manifest
+            .artifacts
+            .insert("events.jsonl".into(), sha256_bytes(&reformatted_events));
+        let scenario_bytes = fs::read(recorded.directory.join("scenario.toml")).unwrap();
+        let choice_bytes = fs::read(recorded.directory.join("choices.json")).unwrap();
+        let assertion_bytes = fs::read(recorded.directory.join("assertions.json")).unwrap();
+        manifest.semantic_outcome_sha256 = digest_parts([
+            scenario_bytes.as_slice(),
+            choice_bytes.as_slice(),
+            reformatted_events.as_slice(),
+            assertion_bytes.as_slice(),
+        ]);
+        write_json(recorded.directory.join("manifest.json"), &manifest).unwrap();
+
+        let error = replay_with_adapter(
+            &ReplayOptions {
+                directory: recorded.directory,
+                kernel: options.kernel.clone(),
+                executable: options.executable.clone(),
+            },
+            &adapter,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("encoding is not byte-identical"),
+            "{message}"
+        );
+        assert!(message.contains("qemu diagnostics"), "{message}");
+        assert!(message.contains("serial diagnostics"), "{message}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replay_rejects_unicode_manifest_run_id_without_panicking() {
+        let root = temporary_root("unicode-run-id");
+        let options = test_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        let mut manifest: Manifest = read_json(
+            &recorded.directory.join("manifest.json"),
+            MAX_MANIFEST_BYTES,
+        )
+        .unwrap();
+        manifest.run_id = "éaaaaaaaaaaaaaaa-0".into();
+        let renamed = recorded.directory.parent().unwrap().join(&manifest.run_id);
+        fs::rename(&recorded.directory, &renamed).unwrap();
+        write_json(renamed.join("manifest.json"), &manifest).unwrap();
+        let error = replay_with_adapter(
+            &ReplayOptions {
+                directory: renamed,
+                kernel: options.kernel.clone(),
+                executable: options.executable.clone(),
+            },
+            &adapter,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid run ID"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replay_rejects_environment_identity_mismatch() {
+        let root = temporary_root("identity-mismatch");
+        let options = test_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        adapter.identity.lock().unwrap().qemu_version = "different QEMU".into();
+        let error = replay_with_adapter(
+            &ReplayOptions {
+                directory: recorded.directory,
+                kernel: options.kernel.clone(),
+                executable: options.executable.clone(),
+            },
+            &adapter,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("environment identity differs"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1195,12 +2138,14 @@ mod tests {
 
     fn fake_adapter(replace_executable: Option<PathBuf>) -> FakeAdapter {
         FakeAdapter {
-            identity: Mutex::new(Some(identity())),
+            identity: Mutex::new(identity()),
             replace_executable,
             mismatch_request: false,
+            force_unavailable: false,
             forged_assertions: false,
             extra_after_shutdown: false,
             malformed_after_shutdown: false,
+            recorded_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1226,9 +2171,12 @@ mod tests {
             corrupt: false,
             running: false,
             mismatch_request: mismatch,
+            force_unavailable: false,
             forged_assertions: false,
             extra_after_shutdown: extra,
             malformed_after_shutdown: malformed,
+            recorded_events: None,
+            playback: false,
         }
     }
 

@@ -11,14 +11,17 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::protocol::{CommandFrame, Event, EventFrame, PROTOCOL_VERSION, read_frame, write_frame};
+use crate::protocol::{
+    CommandFrame, Event, EventFrame, MAX_FRAME_LENGTH, PROTOCOL_VERSION, SERIAL_ACK,
+};
 
 const MACHINE: &str = "pc-i440fx-9.2";
 const CPU: &str = "qemu64";
 const MEMORY_MIB: u32 = 128;
 const START_TIMEOUT: Duration = Duration::from_secs(10);
-const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
-const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const EVENT_TIMEOUT: Duration = Duration::from_secs(180);
+const EXIT_TIMEOUT: Duration = Duration::from_secs(180);
 const QMP_MESSAGE_LIMIT: usize = 64 * 1024;
 const PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
 const PROBE_READ_BUDGET: usize = 64 * 1024;
@@ -58,6 +61,17 @@ pub struct VmIdentity {
 
 pub trait VmAdapter {
     fn launch_record(&self, config: &RecordConfig) -> io::Result<Box<dyn RunningVm>>;
+
+    fn launch_replay(
+        &self,
+        _config: &RecordConfig,
+        _expected_identity: &VmIdentity,
+    ) -> io::Result<Box<dyn RunningVm>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "VM adapter does not support replay",
+        ))
+    }
 }
 
 pub trait RunningVm {
@@ -73,6 +87,21 @@ pub struct QemuAdapter {
     data_directory: PathBuf,
     bios: PathBuf,
     linuxboot: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum ExecutionMode {
+    Record,
+    Replay,
+}
+
+impl ExecutionMode {
+    fn qemu_value(self) -> &'static str {
+        match self {
+            Self::Record => "record",
+            Self::Replay => "replay",
+        }
+    }
 }
 
 impl QemuAdapter {
@@ -126,11 +155,11 @@ impl QemuAdapter {
             vcpus: 1,
             accelerator: "tcg".into(),
             firmware: vec![file_identity(&self.bios)?, file_identity(&self.linuxboot)?],
-            devices: vec!["isa-serial".into()],
+            devices: vec!["isa-serial:diagnostics".into(), "isa-serial:agent".into()],
         })
     }
 
-    fn arguments(&self, config: &RecordConfig) -> io::Result<Vec<OsString>> {
+    fn arguments(&self, config: &RecordConfig, mode: ExecutionMode) -> io::Result<Vec<OsString>> {
         validate_utf8_paths(config)?;
         Ok(vec![
             "-machine".into(),
@@ -169,19 +198,35 @@ impl QemuAdapter {
                 .into(),
             "-chardev".into(),
             "stdio,id=agent,signal=off".into(),
-            "-device".into(),
-            "isa-serial,chardev=agent,index=1".into(),
+            "-serial".into(),
+            "chardev:agent".into(),
             "-qmp".into(),
             option_path("unix:path=", &config.qmp_socket, ",server=on,wait=off")?,
             "-icount".into(),
-            option_path("shift=auto,rr=record,rrfile=", &config.replay_log, "")?,
+            option_path(
+                &format!("shift=auto,rr={},rrfile=", mode.qemu_value()),
+                &config.replay_log,
+                "",
+            )?,
         ])
     }
-}
 
-impl VmAdapter for QemuAdapter {
-    fn launch_record(&self, config: &RecordConfig) -> io::Result<Box<dyn RunningVm>> {
-        for path in [&config.replay_log, &config.qmp_socket] {
+    fn launch(
+        &self,
+        config: &RecordConfig,
+        mode: ExecutionMode,
+        expected_identity: Option<&VmIdentity>,
+    ) -> io::Result<Box<dyn RunningVm>> {
+        let mut stale_paths = vec![&config.qmp_socket];
+        if matches!(mode, ExecutionMode::Record) {
+            stale_paths.push(&config.replay_log);
+        } else if !config.replay_log.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("replay log is missing: {}", config.replay_log.display()),
+            ));
+        }
+        for path in stale_paths {
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -189,10 +234,20 @@ impl VmAdapter for QemuAdapter {
             }
         }
         let identity = self.identity(config)?;
+        if let Some(expected) = expected_identity
+            && &identity != expected
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "replay environment identity differs from the recording\nexpected: {expected:#?}\nactual: {identity:#?}"
+                ),
+            ));
+        }
         let qemu_log = File::create(&config.qemu_log)?;
         let mut command = ProcessCommand::new(&self.executable);
         command
-            .args(self.arguments(config)?)
+            .args(self.arguments(config, mode)?)
             .current_dir(config.qmp_socket.parent().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "QMP socket has no parent")
             })?)
@@ -215,7 +270,8 @@ impl VmAdapter for QemuAdapter {
             .stdout
             .take()
             .expect("qemu stdout was configured as piped");
-        let writer = match CommandWriter::new(input, EVENT_TIMEOUT) {
+        let (acknowledgements, acknowledged) = mpsc::channel();
+        let writer = match CommandWriter::new(input, acknowledged, COMMAND_TIMEOUT) {
             Ok(writer) => writer,
             Err(error) => {
                 terminate(&mut child);
@@ -227,7 +283,7 @@ impl VmAdapter for QemuAdapter {
             .name("qemu-agent-events".into())
             .spawn(move || {
                 loop {
-                    let event = read_frame(&mut output);
+                    let event = read_serial_event(&mut output, &acknowledgements);
                     let finished = !matches!(event, Ok(Some(_)));
                     if sender.send(event).is_err() || finished {
                         break;
@@ -265,7 +321,97 @@ impl VmAdapter for QemuAdapter {
     }
 }
 
+impl VmAdapter for QemuAdapter {
+    fn launch_record(&self, config: &RecordConfig) -> io::Result<Box<dyn RunningVm>> {
+        self.launch(config, ExecutionMode::Record, None)
+    }
+
+    fn launch_replay(
+        &self,
+        config: &RecordConfig,
+        expected_identity: &VmIdentity,
+    ) -> io::Result<Box<dyn RunningVm>> {
+        self.launch(config, ExecutionMode::Replay, Some(expected_identity))
+    }
+}
+
 type WriteRequest = (CommandFrame, mpsc::Sender<io::Result<()>>);
+
+fn write_serial_command(
+    output: &mut impl Write,
+    acknowledgements: &Receiver<()>,
+    frame: &CommandFrame,
+    timeout: Duration,
+) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(frame).map_err(io::Error::other)?;
+    if bytes.len() > MAX_FRAME_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame exceeds maximum length",
+        ));
+    }
+    bytes.push(b'\n');
+    let deadline = Instant::now() + timeout;
+    for byte in bytes {
+        output.write_all(&[byte])?;
+        output.flush()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match acknowledgements.recv_timeout(remaining) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for guest serial acknowledgement",
+                ));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "guest serial acknowledgement channel disconnected",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_serial_event(
+    input: &mut impl Read,
+    acknowledgements: &mpsc::Sender<()>,
+) -> io::Result<Option<EventFrame>> {
+    let mut body = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        match input.read(&mut byte) {
+            Ok(0) if body.is_empty() => return Ok(None),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated serial event frame",
+                ));
+            }
+            Ok(1) if byte[0] == SERIAL_ACK => {
+                let _ = acknowledgements.send(());
+            }
+            Ok(1) if byte[0] == b'\n' => break,
+            Ok(1) => {
+                if body.len() >= MAX_FRAME_LENGTH {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "frame exceeds maximum length",
+                    ));
+                }
+                body.push(byte[0]);
+            }
+            Ok(_) => unreachable!("one-byte buffer accepted more than one byte"),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
 
 struct CommandWriter {
     requests: SyncSender<WriteRequest>,
@@ -274,13 +420,18 @@ struct CommandWriter {
 }
 
 impl CommandWriter {
-    fn new(mut output: impl Write + Send + 'static, timeout: Duration) -> io::Result<Self> {
+    fn new(
+        mut output: impl Write + Send + 'static,
+        acknowledgements: Receiver<()>,
+        timeout: Duration,
+    ) -> io::Result<Self> {
         let (requests, receiver) = mpsc::sync_channel::<WriteRequest>(1);
         let thread = thread::Builder::new()
             .name("qemu-agent-commands".into())
             .spawn(move || {
                 while let Ok((frame, completion)) = receiver.recv() {
-                    let result = write_frame(&mut output, &frame);
+                    let result =
+                        write_serial_command(&mut output, &acknowledgements, &frame, timeout);
                     let failed = result.is_err();
                     let _ = completion.send(result);
                     if failed {
@@ -822,7 +973,6 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
 
@@ -851,7 +1001,9 @@ mod tests {
     #[test]
     fn record_arguments_fix_identity_and_escape_option_paths() {
         let root = Path::new("/tmp/directory=with,comma");
-        let arguments = adapter(root).arguments(&config(root)).unwrap();
+        let arguments = adapter(root)
+            .arguments(&config(root), ExecutionMode::Record)
+            .unwrap();
         let arguments = arguments
             .iter()
             .map(|argument| argument.to_string_lossy())
@@ -865,10 +1017,23 @@ mod tests {
             "-bios /tmp/directory=with,comma/share/qemu/bios-256k.bin",
             "rrfile=/tmp/directory=with,,comma/replay.bin",
             "unix:path=/tmp/directory=with,,comma/qmp.sock",
-            "isa-serial,chardev=agent,index=1",
+            "-serial chardev:agent",
         ] {
             assert!(arguments.contains(required), "missing argument: {required}");
         }
+    }
+
+    #[test]
+    fn replay_arguments_consume_the_existing_replay_log() {
+        let root = Path::new("/tmp/replay");
+        let arguments = adapter(root)
+            .arguments(&config(root), ExecutionMode::Replay)
+            .unwrap();
+        assert!(
+            arguments.iter().any(|argument| {
+                argument == "shift=auto,rr=replay,rrfile=/tmp/replay/replay.bin"
+            })
+        );
     }
 
     #[test]
@@ -884,17 +1049,9 @@ mod tests {
     #[test]
     fn command_writer_times_out_when_transport_stalls() {
         let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let receive_buffer: libc::c_int = 1024;
-        unsafe {
-            libc::setsockopt(
-                reader.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                (&receive_buffer as *const libc::c_int).cast(),
-                std::mem::size_of_val(&receive_buffer) as libc::socklen_t,
-            );
-        }
-        let command_writer = CommandWriter::new(writer, Duration::from_millis(20)).unwrap();
+        let (_acknowledged, acknowledgements) = mpsc::channel();
+        let command_writer =
+            CommandWriter::new(writer, acknowledgements, Duration::from_millis(20)).unwrap();
         let frame = CommandFrame {
             protocol_version: PROTOCOL_VERSION,
             command_id: 1,
@@ -910,6 +1067,26 @@ mod tests {
         );
         drop(reader);
         command_writer.join().unwrap();
+    }
+
+    #[test]
+    fn serial_event_reader_demultiplexes_command_acknowledgements() {
+        let event = EventFrame {
+            protocol_version: PROTOCOL_VERSION,
+            event_id: 1,
+            command_id: 1,
+            event: Event::ServerStopped {},
+            diagnostics: crate::protocol::DiagnosticFields::default(),
+        };
+        let mut bytes = vec![SERIAL_ACK, SERIAL_ACK];
+        bytes.extend(serde_json::to_vec(&event).unwrap());
+        bytes.push(b'\n');
+        let (acknowledgements, acknowledged) = mpsc::channel();
+        assert_eq!(
+            read_serial_event(&mut bytes.as_slice(), &acknowledgements).unwrap(),
+            Some(event)
+        );
+        assert_eq!(acknowledged.try_iter().count(), 2);
     }
 
     #[test]
