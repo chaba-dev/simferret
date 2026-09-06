@@ -73,15 +73,15 @@ required by an acceptance criterion in the RFD.
 
 * Phase 3 — Rust replay path
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
-- [ ] Validate artifact digests and environment compatibility before replay.
-- [ ] Launch QEMU from the recorded initial state in replay mode.
-- [ ] Detect early termination, hangs, surplus events, missing events, and event
+- [X] Validate artifact digests and environment compatibility before replay.
+- [X] Launch QEMU from the recorded initial state in replay mode.
+- [X] Detect early termination, hangs, surplus events, missing events, and event
   divergence with an actionable first-difference report.
-- [ ] Compare normalized event, assertion, and semantic outcome artifacts.
-- [ ] Prove two consecutive replays produce byte-identical semantic artifacts.
+- [X] Compare normalized event, assertion, and semantic outcome artifacts.
+- [X] Prove two consecutive replays produce byte-identical semantic artifacts.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
