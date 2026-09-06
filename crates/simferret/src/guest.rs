@@ -26,7 +26,7 @@ pub fn init() -> io::Result<i32> {
     configure_serial(&channel)?;
     let mut input = channel.try_clone()?;
     let mut output = channel;
-    crate::protocol::write_frame(
+    crate::protocol::write_line_frame(
         &mut output,
         &crate::protocol::EventFrame {
             protocol_version: crate::protocol::PROTOCOL_VERSION,
@@ -37,7 +37,7 @@ pub fn init() -> io::Result<i32> {
         },
     )?;
     let executable = std::env::current_exe()?;
-    let status = crate::agent::run(&mut input, &mut output, &executable)?;
+    let status = crate::agent::run_serial(&mut input, &mut output, &executable)?;
 
     // SAFETY: reboot is called by PID 1 in the isolated guest after all fixture
     // processes have been reaped and all semantic output has been flushed.

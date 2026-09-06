@@ -9,14 +9,31 @@ use std::time::Duration;
 use crate::assertions::evaluate;
 use crate::fixture;
 use crate::protocol::{
-    Command, CommandFrame, DiagnosticFields, Event, EventFrame, PROTOCOL_VERSION, read_frame,
-    require_version, write_frame,
+    Command, CommandFrame, DiagnosticFields, Event, EventFrame, PROTOCOL_VERSION,
+    read_acknowledged_line_frame, read_frame, require_version, write_frame, write_line_frame,
 };
 
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn run(input: &mut impl Read, output: &mut impl Write, executable: &Path) -> io::Result<i32> {
-    let mut agent = Agent::new(executable);
+    run_with_framing(input, output, executable, false)
+}
+
+pub fn run_serial(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    executable: &Path,
+) -> io::Result<i32> {
+    run_with_framing(input, output, executable, true)
+}
+
+fn run_with_framing(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    executable: &Path,
+    line_framing: bool,
+) -> io::Result<i32> {
+    let mut agent = Agent::new(executable, line_framing);
     let result = agent.command_loop(input, output);
     let stop_result = agent.stop_server();
     result.and(stop_result.map(|()| agent.exit_code))
@@ -29,10 +46,11 @@ struct Agent<'a> {
     events: Vec<EventFrame>,
     next_event_id: u64,
     exit_code: i32,
+    line_framing: bool,
 }
 
 impl<'a> Agent<'a> {
-    fn new(executable: &'a Path) -> Self {
+    fn new(executable: &'a Path, line_framing: bool) -> Self {
         Self {
             executable,
             server: None,
@@ -40,11 +58,20 @@ impl<'a> Agent<'a> {
             events: Vec::new(),
             next_event_id: 1,
             exit_code: 0,
+            line_framing,
         }
     }
 
     fn command_loop(&mut self, input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
-        while let Some(frame) = read_frame::<CommandFrame>(input)? {
+        loop {
+            let frame = if self.line_framing {
+                read_acknowledged_line_frame::<CommandFrame>(input, output)?
+            } else {
+                read_frame::<CommandFrame>(input)?
+            };
+            let Some(frame) = frame else {
+                return Ok(());
+            };
             require_version(frame.protocol_version)?;
             let command_id = frame.command_id;
             match frame.command {
@@ -121,7 +148,6 @@ impl<'a> Agent<'a> {
                 }
             }
         }
-        Ok(())
     }
 
     fn emit(&mut self, command_id: u64, event: Event, output: &mut impl Write) -> io::Result<()> {
@@ -133,7 +159,11 @@ impl<'a> Agent<'a> {
             diagnostics: DiagnosticFields::default(),
         };
         self.next_event_id += 1;
-        write_frame(output, &frame)?;
+        if self.line_framing {
+            write_line_frame(output, &frame)?;
+        } else {
+            write_frame(output, &frame)?;
+        }
         self.events.push(frame);
         Ok(())
     }
@@ -327,7 +357,7 @@ mod tests {
         while child.try_wait().unwrap().is_none() {
             thread::yield_now();
         }
-        let mut agent = Agent::new(Path::new("unused"));
+        let mut agent = Agent::new(Path::new("unused"), false);
         agent.server = Some(child);
         assert!(agent.stop_server_controlled().is_err());
     }

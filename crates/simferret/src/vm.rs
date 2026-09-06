@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::protocol::{CommandFrame, Event, EventFrame, PROTOCOL_VERSION, read_frame, write_frame};
+use crate::protocol::{
+    CommandFrame, Event, EventFrame, MAX_FRAME_LENGTH, PROTOCOL_VERSION, SERIAL_ACK,
+};
 
 const MACHINE: &str = "pc-i440fx-9.2";
 const CPU: &str = "qemu64";
@@ -153,7 +155,7 @@ impl QemuAdapter {
             vcpus: 1,
             accelerator: "tcg".into(),
             firmware: vec![file_identity(&self.bios)?, file_identity(&self.linuxboot)?],
-            devices: vec!["isa-serial".into()],
+            devices: vec!["isa-serial:diagnostics".into(), "isa-serial:agent".into()],
         })
     }
 
@@ -196,8 +198,8 @@ impl QemuAdapter {
                 .into(),
             "-chardev".into(),
             "stdio,id=agent,signal=off".into(),
-            "-device".into(),
-            "isa-serial,chardev=agent,index=1".into(),
+            "-serial".into(),
+            "chardev:agent".into(),
             "-qmp".into(),
             option_path("unix:path=", &config.qmp_socket, ",server=on,wait=off")?,
             "-icount".into(),
@@ -268,7 +270,8 @@ impl QemuAdapter {
             .stdout
             .take()
             .expect("qemu stdout was configured as piped");
-        let writer = match CommandWriter::new(input, COMMAND_TIMEOUT) {
+        let (acknowledgements, acknowledged) = mpsc::channel();
+        let writer = match CommandWriter::new(input, acknowledged, COMMAND_TIMEOUT) {
             Ok(writer) => writer,
             Err(error) => {
                 terminate(&mut child);
@@ -280,7 +283,7 @@ impl QemuAdapter {
             .name("qemu-agent-events".into())
             .spawn(move || {
                 loop {
-                    let event = read_frame(&mut output);
+                    let event = read_serial_event(&mut output, &acknowledgements);
                     let finished = !matches!(event, Ok(Some(_)));
                     if sender.send(event).is_err() || finished {
                         break;
@@ -334,6 +337,82 @@ impl VmAdapter for QemuAdapter {
 
 type WriteRequest = (CommandFrame, mpsc::Sender<io::Result<()>>);
 
+fn write_serial_command(
+    output: &mut impl Write,
+    acknowledgements: &Receiver<()>,
+    frame: &CommandFrame,
+    timeout: Duration,
+) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(frame).map_err(io::Error::other)?;
+    if bytes.len() > MAX_FRAME_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame exceeds maximum length",
+        ));
+    }
+    bytes.push(b'\n');
+    let deadline = Instant::now() + timeout;
+    for byte in bytes {
+        output.write_all(&[byte])?;
+        output.flush()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match acknowledgements.recv_timeout(remaining) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for guest serial acknowledgement",
+                ));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "guest serial acknowledgement channel disconnected",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_serial_event(
+    input: &mut impl Read,
+    acknowledgements: &mpsc::Sender<()>,
+) -> io::Result<Option<EventFrame>> {
+    let mut body = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        match input.read(&mut byte) {
+            Ok(0) if body.is_empty() => return Ok(None),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated serial event frame",
+                ));
+            }
+            Ok(1) if byte[0] == SERIAL_ACK => {
+                let _ = acknowledgements.send(());
+            }
+            Ok(1) if byte[0] == b'\n' => break,
+            Ok(1) => {
+                if body.len() >= MAX_FRAME_LENGTH {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "frame exceeds maximum length",
+                    ));
+                }
+                body.push(byte[0]);
+            }
+            Ok(_) => unreachable!("one-byte buffer accepted more than one byte"),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 struct CommandWriter {
     requests: SyncSender<WriteRequest>,
     thread: Option<JoinHandle<()>>,
@@ -341,13 +420,18 @@ struct CommandWriter {
 }
 
 impl CommandWriter {
-    fn new(mut output: impl Write + Send + 'static, timeout: Duration) -> io::Result<Self> {
+    fn new(
+        mut output: impl Write + Send + 'static,
+        acknowledgements: Receiver<()>,
+        timeout: Duration,
+    ) -> io::Result<Self> {
         let (requests, receiver) = mpsc::sync_channel::<WriteRequest>(1);
         let thread = thread::Builder::new()
             .name("qemu-agent-commands".into())
             .spawn(move || {
                 while let Ok((frame, completion)) = receiver.recv() {
-                    let result = write_frame(&mut output, &frame);
+                    let result =
+                        write_serial_command(&mut output, &acknowledgements, &frame, timeout);
                     let failed = result.is_err();
                     let _ = completion.send(result);
                     if failed {
@@ -889,7 +973,6 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
 
@@ -934,7 +1017,7 @@ mod tests {
             "-bios /tmp/directory=with,comma/share/qemu/bios-256k.bin",
             "rrfile=/tmp/directory=with,,comma/replay.bin",
             "unix:path=/tmp/directory=with,,comma/qmp.sock",
-            "isa-serial,chardev=agent,index=1",
+            "-serial chardev:agent",
         ] {
             assert!(arguments.contains(required), "missing argument: {required}");
         }
@@ -966,17 +1049,9 @@ mod tests {
     #[test]
     fn command_writer_times_out_when_transport_stalls() {
         let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let receive_buffer: libc::c_int = 1024;
-        unsafe {
-            libc::setsockopt(
-                reader.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                (&receive_buffer as *const libc::c_int).cast(),
-                std::mem::size_of_val(&receive_buffer) as libc::socklen_t,
-            );
-        }
-        let command_writer = CommandWriter::new(writer, Duration::from_millis(20)).unwrap();
+        let (_acknowledged, acknowledgements) = mpsc::channel();
+        let command_writer =
+            CommandWriter::new(writer, acknowledgements, Duration::from_millis(20)).unwrap();
         let frame = CommandFrame {
             protocol_version: PROTOCOL_VERSION,
             command_id: 1,
@@ -992,6 +1067,26 @@ mod tests {
         );
         drop(reader);
         command_writer.join().unwrap();
+    }
+
+    #[test]
+    fn serial_event_reader_demultiplexes_command_acknowledgements() {
+        let event = EventFrame {
+            protocol_version: PROTOCOL_VERSION,
+            event_id: 1,
+            command_id: 1,
+            event: Event::ServerStopped {},
+            diagnostics: crate::protocol::DiagnosticFields::default(),
+        };
+        let mut bytes = vec![SERIAL_ACK, SERIAL_ACK];
+        bytes.extend(serde_json::to_vec(&event).unwrap());
+        bytes.push(b'\n');
+        let (acknowledgements, acknowledged) = mpsc::channel();
+        assert_eq!(
+            read_serial_event(&mut bytes.as_slice(), &acknowledgements).unwrap(),
+            Some(event)
+        );
+        assert_eq!(acknowledged.try_iter().count(), 2);
     }
 
     #[test]

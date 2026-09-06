@@ -8,6 +8,7 @@ use crate::assertions::AssertionReport;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_LENGTH: usize = 1024 * 1024;
 pub const MAX_REQUEST_DATA_LENGTH: usize = 64 * 1024;
+pub const SERIAL_ACK: u8 = 0;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -139,6 +140,19 @@ pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Resu
     writer.flush()
 }
 
+pub fn write_line_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> {
+    let body = serde_json::to_vec(value).map_err(io::Error::other)?;
+    if body.len() > MAX_FRAME_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame exceeds maximum length",
+        ));
+    }
+    writer.write_all(&body)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
+
 pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<Option<T>> {
     let mut length = [0_u8; 4];
     loop {
@@ -160,6 +174,77 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<Opt
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+pub fn read_line_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<Option<T>> {
+    let mut body = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) if body.is_empty() => return Ok(None),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated line-delimited frame",
+                ));
+            }
+            Ok(1) if byte[0] == b'\n' => break,
+            Ok(1) => {
+                if body.len() >= MAX_FRAME_LENGTH {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "frame exceeds maximum length",
+                    ));
+                }
+                body.push(byte[0]);
+            }
+            Ok(_) => unreachable!("one-byte buffer accepted more than one byte"),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+pub fn read_acknowledged_line_frame<T: DeserializeOwned>(
+    reader: &mut impl Read,
+    acknowledgements: &mut impl Write,
+) -> io::Result<Option<T>> {
+    let mut body = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) if body.is_empty() => return Ok(None),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated line-delimited frame",
+                ));
+            }
+            Ok(1) => {
+                acknowledgements.write_all(&[SERIAL_ACK])?;
+                acknowledgements.flush()?;
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if body.len() >= MAX_FRAME_LENGTH {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "frame exceeds maximum length",
+                    ));
+                }
+                body.push(byte[0]);
+            }
+            Ok(_) => unreachable!("one-byte buffer accepted more than one byte"),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
     serde_json::from_slice(&body)
         .map(Some)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
@@ -195,6 +280,60 @@ mod tests {
         write_frame(&mut bytes, &command).unwrap();
         assert_eq!(read_frame(&mut bytes.as_slice()).unwrap(), Some(command));
         assert!(require_version(PROTOCOL_VERSION + 1).is_err());
+    }
+
+    #[test]
+    fn line_frame_round_trip() {
+        let command = CommandFrame {
+            protocol_version: PROTOCOL_VERSION,
+            command_id: 9,
+            command: Command::StopServer {},
+        };
+        let mut bytes = Vec::new();
+        write_line_frame(&mut bytes, &command).unwrap();
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert_eq!(
+            read_line_frame(&mut bytes.as_slice()).unwrap(),
+            Some(command)
+        );
+    }
+
+    #[test]
+    fn truncated_line_frame_is_not_treated_as_clean_eof() {
+        assert_eq!(
+            read_line_frame::<CommandFrame>(&mut br#"{"protocol_version":1}"#.as_slice())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn oversized_line_frame_is_rejected_before_reading_past_the_limit() {
+        let bytes = vec![b' '; MAX_FRAME_LENGTH + 1];
+        assert_eq!(
+            read_line_frame::<CommandFrame>(&mut bytes.as_slice())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn acknowledged_line_frame_acks_every_consumed_byte() {
+        let command = CommandFrame {
+            protocol_version: PROTOCOL_VERSION,
+            command_id: 9,
+            command: Command::StopServer {},
+        };
+        let mut bytes = Vec::new();
+        write_line_frame(&mut bytes, &command).unwrap();
+        let mut acknowledgements = Vec::new();
+        assert_eq!(
+            read_acknowledged_line_frame(&mut bytes.as_slice(), &mut acknowledgements).unwrap(),
+            Some(command)
+        );
+        assert_eq!(acknowledgements, vec![SERIAL_ACK; bytes.len()]);
     }
 
     #[test]
