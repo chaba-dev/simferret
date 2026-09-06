@@ -206,8 +206,8 @@ current QEMU, kernel, firmware, machine, CPU, memory, vCPU, accelerator, and
 device identity with the recording. QEMU consumes a verified private copy of
 the replay log, so replay does not modify the recorded run.
 
-On 2026-09-06, a fresh recording under QEMU 11.1.0 produced a 10,135,454-byte
-replay log. Two consecutive replays completed in 16.17 and 16.35 seconds. Both
+On 2026-09-06, a fresh recording under QEMU 11.1.0 produced an 8,415,903-byte
+replay log. Two consecutive replays completed in 14.46 and 14.70 seconds. Both
 replays reached normal termination and verified 17 byte-identical normalized
 events, the byte-identical assertion report, and this semantic outcome digest:
 
@@ -221,13 +221,13 @@ after both runs:
 
 [source,text]
 ----
-replay.bin      5cecabda62f768ffe53f944d7ebab65aa70546320476e6c268aefce5afad1dcb
+replay.bin      b1588b8b219a52c3d11c6071231c5d996fad03de9d599710f94c742c0e662be7
 events.jsonl    c8e706bf77ba5f4e9a81b1faaa667087267046620db7bd613aad144a0d270fc2
 assertions.json 416af5fbbed7c8522f713d3f73ddf08f350dbc64d9bb59b006f7e7f4c1de5b9d
 ----
 
 The initial-state digest was
-`93c4950e5fe9c4fbd60959e367e60e14cae290b4a105f4d067a814f862fa3820`.
+`4c5ed79dc43f598b43595dc51c167aad1df690ca4a38b7276010f16330afc42d`.
 An initial 10-second event deadline was insufficient, and a 60-second deadline
 was sensitive to host load despite active QEMU progress. Replay therefore uses
 a three-minute per-event infrastructure deadline while command writes retain a
@@ -238,5 +238,5 @@ Regression tests replay the adapter-backed recording twice, reject changes to
 each of the seven artifacts before launch, reject VM identity mismatch, and
 report the first valid-but-divergent event. Shared VM and protocol tests cover
 bounded startup, event and exit waits, early termination, malformed or missing
-frames, and surplus terminal events. The workspace has forty-nine unit tests
+frames, and surplus terminal events. The workspace has fifty unit tests
 and seven process-level integration tests.
