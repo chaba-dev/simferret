@@ -147,15 +147,18 @@ the run's choices. Seed 42 selected request index 2 of 6 as the fault point.
 
 The controller launched QEMU 11.1.0 in TCG record mode with machine
 `pc-i440fx-9.2`, CPU `qemu64`, one vCPU, 128 MiB of memory, no network, and a
-second ISA serial port as the recorded command/event boundary. QEMU command-line
-construction, process supervision, QMP capability negotiation, and bounded
-startup/event/exit waits are owned by one VM adapter. A typed readiness event
-prevents host input from reaching the emulated serial port before the guest has
-configured it for raw framed I/O. Scenario execution itself contains no sleeps
-or wall-clock decisions. The manifest identifies both QEMU firmware inputs by
-absolute path and digest. The verification run started from a directory
-containing a shadow `linuxboot_dma.bin`; QEMU's private working directory and
-explicit firmware paths prevented that file from affecting the recording.
+replay-aware ISA serial port as the recorded command/event boundary. Serial
+commands use line-delimited JSON. The host sends one byte at a time and waits
+for a guest acknowledgement before sending the next, preventing QEMU's deferred
+record events from overrunning the emulated UART. QEMU command-line construction,
+process supervision, QMP capability negotiation, and bounded startup/event/exit
+waits are owned by one VM adapter. A typed readiness event prevents host input
+from reaching the serial port before the guest has configured it for raw I/O.
+Scenario execution itself contains no sleeps or wall-clock decisions. The
+manifest identifies both QEMU firmware inputs by absolute path and digest. The
+verification run started from a directory containing a shadow
+`linuxboot_dma.bin`; QEMU's private working directory and explicit firmware
+paths prevented that file from affecting the recording.
 
 The real run produced 17 normalized events: two matching requests before the
 fault, one stopped-phase attempt followed by unavailability, a server restart,
@@ -167,7 +170,7 @@ returned zero and printed the run ID, artifact path, assertion summary, and
 
 The completed run directory was published with one rename only after QEMU exited
 normally and every artifact had been written. It contained the exact scenario,
-choice plan, 5,985,388-byte QEMU replay log, normalized JSON-lines events,
+choice plan, 12,366,448-byte QEMU replay log, normalized JSON-lines events,
 assertion report, QEMU and serial diagnostics, and a manifest that digested all
 seven non-manifest artifacts. The semantic outcome digest covering scenario,
 choices, events, and assertions was:
@@ -178,14 +181,14 @@ choices, events, and assertions was:
 ----
 
 The recorded initramfs digest was
-`2229316f7f0d37121587ffd93e39ca552d04032c0c0f71da1b08aa8a4f2c00d2`;
+`1e3b6589da8bd98b16befc8e207374431c4356668c36b2c5f40235a58b0d85da`;
 the replay log digest was
-`04fca7df8562fd9e21dee5d50b5c8b8453143db2e96c2132da996c6710e05b41`.
+`6247d1d0723b56096ecdc18762f691a0050a9abce702eeb2adde60bec854e448`.
 The existing kernel digest remained
 `d4c2d110cb9b82dad81517cc2f1f3a46d0e31c8937237cf3df59eeffb3d7070b`.
 An adapter-backed regression test independently verifies complete artifact
 publication and every manifest digest without requiring QEMU. Together with the
-scenario and VM-boundary tests, the workspace now has forty-four unit tests and
+scenario and VM-boundary tests, the workspace now has sixty-one unit tests and
 seven process-level integration tests.
 
 == Phase 3 — Rust replay path
@@ -204,12 +207,18 @@ rematerializes the choice plan from the recorded seed, rebuilds the
 content-addressed initial state from the current executable, and compares the
 current QEMU, kernel, firmware, machine, CPU, memory, vCPU, accelerator, and
 device identity with the recording. QEMU consumes a verified private copy of
-the replay log, so replay does not modify the recorded run.
+the replay log, so replay does not modify the recorded run. Every input is
+opened nonblocking without following symlinks, verified as a bounded regular
+file through its descriptor, and bounded again while reading, hashing, or
+copying it.
 
-On 2026-09-06, a fresh recording under QEMU 11.1.0 produced an 8,415,903-byte
-replay log. Two consecutive replays completed in 14.46 and 14.70 seconds. Both
-replays reached normal termination and verified 17 byte-identical normalized
-events, the byte-identical assertion report, and this semantic outcome digest:
+On 2026-09-06, a fresh recording under QEMU 11.1.0 completed in approximately
+65 seconds and produced a 12,366,448-byte replay log. Two consecutive replays
+completed in 74.63 and 74.78 seconds. The replay controller made zero command
+writes: QEMU supplied all guest input from the recorded serial stream. Both
+replays reached normal termination and incrementally verified 17 byte-identical
+normalized events, the byte-identical assertion report, and this semantic
+outcome digest:
 
 [source,text]
 ----
@@ -221,13 +230,13 @@ after both runs:
 
 [source,text]
 ----
-replay.bin      b1588b8b219a52c3d11c6071231c5d996fad03de9d599710f94c742c0e662be7
+replay.bin      6247d1d0723b56096ecdc18762f691a0050a9abce702eeb2adde60bec854e448
 events.jsonl    c8e706bf77ba5f4e9a81b1faaa667087267046620db7bd613aad144a0d270fc2
 assertions.json 416af5fbbed7c8522f713d3f73ddf08f350dbc64d9bb59b006f7e7f4c1de5b9d
 ----
 
 The initial-state digest was
-`4c5ed79dc43f598b43595dc51c167aad1df690ca4a38b7276010f16330afc42d`.
+`1e3b6589da8bd98b16befc8e207374431c4356668c36b2c5f40235a58b0d85da`.
 An initial 10-second event deadline was insufficient, and a 60-second deadline
 was sensitive to host load despite active QEMU progress. Replay therefore uses
 a three-minute per-event infrastructure deadline while command writes retain a
@@ -236,7 +245,12 @@ position.
 
 Regression tests replay the adapter-backed recording twice, reject changes to
 each of the seven artifacts before launch, reject VM identity mismatch, and
-report the first valid-but-divergent event. Shared VM and protocol tests cover
-bounded startup, event and exit waits, early termination, malformed or missing
-frames, and surplus terminal events. The workspace has fifty unit tests
-and seven process-level integration tests.
+report the first valid-but-divergent event before reading later output. They
+also reject FIFOs, devices, symlinks, oversized inputs, inconsistent recorded
+semantics, forged guest assertions, and malformed Unicode run IDs, while
+retaining both diagnostic streams for launch, execution, and final encoding
+failures. Shared VM and protocol tests cover replay-aware serial topology,
+per-byte acknowledgement framing, passive replay, bounded startup/event/exit
+waits, early termination, malformed or missing frames, and surplus terminal
+events. The workspace has sixty-one unit tests and seven process-level integration
+tests.
