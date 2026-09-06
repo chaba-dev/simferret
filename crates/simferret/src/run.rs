@@ -222,12 +222,56 @@ pub fn replay_with_adapter(
             expected_events.len()
         )));
     }
+    for (index, event) in expected_events.iter().enumerate() {
+        if event.protocol_version != PROTOCOL_VERSION || event.event_id != index as u64 + 1 {
+            return Err(invalid_data(format!(
+                "recorded event envelope is invalid at index {index}: {event:#?}"
+            )));
+        }
+    }
     let expected_assertion_bytes = read_bounded(
         &directory.join("assertions.json"),
         MAX_SEMANTIC_ARTIFACT_BYTES,
     )?;
     let expected_assertions: AssertionReport = serde_json::from_slice(&expected_assertion_bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if !valid_report(&expected_assertions) {
+        return Err(invalid_data(
+            "recorded assertion report has an invalid shape",
+        ));
+    }
+    let expected_frames = expected_events
+        .iter()
+        .map(|event| EventFrame {
+            protocol_version: event.protocol_version,
+            event_id: event.event_id,
+            command_id: event.command_id,
+            event: event.event.clone(),
+            diagnostics: Default::default(),
+        })
+        .collect::<Vec<_>>();
+    let evaluated_assertions = evaluate(
+        &expected_frames,
+        scenario.outage_event_bound,
+        scenario.liveness_event_bound,
+    );
+    if expected_assertions != evaluated_assertions {
+        return Err(invalid_data(
+            "recorded assertion report does not match recorded events",
+        ));
+    }
+    let recorded_semantic_digest = digest_parts([
+        scenario_bytes.as_slice(),
+        choice_bytes.as_slice(),
+        expected_event_bytes.as_slice(),
+        expected_assertion_bytes.as_slice(),
+    ]);
+    if recorded_semantic_digest != manifest.semantic_outcome_sha256 {
+        return Err(invalid_data(format!(
+            "recorded semantic outcome digest mismatch: expected {}, found {recorded_semantic_digest}",
+            manifest.semantic_outcome_sha256
+        )));
+    }
 
     let runs_directory = directory
         .parent()
@@ -1359,6 +1403,59 @@ mod tests {
             assert!(error.to_string().contains(name), "{error}");
             fs::write(path, original).unwrap();
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replay_rejects_self_consistent_digests_for_inconsistent_semantics() {
+        let root = temporary_root("inconsistent-semantics");
+        let options = test_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        let mut manifest: Manifest = read_json(
+            &recorded.directory.join("manifest.json"),
+            MAX_MANIFEST_BYTES,
+        )
+        .unwrap();
+        let mut assertions: AssertionReport = read_json(
+            &recorded.directory.join("assertions.json"),
+            MAX_SEMANTIC_ARTIFACT_BYTES,
+        )
+        .unwrap();
+        assertions.passed = false;
+        assertions.assertions[0].passed = false;
+        assertions.assertions[0].detail = "forged failure".into();
+        let assertion_bytes = json_bytes(&assertions).unwrap();
+        fs::write(recorded.directory.join("assertions.json"), &assertion_bytes).unwrap();
+        manifest
+            .artifacts
+            .insert("assertions.json".into(), sha256_bytes(&assertion_bytes));
+        let scenario_bytes = fs::read(recorded.directory.join("scenario.toml")).unwrap();
+        let choice_bytes = fs::read(recorded.directory.join("choices.json")).unwrap();
+        let event_bytes = fs::read(recorded.directory.join("events.jsonl")).unwrap();
+        manifest.semantic_outcome_sha256 = digest_parts([
+            scenario_bytes.as_slice(),
+            choice_bytes.as_slice(),
+            event_bytes.as_slice(),
+            assertion_bytes.as_slice(),
+        ]);
+        write_json(recorded.directory.join("manifest.json"), &manifest).unwrap();
+
+        let error = replay_with_adapter(
+            &ReplayOptions {
+                directory: recorded.directory,
+                kernel: options.kernel.clone(),
+                executable: options.executable.clone(),
+            },
+            &adapter,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("assertion report does not match recorded events"),
+            "{error}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
