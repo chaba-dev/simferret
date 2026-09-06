@@ -62,7 +62,8 @@ expect_status() {
 }
 
 cargo build --manifest-path "$repo_root/Cargo.toml" \
-  --locked --release --target x86_64-unknown-linux-musl
+  --locked --release --target x86_64-unknown-linux-musl \
+  --target-dir "$repo_root/target"
 
 run_timed record-seed-42 env \
   SIMFERRET_KERNEL="$kernel" QEMU_SYSTEM_X86_64="$qemu" \

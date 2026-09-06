@@ -56,6 +56,7 @@ jobs:
         with:
           install_url: https://releases.nixos.org/nix/nix-2.35.1/install
       - run: nix develop --command ./scripts/qemu-replay-smoke-test.sh
+      - run: nix develop --command ./scripts/phase4-acceptance-test.sh
       - run: nix develop --command ./scripts/qemu-replay-smoke.sh
       - run: nix develop --command ./scripts/phase4-acceptance.sh
       - if: failure()
