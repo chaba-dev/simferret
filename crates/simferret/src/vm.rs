@@ -58,6 +58,17 @@ pub struct VmIdentity {
 
 pub trait VmAdapter {
     fn launch_record(&self, config: &RecordConfig) -> io::Result<Box<dyn RunningVm>>;
+
+    fn launch_replay(
+        &self,
+        _config: &RecordConfig,
+        _expected_identity: &VmIdentity,
+    ) -> io::Result<Box<dyn RunningVm>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "VM adapter does not support replay",
+        ))
+    }
 }
 
 pub trait RunningVm {
@@ -73,6 +84,21 @@ pub struct QemuAdapter {
     data_directory: PathBuf,
     bios: PathBuf,
     linuxboot: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum ExecutionMode {
+    Record,
+    Replay,
+}
+
+impl ExecutionMode {
+    fn qemu_value(self) -> &'static str {
+        match self {
+            Self::Record => "record",
+            Self::Replay => "replay",
+        }
+    }
 }
 
 impl QemuAdapter {
@@ -130,7 +156,7 @@ impl QemuAdapter {
         })
     }
 
-    fn arguments(&self, config: &RecordConfig) -> io::Result<Vec<OsString>> {
+    fn arguments(&self, config: &RecordConfig, mode: ExecutionMode) -> io::Result<Vec<OsString>> {
         validate_utf8_paths(config)?;
         Ok(vec![
             "-machine".into(),
@@ -174,14 +200,30 @@ impl QemuAdapter {
             "-qmp".into(),
             option_path("unix:path=", &config.qmp_socket, ",server=on,wait=off")?,
             "-icount".into(),
-            option_path("shift=auto,rr=record,rrfile=", &config.replay_log, "")?,
+            option_path(
+                &format!("shift=auto,rr={},rrfile=", mode.qemu_value()),
+                &config.replay_log,
+                "",
+            )?,
         ])
     }
-}
 
-impl VmAdapter for QemuAdapter {
-    fn launch_record(&self, config: &RecordConfig) -> io::Result<Box<dyn RunningVm>> {
-        for path in [&config.replay_log, &config.qmp_socket] {
+    fn launch(
+        &self,
+        config: &RecordConfig,
+        mode: ExecutionMode,
+        expected_identity: Option<&VmIdentity>,
+    ) -> io::Result<Box<dyn RunningVm>> {
+        let mut stale_paths = vec![&config.qmp_socket];
+        if matches!(mode, ExecutionMode::Record) {
+            stale_paths.push(&config.replay_log);
+        } else if !config.replay_log.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("replay log is missing: {}", config.replay_log.display()),
+            ));
+        }
+        for path in stale_paths {
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -189,10 +231,20 @@ impl VmAdapter for QemuAdapter {
             }
         }
         let identity = self.identity(config)?;
+        if let Some(expected) = expected_identity
+            && &identity != expected
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "replay environment identity differs from the recording\nexpected: {expected:#?}\nactual: {identity:#?}"
+                ),
+            ));
+        }
         let qemu_log = File::create(&config.qemu_log)?;
         let mut command = ProcessCommand::new(&self.executable);
         command
-            .args(self.arguments(config)?)
+            .args(self.arguments(config, mode)?)
             .current_dir(config.qmp_socket.parent().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "QMP socket has no parent")
             })?)
@@ -262,6 +314,20 @@ impl VmAdapter for QemuAdapter {
             ));
         }
         Ok(Box::new(vm))
+    }
+}
+
+impl VmAdapter for QemuAdapter {
+    fn launch_record(&self, config: &RecordConfig) -> io::Result<Box<dyn RunningVm>> {
+        self.launch(config, ExecutionMode::Record, None)
+    }
+
+    fn launch_replay(
+        &self,
+        config: &RecordConfig,
+        expected_identity: &VmIdentity,
+    ) -> io::Result<Box<dyn RunningVm>> {
+        self.launch(config, ExecutionMode::Replay, Some(expected_identity))
     }
 }
 
@@ -851,7 +917,9 @@ mod tests {
     #[test]
     fn record_arguments_fix_identity_and_escape_option_paths() {
         let root = Path::new("/tmp/directory=with,comma");
-        let arguments = adapter(root).arguments(&config(root)).unwrap();
+        let arguments = adapter(root)
+            .arguments(&config(root), ExecutionMode::Record)
+            .unwrap();
         let arguments = arguments
             .iter()
             .map(|argument| argument.to_string_lossy())
@@ -869,6 +937,19 @@ mod tests {
         ] {
             assert!(arguments.contains(required), "missing argument: {required}");
         }
+    }
+
+    #[test]
+    fn replay_arguments_consume_the_existing_replay_log() {
+        let root = Path::new("/tmp/replay");
+        let arguments = adapter(root)
+            .arguments(&config(root), ExecutionMode::Replay)
+            .unwrap();
+        assert!(
+            arguments.iter().any(|argument| {
+                argument == "shift=auto,rr=replay,rrfile=/tmp/replay/replay.bin"
+            })
+        );
     }
 
     #[test]
