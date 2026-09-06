@@ -167,7 +167,7 @@ returned zero and printed the run ID, artifact path, assertion summary, and
 
 The completed run directory was published with one rename only after QEMU exited
 normally and every artifact had been written. It contained the exact scenario,
-choice plan, 8,738,263-byte QEMU replay log, normalized JSON-lines events,
+choice plan, 5,985,388-byte QEMU replay log, normalized JSON-lines events,
 assertion report, QEMU and serial diagnostics, and a manifest that digested all
 seven non-manifest artifacts. The semantic outcome digest covering scenario,
 choices, events, and assertions was:
@@ -178,12 +178,12 @@ choices, events, and assertions was:
 ----
 
 The recorded initramfs digest was
-`91d71bc397aa5c91c6506ebe8dc6c97d9f184df2aadcd791fb512bb41d983b04`;
+`2229316f7f0d37121587ffd93e39ca552d04032c0c0f71da1b08aa8a4f2c00d2`;
 the replay log digest was
-`0865c7105d08bc3fd0c94b750c5a8b9c1b6df5a36f5ad4cd03ffe9cf98540244`.
+`04fca7df8562fd9e21dee5d50b5c8b8453143db2e96c2132da996c6710e05b41`.
 The existing kernel digest remained
 `d4c2d110cb9b82dad81517cc2f1f3a46d0e31c8937237cf3df59eeffb3d7070b`.
 An adapter-backed regression test independently verifies complete artifact
 publication and every manifest digest without requiring QEMU. Together with the
-scenario and VM-boundary tests, the workspace now has forty-two unit tests and
+scenario and VM-boundary tests, the workspace now has forty-four unit tests and
 seven process-level integration tests.

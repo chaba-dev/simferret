@@ -69,7 +69,11 @@ drives requests over a recorded serial boundary, stops and restarts the real
 echo-server process at the seed-derived choice point, and evaluates structured
 assertions. A successful run prints its identifier, assertion result, artifact
 directory, and the Phase 3 replay command. Complete runs are atomically
-published under `runs/`; incomplete staging directories are removed.
+published under `runs/`; incomplete staging directories are removed when the
+controller unwinds normally. Abrupt termination can leave hidden temporary
+directories that require manual removal. The replay identity guarantee assumes
+the documented pinned, immutable Nix QEMU, kernel, and firmware inputs; mutable
+environment overrides are outside the Phase 2 contract.
 
 ## Development
 
