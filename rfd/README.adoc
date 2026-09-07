@@ -10,6 +10,9 @@ authoritative merely because it exists; its `state` says how it should be read.
 
 | link:0001/README.adoc[1: Deterministic execution proof of concept]
 | Rust/QEMU execution architecture and a bounded record/replay demonstration with a controlled process failure
+
+| link:0002/README.adoc[2: Deterministic network fault model]
+| Restricted QEMU networking and a bounded, replayable peer-specific outage
 |===
 
 == Source format
