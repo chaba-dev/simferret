@@ -190,7 +190,26 @@ contained only the later robustness commit and not RFD 2's earlier index entry.
 The complete RFD 2 branch contains that entry and passes the same check. This was
 a validation-transfer issue, not a QEMU or repository-branch failure.
 
-GitHub-hosted x86-64 Linux execution remains required before Phase 0 is complete.
+=== GitHub-hosted x86-64 Linux
+
+The checked-in regression and real network smoke commands passed in the
+`QEMU record/replay` job on GitHub-hosted Ubuntu. The complete job passed in 6
+minutes 38 seconds without elevated privileges. The network record took 5.733
+seconds, its passive replays took 9.008 and 8.781 seconds, and the intentional
+corruption record took 5.986 seconds.
+
+The initramfs size and digest matched `sophie`. The 3,502,215-byte replay log had
+SHA-256 digest
+`b5aa21826f7b9c71d85aade288611aa8c514f78b8757444d906d6d30367ce38b`.
+Record and both replay serial streams again had the cross-host semantic digest
+`33ddf17fe726d78ffe495a37f1926284cba9038dcb218ad4874778453671dbf3`.
+The corrupt serial stream had the expected digest
+`f1a0bd0af1b41a564493105a4bb213b6d1469c8dba33e36dcb74a49192dc20bb`.
+
+The Amp orb, independent `sophie` runner, and GitHub-hosted runner therefore all
+validate the selected tuple. This completes the Phase 0 feasibility gate while
+leaving controller integration, typed production identities, and full RFD 2
+acceptance to subsequent phases.
 
 == Negative results and constraints
 
