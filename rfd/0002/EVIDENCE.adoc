@@ -1,0 +1,122 @@
+= RFD 2 Preliminary Evidence
+
+== Purpose
+
+These pre-implementation spikes test whether the network boundary proposed by
+RFD 2 is feasible with the QEMU, kernel, machine, and unprivileged CI constraints
+committed by RFD 1. They establish viability, not completion of RFD 2's
+controller integration or acceptance criteria.
+
+== Sophie runner baseline
+
+The `sophie` x86-64 Linux runner fetched `origin/main` at commit `e27ffb2f` and
+ran the repository's pinned QEMU 11.1.0, Linux 6.18.49, machine
+`pc-i440fx-9.2`, and TCG as an unprivileged user.
+
+The RFD 1 QEMU smoke test passed in 24.97 seconds. Its internal record duration
+was 5.75 seconds and its two replay durations were 8.89 and 9.43 seconds. The
+5,863,403-byte replay log had SHA-256 digest
+`b0c696f907f8706e8147506e9948dc7c9c19e648a798dc5a1a74d162a4186090`.
+All serial outputs had SHA-256 digest
+`3771b23d96c0b8635c375ecb9e3c39664890e3dc7f5eb06a3317041799f25b66`.
+
+The complete RFD 1 acceptance demonstration also passed in 236.35 seconds. The
+normal record took 54.96 seconds, its replays took 63.40 and 62.95 seconds, and
+the intentional-corruption record took 53.91 seconds. Artifact tampering,
+identity tampering, and intentional fixture corruption produced their expected
+failures.
+
+== RTL8139 ingress and passive replay on Sophie
+
+A disposable spike used this replay-relevant network shape:
+
+[source,text]
+----
+-device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+-netdev user,id=net0,restrict=on,hostfwd=udp:127.0.0.1:45555-:12345
+-object filter-replay,id=net-replay,netdev=net0
+-icount shift=auto,rr=<record|replay>,rrfile=<replay.bin>
+----
+
+The guest received the 23-byte payload `simferret-network-spike` from
+`10.0.2.2` and emitted `NET_SPIKE_OK`. Record mode completed in 6.54 seconds.
+Two replays without the host forward or sender completed in 10.87 and 11.10
+seconds with byte-identical serial output.
+
+A stronger replay replaced the recording-time user backend with an isolated
+socket netdev listening on a private unused address and no peer. It completed in
+11.20 seconds with the same serial output. This directly establishes that
+replay requires a netdev object for structural attachment but does not require
+the recording backend, host forward, sender, or peer interaction.
+
+The 8,335,311-byte replay log had SHA-256 digest
+`47df1845882b06f7020c40cf24f1a35429d804cb6eef13585c261be2d7962fa2`.
+The record and all three replay serial streams had SHA-256 digest
+`c96da14b312c0e61c09dbdefb550bb4a165ca914165f9201703afd467d23bc38`.
+Against the focused no-network smoke run, this one-packet sample increased log
+size by 1.42 times, record duration by 1.14 times, and replay duration by
+approximately 1.2 times. It is not a throughput forecast.
+
+== Outage and recovery spike in an Amp orb
+
+A second disposable spike used QEMU 11.1.0, the same kernel and machine, an
+explicit e1000 NIC, restricted user-mode networking, built-in TFTP fixture
+content, and `filter-replay`. A static BusyBox guest configured the NIC and a
+fixed route.
+
+The guest fetched matching content, installed a peer-specific `prohibit` route,
+observed an immediate unavailable result, removed the route, and fetched the
+matching content again. It emitted all three markers:
+
+[source,text]
+----
+SIMFERRET_NET_PRE_OK version=1
+SIMFERRET_NET_OUTAGE_OK version=1
+SIMFERRET_NET_RECOVERY_OK version=1
+----
+
+After record mode, the TFTP fixture directory was deleted. Two passive replays
+still produced byte-identical serial output. Record mode took 13.27 seconds and
+the replays took 34.12 and 34.02 seconds. The replay log was 20,951,688 bytes
+with SHA-256 digest
+`5de81a09527cebd7aabe6fb376f4aa4504dc33fa4e0c108e9e0028c61ded801a`.
+All serial streams had SHA-256 digest
+`59ae1229ae23afdab0e79bee1fa80ec3b83bedc8c893d9d21673f3a4bbb5a7a2`.
+
+This proves the initial peer-specific route fault with e1000. RFD 2 still must
+repeat the integrated outage scenario with its selected RTL8139 identity.
+
+== Negative results and constraints
+
+Omitting `filter-replay` allowed recording and ingress but caused replay to hang
+until its 15-second watchdog expired. Referring the filter to a nonexistent
+netdev, or omitting the netdev object, failed immediately because the filter
+requires a backend identifier.
+
+Changing the MAC address during replay produced partial divergence and then a
+15-second timeout. Reusing the recording-time host forward while its port was
+occupied failed QEMU startup. In the orb spike, omitting the filter or changing
+the MAC similarly hung until a 20-second watchdog expired. QEMU therefore cannot
+provide the required actionable compatibility validation; SimFerret must reject
+these differences before launch.
+
+Using a TCP `guestfwd` endpoint caused QEMU to connect to its peer during backend
+initialization, including before replay could disable packet interaction. The
+recording peer could not simply be absent. Restricted built-in fixture services
+or a record-time host forward combined with an isolated replay netdev avoid this
+coupling.
+
+The pinned kernel builds RTL8139, e1000, and virtio-net drivers as modules. The
+RTL8139 spike required `mii`, `8139cp`, and `8139too`. Its minimal loader could
+not pass compressed `.ko.xz` files directly to `finit_module`; the initramfs
+decompressed them first.
+
+Netfilter core is built in, while nftables, iptables, and netem functionality is
+provided as modules. Their module dependency closures exist, but the current
+guest does not contain them or a pinned `nft`, `iptables`, or `tc` executable.
+A peer-specific route through pinned static BusyBox is proven and smaller for
+the first outage. Rich packet faults remain unproven.
+
+All successful network spikes ran as uid 1000 with QEMU TCG and user-mode
+networking. They required no root access, TAP, bridge, KVM, or uncontrolled
+Internet traffic.

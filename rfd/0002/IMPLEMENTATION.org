@@ -1,0 +1,120 @@
+#+TITLE: RFD 0002 implementation checklist
+#+STARTUP: showall
+
+Implements [[file:README.adoc][RFD 2: Deterministic network fault model]].
+
+* Objective
+
+Prove a bounded network outage and recovery through an explicit QEMU network
+device and replay filter while preserving RFD 1's exact passive replay contract.
+
+* Entry gate
+:PROPERTIES:
+:STATUS: DONE
+:END:
+
+- [X] Complete RFD 1 and review its replay fidelity, runtime, artifact size,
+  unsupported-input, and GitHub Actions evidence.
+- [X] Confirm that QEMU documents record/replay for network backends through one
+  replay filter per backend.
+- [X] Select an unprivileged single-guest spike before considering TAP, multiple
+  guests, a custom network stack, or broad QEMU changes.
+
+* Phase 0 — Network replay spike
+:PROPERTIES:
+:STATUS: DONE
+:END:
+
+- [X] Select and pin an emulated NIC, fixed MAC address, user-mode backend, and
+  replay-filter configuration supported by the pinned QEMU.
+- [X] Build the smallest guest kernel and initramfs additions required for a
+  fixed address, route, network request, and narrow network rule.
+- [X] Connect the guest through a restricted private network path to
+  content-controlled fixture input without external network access.
+- [X] Record real traffic through the NIC and replay it twice with the recording
+  backend, host forward, fixture content, and peer interaction absent.
+- [X] Verify that omitting or misplacing the replay filter fails the spike rather
+  than producing an artifact marked replayable.
+- [X] Record exact QEMU options, packet direction, device support, duration,
+  replay-log growth, and all observed divergence.
+
+* Phase 1 — Network identity and VM adapter
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Add the NIC, MAC, record backend, isolated replay backend, replay filter,
+  addressing, route, fixture, and fault settings to typed identities.
+- [ ] Construct and supervise all QEMU network options and private peer endpoints
+  inside the VM adapter boundary.
+- [ ] Restrict accepted configurations to the proven unprivileged backend and
+  reject unrestricted, TAP, bridge, passthrough, and unrecorded networking.
+- [ ] Validate all network identity fields before replay and report the first
+  incompatibility with expected and actual values.
+- [ ] Keep runtime-only socket paths and host process identifiers diagnostic
+  without removing endpoint type and safety behavior from the launch contract.
+
+* Phase 2 — Fault protocol and properties
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Extend the scenario and stable choice plan with outage activation and
+  restoration points.
+- [ ] Add versioned guest commands and events for applying, confirming, and
+  removing one outbound peer-specific prohibit route.
+- [ ] Ensure fault transitions are event-driven and no host sleep or task wake
+  order controls scenario semantics.
+- [ ] Route fixture workload traffic through the emulated NIC rather than guest
+  loopback.
+- [ ] Evaluate typed pre-outage safety, bounded outage, restoration, and bounded
+  recovery properties from structured events.
+- [ ] Preserve intentional response corruption as a safety-property failure
+  across the network boundary.
+
+* Phase 3 — Record and passive replay integration
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Record a finite successful, outage, and recovery sequence and persist its
+  complete network identity and semantic artifacts atomically.
+- [ ] Replay the recording twice through the isolated replay netdev without the
+  record backend, fixture content, host forwarding, or peer interaction.
+- [ ] Compare normalized events, assertion artifacts, and semantic outcome
+  digests while QEMU injects recorded incoming packets.
+- [ ] Reject tampered network identities, missing replay filters, malformed
+  fault plans, and network artifact divergence.
+- [ ] Retain bounded QEMU, backend-mode, fault-transition, and packet-count
+  diagnostics for launch, execution, and replay failures.
+
+* Phase 4 — Acceptance and evidence
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Automate the record-and-two-replays demonstration on a GitHub-hosted
+  x86-64 Linux runner without elevated privileges.
+- [ ] Verify another seed changes the materialized request or outage plan.
+- [ ] Verify every network identity class is covered by compatibility or
+  tampering tests.
+- [ ] Verify forbidden external and privileged network configurations fail
+  before QEMU starts.
+- [ ] Verify intentional response corruption returns a nonzero CLI result.
+- [ ] Document the equivalent self-hosted-runner requirements and invocation.
+- [ ] Record runtime, replay-log growth, traffic volume, event-bounded fault
+  latency, device limitations, and all observed divergence in ~EVIDENCE.adoc~.
+- [ ] Recommend the next RFD from the measured network and CI evidence.
+
+* Exit criteria
+
+- [ ] Every acceptance criterion in the RFD has linked automated or captured
+  evidence.
+- [ ] Replay is passive with respect to the host network backend and fixture
+  input.
+- [ ] The acceptance traffic demonstrably traverses the configured QEMU NIC and
+  replay filter.
+- [ ] The implementation preserves RFD 1's VM adapter, artifact, identity,
+  normalization, and assertion ownership boundaries.
+- [ ] No privileged networking, external service, second guest, custom network
+  stack, custom VMM, or broad QEMU fork exists without new evidence and an RFD.

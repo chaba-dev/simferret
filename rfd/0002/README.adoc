@@ -1,0 +1,329 @@
+:authors: Darwin Wu <tough.pasta0068@wunli88.com>
+:state: prediscussion
+:discussion:
+:labels: determinism, faults, network, qemu, replay, testing
+
+= RFD 2 Deterministic network fault model
+
+== Goal
+
+Add one explicitly configured virtual network to SimFerret and prove that a
+seeded, recorded network outage can be reproduced exactly. The increment should
+expand the RFD 1 process-restart scenario across a QEMU-supported network replay
+boundary without adding a custom network stack, privileged host networking,
+multiple virtual machines, or uncontrolled Internet access.
+
+The result establishes whether QEMU's replay filter and an unprivileged network
+backend are a viable base for later partitions, packet faults, multiple nodes,
+and state-space exploration.
+
+== Motivation
+
+RFD 1 proved exact record and replay of one diskless, one-vCPU guest controlled
+through a replay-aware serial port. Its acceptance run completed without
+semantic divergence, detected artifact and VM-identity tampering, and passed in
+GitHub Actions. It also remained limited to guest loopback communication and a
+process failure.
+
+The final RFD 1 evidence recommends a deterministic network fault model as the
+next increment. A network replay spike is narrower than general container
+packaging and gives the project evidence about the QEMU device boundary before
+it commits to multi-node workloads or snapshot branching.
+
+RFD 1 recorded approximately 64 seconds for the normal scenario and 70 seconds
+for each replay, with an 8.5 MB replay log. The per-byte acknowledged ISA serial
+protocol contributes operational overhead. This RFD records the additional
+cost of a NIC and network traffic but does not combine that measurement with an
+unrelated control-channel redesign.
+
+== QEMU network replay boundary
+
+QEMU record/replay supports network input through one `filter-replay` object per
+network backend. In record mode the filter writes packets entering QEMU from the
+backend to the replay log. In replay mode it disables backend interaction and
+injects those packets from the log. Outbound packets and guest device execution
+remain deterministic consequences of the initial state and recorded inputs.
+
+The initial spike selected the emulated RTL8139 NIC used by QEMU's documented
+record/replay example. Record mode uses an unprivileged, restricted user-mode
+network backend and one replay filter:
+
+[source,text]
+----
+-netdev user,id=simnet,restrict=on,<explicit-fixture-options>
+-device rtl8139,netdev=simnet,mac=52:54:00:12:34:56
+-object filter-replay,id=simnet-replay,netdev=simnet
+----
+
+Replay still requires a netdev object with the recorded identifier, but it does
+not require the recording backend, host forward, or peer. The proven replay
+configuration uses an isolated socket netdev with no connected peer and the same
+replay filter:
+
+[source,text]
+----
+-netdev socket,id=simnet,listen=<private-unused-address>
+-device rtl8139,netdev=simnet,mac=52:54:00:12:34:56
+-object filter-replay,id=simnet-replay,netdev=simnet
+----
+
+Record and replay backend configurations are therefore distinct typed parts of
+the VM launch contract. The record backend and fixture identity are semantic
+inputs. The replay backend is a restricted sink selected from a proven allowlist
+and must have no peer interaction. Its runtime address is not compared with the
+record backend as though they were the same device input.
+
+The record backend is restricted from reaching arbitrary external networks. It
+exposes only the minimum fixture service or forwarding path required by the
+scenario. TAP, host bridges, raw sockets, and host firewall configuration are
+excluded because they require privileges and would make the GitHub-hosted CI
+environment materially different from local execution.
+
+The pinned kernel provides RTL8139 support as compressed modules rather than
+built-in code. The reproducible initramfs includes the exact `mii`, `8139cp`, and
+`8139too` module dependency closure and decompresses modules before loading them.
+The module digests, load order, and decompression tool are part of the initial
+state identity.
+
+== Scenario boundary
+
+The acceptance scenario retains one guest and the small auditable fixtures from
+RFD 1. Traffic under test must traverse the emulated NIC; guest loopback traffic
+does not satisfy this RFD.
+
+The initial outage topology is:
+
+[source,text]
+----
+guest workload client
+  -> guest TCP/IP stack
+  -> emulated NIC
+  -> QEMU user network backend and replay filter
+  -> content-controlled fixture service
+----
+
+The guest uses a fixed MAC address and static network configuration so DHCP and
+DNS do not add inputs unrelated to the test. The first fixture is immutable
+content served by QEMU's restricted built-in TFTP service. The controller
+materializes and digests that content in a private run directory. The backend
+has no route to an external service.
+
+The guest agent continues to emit structured semantic events over the existing
+serial channel. Network traffic is an application input, not a replacement
+control plane. In replay mode the fixture content and recording-time backend are
+absent; QEMU must supply all incoming packets from the recorded replay log while
+an isolated netdev satisfies the structural device attachment. This passive
+replay condition is an acceptance requirement rather than an implementation
+detail.
+
+== Fault contract
+
+The first fault is a bounded outbound outage for the configured fixture peer. At
+a seed-derived choice point, the controller sends a recorded fault command to
+the guest agent. The agent installs a `prohibit` route for that peer address,
+confirms the transition as a structured event, and later removes the route at
+another explicit choice point. A disposable spike proved immediate failure and
+recovery with this mechanism through an e1000 NIC; the implementation repeats
+the result with the selected RTL8139 identity.
+
+The route targets only the fixture peer and may not alter unrelated guest
+traffic. A pinned static BusyBox `ip` implementation applies the route without
+requiring nftables, iptables, qdisc, or their module dependency closures. The
+tool digest, arguments, route representation, and resulting event are part of
+the initial-state and scenario identities.
+
+The fault model is event-driven. Host sleeps, host packet timing, and task wake
+order do not determine when the outage begins or ends. Infrastructure deadlines
+may terminate a hung run, but they are not semantic fault choices.
+
+The recorded scenario performs this sequence:
+
+. boot the guest and configure the explicit network interface;
+. establish the content-controlled fixture service;
+. send at least one successful request through the emulated NIC;
+. activate the directional outage at the recorded choice point;
+. attempt at least one request and observe a bounded unavailable result;
+. remove the outage;
+. observe a subsequent matching response within an event bound;
+. evaluate structured safety, outage, and recovery properties; and
+. shut down normally.
+
+The route produces an immediate unreachable result for the initial outage.
+Silent packet loss, port-specific filtering, probabilistic loss, latency,
+duplication, corruption, reordering, bandwidth limits, and asymmetric partitions
+are later extensions. The pinned kernel exposes nftables, iptables, and netem as
+modules, but no corresponding userspace tool is currently pinned in the guest.
+Kernel configuration alone is not evidence that those later faults are usable.
+
+== Choice plan and replay identity
+
+The scenario seed materializes the request plan, outage activation point, and
+restoration point into the choice plan before those choices affect the guest.
+A seed alone remains insufficient for exact replay.
+
+The RFD 1 replay identity is extended with at least:
+
+* NIC model, fixed MAC address, and all device properties;
+* record backend type and complete semantic configuration;
+* the allowed isolated replay backend type and safety properties;
+* replay-filter type, placement, and properties;
+* guest network address, route, peer, transport, and direction;
+* guest-kernel fault mechanism and rule representation; and
+* identities of the fixture content and its fixed serving behavior.
+
+Runtime-only socket paths and host-assigned process identifiers are diagnostic,
+not semantic, but their endpoint type and safety behavior remain part of the
+launch contract. Replay rejects missing, extra, reordered, or changed semantic
+network identity fields. It also rejects a replay backend outside the isolated
+allowlist before starting QEMU.
+
+Incoming packets are already represented in QEMU's replay log and are not
+duplicated into SimFerret's semantic event stream. Semantic events identify the
+request, response, fault transition, and property result. Optional packet
+diagnostics must be bounded and must not become a second source of replay truth.
+
+== Assertions
+
+The scenario retains RFD 1's response-integrity safety property and adds typed
+network fault events. It passes only when:
+
+* a pre-outage request traverses the configured network and returns the matching
+  request identifier and payload;
+* the outage is confirmed active before an under-fault request is attempted;
+* at least one under-fault request reports unavailable within its event bound;
+* restoration is confirmed before the recovery request is attempted; and
+* a matching post-restoration response arrives within its event bound.
+
+The checker uses structured guest and controller events rather than parsing
+human logs or inferring a partition solely from elapsed host time.
+
+== Artifacts and compatibility
+
+Run directories retain the RFD 1 manifest, scenario, choices, replay log,
+normalized events, assertions, and diagnostics. The manifest includes the
+extended network identity and digests every additional semantic artifact.
+
+Network diagnostics should make first failures actionable. They include the
+resolved QEMU network command line, backend mode, fault transitions, bounded
+packet counters when available, and QEMU errors. Secrets, ambient environment,
+temporary socket paths, and unrestricted packet payload captures are not added
+to normal run artifacts.
+
+QEMU does not reliably diagnose replay identity errors itself. In the completed
+spikes, omitting the replay filter or changing the MAC address caused a hang
+until the watchdog expired. SimFerret must validate the complete network
+identity and mandatory filter before launch rather than relying on QEMU to fail
+fast.
+
+== GitHub Actions and workers
+
+The acceptance scenario runs as an ordinary process on a GitHub-hosted x86-64
+Linux runner. It uses QEMU TCG and unprivileged user-mode networking, so it does
+not require nested virtualization, `/dev/kvm`, TAP devices, or persistent host
+network configuration.
+
+The same CLI invocation is supported on an x86-64 Linux self-hosted runner. The
+GitHub runner remains outside the deterministic guest: placing the Actions agent
+inside the guest would introduce GitHub's network and timing behavior into the
+simulation boundary.
+
+CI uploads complete run diagnostics on failure. A later thin GitHub Action may
+wrap the stable CLI, but Action-specific code is not part of this increment.
+
+== Acceptance criteria
+
+This increment is complete when:
+
+* a documented spike records one successful request through an explicit QEMU
+  NIC and replay-filtered backend, then passively replays it twice;
+* replay succeeds with the recording backend, fixture content, host forwarding,
+  and peer interaction absent, using only an approved isolated replay netdev;
+* the scenario activates and restores a narrowly scoped directional outage at
+  materialized choice points without host sleeps controlling semantics;
+* at least one request succeeds before the outage, one bounded request reports
+  unavailable during it, and one matching request succeeds after restoration;
+* two consecutive replays produce byte-identical normalized event and assertion
+  artifacts and matching semantic outcome digests;
+* changing the seed changes the materialized request or fault choice plan;
+* changing any NIC, record backend, filter, address, route, peer, or fault-rule
+  identity is rejected before replay, and an unsafe replay backend is rejected;
+* omitting the replay filter cannot accidentally produce a run marked
+  replayable;
+* attempts to configure unrestricted external networking, TAP, a host bridge,
+  or an unrecorded backend are rejected;
+* intentional response corruption still produces a failing safety assertion
+  and nonzero CLI result across the network boundary;
+* the complete acceptance demonstration passes on a GitHub-hosted x86-64 Linux
+  runner without additional privileges; and
+* evidence records device compatibility, record and replay duration,
+  replay-log growth, traffic volume, fault latency in semantic events, and all
+  observed divergence.
+
+== Excluded from this increment
+
+This proposal does not include:
+
+* uncontrolled Internet or LAN access;
+* TAP, bridge, passthrough, vhost, or privileged host networking;
+* multiple guests, multiple virtual CPUs, or arbitrary network topology;
+* probabilistic loss, delay, duplication, corruption, or packet reordering;
+* general application, OCI, Docker Compose, or Kubernetes packaging;
+* persistent block devices, disk faults, or durable application state;
+* checkpoint-tree branching or exploration workers;
+* replacing the recorded serial control channel;
+* a custom TCP/IP stack, VMM, or broad QEMU fork; or
+* hosted product, user interface, billing, or organization features.
+
+== Follow-up decision
+
+Completion produces evidence about NIC replay fidelity, passive replay,
+network-log growth, fault control, CI portability, and runtime cost. That
+evidence informs the next RFD.
+
+If the boundary is reliable, reproducible OCI workload packaging is the
+recommended next product-facing increment so users can apply the network model
+to their own software. Checkpoint branching should follow once a real workload
+and network traffic provide representative snapshot and exploration costs.
+Broader packet faults or a second guest move earlier only if the evidence shows
+that the initial outage is too narrow to validate the model.
+
+== Alternatives considered
+
+Reproducible OCI workload packaging would improve user onboarding immediately,
+but it would preserve only the process-restart fault proven by RFD 1. The final
+RFD 1 evidence explicitly recommends validating QEMU's network boundary first.
+
+Checkpoint branching would begin the exploration engine, but its throughput and
+snapshot costs are not representative while the guest has no external device
+traffic and only a small built-in fixture.
+
+TAP networking offers familiar host integration but requires privileges and
+host configuration that are unavailable or undesirable on GitHub-hosted
+runners. QEMU's user-mode backend is narrower and supported by its documented
+replay filter.
+
+A custom deterministic switch or TCP/IP stack would offer precise packet
+scheduling, but it is not required to answer whether QEMU can record and replay
+a controlled network boundary. Such a component requires separate evidence and
+an RFD after a concrete limitation is observed.
+
+Guest nftables or qdisc would support narrower and richer packet faults. The
+pinned kernel has the relevant modules, but the current guest contains neither
+their dependency closures nor pinned control tools. A peer-specific route is the
+smallest mechanism already proven to answer this RFD's outage question.
+
+Two guests would model a realistic partition, but coordinating two independent
+QEMU record/replay timelines introduces a new synchronization problem. The
+single-guest scenario isolates the network replay question first.
+
+== Implementation
+
+Delivery phases are tracked in
+link:IMPLEMENTATION.org[RFD 2 implementation checklist], with preliminary
+results in the adjacent link:EVIDENCE.adoc[evidence record].
+
+== References
+
+* https://www.qemu.org/docs/master/system/replay.html[QEMU record/replay]
+* https://www.qemu.org/docs/master/system/devices/net.html[QEMU network emulation]
+* link:../0001/README.adoc[RFD 1: Deterministic execution proof of concept]
