@@ -162,8 +162,35 @@ The one-request row is the later complete run and is not directly comparable to
 the earlier 10- and 100-request rows. Replay-log size also varied substantially
 between repeated runs. These measurements establish bounded execution through
 100 requests, but do not establish smooth scaling, deterministic replay-log
-size, or production throughput. The checked-in command still needs independent
-execution on `sophie` and GitHub-hosted x86-64 Linux before Phase 0 is complete.
+size, or production throughput.
+
+=== Independent checked-in tuple on Sophie
+
+The same guest sources, build script, pinned dependencies, and QEMU tuple passed
+independent execution on the unprivileged `sophie` runner. The regression suite
+completed in 4.13 seconds. The real smoke command completed in 38.68 seconds:
+record took 6.598 seconds, the two passive replays took 11.029 and 10.965
+seconds, and the intentional-corruption record took 6.692 seconds.
+
+The 866,175-byte initramfs had SHA-256 digest
+`57757eb8eb820d916eee3a980e321c74bec345654f70aa5c71835d6a25f57f33`.
+The 7,754,388-byte replay log had SHA-256 digest
+`28ae9af6f3a0b237ee21bfee6b543638b819f84f3afa6356c7bdd3d68932d8e7`.
+Record and both replay serial streams were byte-identical and matched the Amp
+orb's semantic serial digest,
+`33ddf17fe726d78ffe495a37f1926284cba9038dcb218ad4874778453671dbf3`.
+The corrupt run emitted the typed `response_mismatch` marker and no success
+marker. All QEMU diagnostic logs were empty.
+
+The different hosts produced materially different durations and replay-log
+sizes despite matching semantic output. Replay-log byte identity across separate
+recordings is therefore not a supported invariant. The transfer archive was
+applied over `origin/main`, so its RFD index check failed because the archive
+contained only the later robustness commit and not RFD 2's earlier index entry.
+The complete RFD 2 branch contains that entry and passes the same check. This was
+a validation-transfer issue, not a QEMU or repository-branch failure.
+
+GitHub-hosted x86-64 Linux execution remains required before Phase 0 is complete.
 
 == Negative results and constraints
 

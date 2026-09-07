@@ -33,7 +33,7 @@ device and replay filter while preserving RFD 1's exact passive replay contract.
   content-controlled fixture input without external network access.
 - [X] Record the selected RTL8139 success, administrative-outage, and recovery
   tuple in an Amp orb and replay it twice without fixture content.
-- [ ] Run the same checked-in spike on the ~sophie~ runner.
+- [X] Run the same checked-in spike on the ~sophie~ runner.
 - [ ] Run the same checked-in spike on GitHub-hosted x86-64 Linux.
 - [X] Verify that omitting or misplacing the replay filter fails the spike rather
   than producing an artifact marked replayable.
