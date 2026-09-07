@@ -200,3 +200,28 @@ the first outage. Rich packet faults remain unproven.
 All successful network spikes ran as uid 1000 with QEMU TCG and user-mode
 networking. They required no root access, TAP, bridge, KVM, or uncontrolled
 Internet traffic.
+
+== Phase 1 — Network identity and VM adapter
+
+The VM adapter now represents the selected NIC, fixed MAC and PCI attachment,
+restricted backend, mandatory replay filter, addressing, route, immutable TFTP
+fixture, and peer-specific prohibit-route fault as typed semantic identity. It
+constructs the complete network argument sequence and rejects changed or unsafe
+profiles before QEMU starts. Replay incompatibility reports identify the first
+differing field and include its expected and actual values.
+
+Record fixture identity is derived from a bounded canonical encoding of sorted
+filenames and bytes rather than accepted from the caller. The adapter traverses
+the source without following directory or file symlinks, rejects special files,
+and copies the verified bytes into a private runtime snapshot. QEMU receives
+only that adapter-owned snapshot. Replay refuses live fixture input and creates
+a fresh empty private directory with the same semantic endpoint type. Runtime
+paths remain diagnostic and are excluded from the persisted identity.
+
+Unit regressions cover exact QEMU options, unsupported backends, missing replay
+filters, field-level replay diagnostics, canonical fixture identity, source and
+leaf symlink rejection, special files, bounded file counts and sizes, directory
+substitution, source mutation, preservation of an existing recording after
+preflight failure, absolute runtime paths, passive replay emptiness, and fixture
+ownership through VM launch and drop. The pre-existing no-network profile and
+manifest schema remain compatible with RFD 1.
