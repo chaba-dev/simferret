@@ -131,6 +131,7 @@ pub fn record_with_adapter(options: &RunOptions, adapter: &dyn VmAdapter) -> io:
         qmp_socket: qmp.path.join("qmp.sock"),
         serial_log: staging.path.join("logs/serial.log"),
         qemu_log: staging.path.join("logs/qemu.log"),
+        network: None,
     };
     let execution = (|| {
         let mut vm = adapter.launch_record(&config)?;
@@ -315,6 +316,7 @@ pub fn replay_with_adapter(
         qmp_socket: runtime.path.join("qmp.sock"),
         serial_log: runtime.path.join("logs/serial.log"),
         qemu_log: runtime.path.join("logs/qemu.log"),
+        network: None,
     };
     let execution = (|| {
         let mut vm = adapter.launch_replay(&config, &manifest.vm)?;
@@ -2208,6 +2210,7 @@ mod tests {
                 },
             ],
             devices: vec!["virtio-serial-pci".into()],
+            network: None,
         }
     }
 }

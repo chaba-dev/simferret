@@ -34,6 +34,7 @@ pub struct RecordConfig {
     pub qmp_socket: PathBuf,
     pub serial_log: PathBuf,
     pub qemu_log: PathBuf,
+    pub network: Option<NetworkConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -57,6 +58,328 @@ pub struct VmIdentity {
     pub accelerator: String,
     pub firmware: Vec<FileIdentity>,
     pub devices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkIdentity>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NetworkConfig {
+    pub identity: NetworkIdentity,
+    pub fixture_directory: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkIdentity {
+    pub nic: NicIdentity,
+    pub backend: BackendIdentity,
+    pub replay_filter: Option<ReplayFilterIdentity>,
+    pub addressing: AddressingIdentity,
+    pub route: RouteIdentity,
+    pub fixture: FixtureIdentity,
+    pub fault: FaultIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NicIdentity {
+    pub model: String,
+    pub mac_address: String,
+    pub bus: String,
+    pub pci_address: String,
+    pub option_rom: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendIdentity {
+    pub kind: String,
+    pub id: String,
+    pub restricted: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayFilterIdentity {
+    pub kind: String,
+    pub id: String,
+    pub backend_id: String,
+    pub queue: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddressingIdentity {
+    pub guest_cidr: String,
+    pub gateway: String,
+    pub peer: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteIdentity {
+    pub destination: String,
+    pub gateway: String,
+    pub interface: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureIdentity {
+    pub transport: String,
+    pub behavior: String,
+    pub content_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FaultIdentity {
+    pub mechanism: String,
+    pub direction: String,
+    pub peer_cidr: String,
+    pub rule: String,
+    pub tool: FileIdentity,
+}
+
+impl NetworkConfig {
+    pub fn restricted_tftp(
+        fixture_directory: PathBuf,
+        fixture_content_sha256: String,
+        busybox_sha256: String,
+    ) -> Self {
+        Self {
+            identity: NetworkIdentity {
+                nic: NicIdentity {
+                    model: "rtl8139".into(),
+                    mac_address: "52:54:00:12:34:56".into(),
+                    bus: "pci.0".into(),
+                    pci_address: "0x3".into(),
+                    option_rom: false,
+                },
+                backend: BackendIdentity {
+                    kind: "user".into(),
+                    id: "simnet".into(),
+                    restricted: true,
+                },
+                replay_filter: Some(ReplayFilterIdentity {
+                    kind: "filter-replay".into(),
+                    id: "simnet-replay".into(),
+                    backend_id: "simnet".into(),
+                    queue: "all".into(),
+                }),
+                addressing: AddressingIdentity {
+                    guest_cidr: "10.0.2.15/24".into(),
+                    gateway: "10.0.2.2".into(),
+                    peer: "10.0.2.2".into(),
+                },
+                route: RouteIdentity {
+                    destination: "0.0.0.0/0".into(),
+                    gateway: "10.0.2.2".into(),
+                    interface: "eth0".into(),
+                },
+                fixture: FixtureIdentity {
+                    transport: "tftp".into(),
+                    behavior: "immutable-files".into(),
+                    content_sha256: fixture_content_sha256,
+                },
+                fault: FaultIdentity {
+                    mechanism: "prohibit-route".into(),
+                    direction: "outbound".into(),
+                    peer_cidr: "10.0.2.2/32".into(),
+                    rule: "prohibit 10.0.2.2/32".into(),
+                    tool: FileIdentity {
+                        path: "/bin/busybox".into(),
+                        sha256: busybox_sha256,
+                    },
+                },
+            },
+            fixture_directory,
+        }
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        self.identity.validate()?;
+        let metadata = fs::symlink_metadata(&self.fixture_directory).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "network fixture directory is unavailable: {}: {error}",
+                    self.fixture_directory.display()
+                ),
+            )
+        })?;
+        if !self.fixture_directory.is_absolute()
+            || self.fixture_directory.to_str().is_none()
+            || !metadata.file_type().is_dir()
+        {
+            return Err(invalid_network(
+                "fixture_directory must be an absolute UTF-8 directory and may not be a symlink",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl NetworkIdentity {
+    fn validate(&self) -> io::Result<()> {
+        macro_rules! require {
+            ($condition:expr, $message:literal) => {
+                if !$condition {
+                    return Err(invalid_network($message));
+                }
+            };
+        }
+        require!(
+            self.nic.model == "rtl8139",
+            "only the rtl8139 NIC is supported"
+        );
+        require!(
+            self.nic.mac_address == "52:54:00:12:34:56",
+            "the NIC MAC must match the proven fixed address"
+        );
+        require!(
+            self.nic.bus == "pci.0" && self.nic.pci_address == "0x3",
+            "the NIC must use the proven fixed PCI attachment"
+        );
+        require!(!self.nic.option_rom, "the NIC option ROM must be disabled");
+        require!(
+            self.backend.kind == "user",
+            "TAP, bridge, socket, passthrough, and other network backends are not supported"
+        );
+        require!(
+            self.backend.id == "simnet" && self.backend.restricted,
+            "the user network backend must be restricted and use the fixed identifier"
+        );
+        let filter = self.replay_filter.as_ref().ok_or_else(|| {
+            invalid_network("the replay filter is mandatory for every network backend")
+        })?;
+        require!(
+            filter.kind == "filter-replay"
+                && filter.id == "simnet-replay"
+                && filter.backend_id == self.backend.id
+                && filter.queue == "all",
+            "the replay filter must use the proven backend attachment and all queues"
+        );
+        require!(
+            self.addressing.guest_cidr == "10.0.2.15/24"
+                && self.addressing.gateway == "10.0.2.2"
+                && self.addressing.peer == "10.0.2.2",
+            "guest addressing must match the proven private user-network profile"
+        );
+        require!(
+            self.route.destination == "0.0.0.0/0"
+                && self.route.gateway == self.addressing.gateway
+                && self.route.interface == "eth0",
+            "the guest route must match the proven private user-network profile"
+        );
+        require!(
+            self.fixture.transport == "tftp" && self.fixture.behavior == "immutable-files",
+            "only immutable content served by restricted TFTP is supported"
+        );
+        require!(
+            valid_sha256(&self.fixture.content_sha256),
+            "fixture content must have a lowercase SHA-256 identity"
+        );
+        require!(
+            self.fault.mechanism == "prohibit-route"
+                && self.fault.direction == "outbound"
+                && self.fault.peer_cidr == "10.0.2.2/32"
+                && self.fault.rule == "prohibit 10.0.2.2/32",
+            "the fault must be the proven outbound peer-specific prohibit route"
+        );
+        require!(
+            self.fault.tool.path == "/bin/busybox" && valid_sha256(&self.fault.tool.sha256),
+            "the fault tool must be the digested /bin/busybox executable"
+        );
+        Ok(())
+    }
+}
+
+fn invalid_network(message: impl Into<String>) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "unsafe or unsupported network configuration: {}",
+            message.into()
+        ),
+    )
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_identity_compatibility(expected: &VmIdentity, actual: &VmIdentity) -> io::Result<()> {
+    if expected == actual {
+        return Ok(());
+    }
+    let expected = serde_json::to_value(expected).map_err(io::Error::other)?;
+    let actual = serde_json::to_value(actual).map_err(io::Error::other)?;
+    let (field, expected, actual) = first_identity_difference("vm", &expected, &actual)
+        .expect("unequal identities have a differing field");
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "replay environment identity differs at {field}: expected {expected}, actual {actual}"
+        ),
+    ))
+}
+
+fn first_identity_difference(
+    path: &str,
+    expected: &serde_json::Value,
+    actual: &serde_json::Value,
+) -> Option<(String, String, String)> {
+    match (expected, actual) {
+        (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => {
+            for (name, expected_value) in expected {
+                let child = format!("{path}.{name}");
+                let Some(actual_value) = actual.get(name) else {
+                    return Some((child, expected_value.to_string(), "<missing>".into()));
+                };
+                if let Some(difference) =
+                    first_identity_difference(&child, expected_value, actual_value)
+                {
+                    return Some(difference);
+                }
+            }
+            actual
+                .iter()
+                .find(|(name, _)| !expected.contains_key(*name))
+                .map(|(name, value)| {
+                    (
+                        format!("{path}.{name}"),
+                        "<missing>".into(),
+                        value.to_string(),
+                    )
+                })
+        }
+        (serde_json::Value::Array(expected), serde_json::Value::Array(actual)) => {
+            for (index, expected_value) in expected.iter().enumerate() {
+                let child = format!("{path}[{index}]");
+                let Some(actual_value) = actual.get(index) else {
+                    return Some((child, expected_value.to_string(), "<missing>".into()));
+                };
+                if let Some(difference) =
+                    first_identity_difference(&child, expected_value, actual_value)
+                {
+                    return Some(difference);
+                }
+            }
+            actual.get(expected.len()).map(|value| {
+                (
+                    format!("{path}[{}]", expected.len()),
+                    "<missing>".into(),
+                    value.to_string(),
+                )
+            })
+        }
+        _ if expected == actual => None,
+        _ => Some((path.into(), expected.to_string(), actual.to_string())),
+    }
 }
 
 pub trait VmAdapter {
@@ -138,6 +461,9 @@ impl QemuAdapter {
 
     fn identity(&self, config: &RecordConfig) -> io::Result<VmIdentity> {
         validate_utf8_paths(config)?;
+        if let Some(network) = &config.network {
+            network.validate()?;
+        }
         let output = bounded_output(&self.executable, &["--version"], START_TIMEOUT)?;
         if !output.status.success() {
             return Err(io::Error::other("qemu --version failed"));
@@ -156,12 +482,16 @@ impl QemuAdapter {
             accelerator: "tcg".into(),
             firmware: vec![file_identity(&self.bios)?, file_identity(&self.linuxboot)?],
             devices: vec!["isa-serial:diagnostics".into(), "isa-serial:agent".into()],
+            network: config
+                .network
+                .as_ref()
+                .map(|network| network.identity.clone()),
         })
     }
 
     fn arguments(&self, config: &RecordConfig, mode: ExecutionMode) -> io::Result<Vec<OsString>> {
         validate_utf8_paths(config)?;
-        Ok(vec![
+        let mut arguments = vec![
             "-machine".into(),
             format!("{MACHINE},accel=tcg").into(),
             "-cpu".into(),
@@ -185,8 +515,6 @@ impl QemuAdapter {
             "-serial".into(),
             "chardev:diagnostics".into(),
             "-no-reboot".into(),
-            "-net".into(),
-            "none".into(),
             "-rtc".into(),
             "base=2000-01-01T00:00:00,clock=vm".into(),
             "-kernel".into(),
@@ -202,13 +530,53 @@ impl QemuAdapter {
             "chardev:agent".into(),
             "-qmp".into(),
             option_path("unix:path=", &config.qmp_socket, ",server=on,wait=off")?,
+        ];
+        if let Some(network) = &config.network {
+            network.validate()?;
+            let identity = &network.identity;
+            let filter = identity
+                .replay_filter
+                .as_ref()
+                .expect("validated network has a replay filter");
+            arguments.extend([
+                "-netdev".into(),
+                option_path(
+                    &format!(
+                        "{},id={},restrict=on,tftp=",
+                        identity.backend.kind, identity.backend.id
+                    ),
+                    &network.fixture_directory,
+                    "",
+                )?,
+                "-device".into(),
+                format!(
+                    "{},netdev={},mac={},bus={},addr={},romfile=",
+                    identity.nic.model,
+                    identity.backend.id,
+                    identity.nic.mac_address,
+                    identity.nic.bus,
+                    identity.nic.pci_address
+                )
+                .into(),
+                "-object".into(),
+                format!(
+                    "{},id={},netdev={},queue={}",
+                    filter.kind, filter.id, filter.backend_id, filter.queue
+                )
+                .into(),
+            ]);
+        } else {
+            arguments.extend(["-net".into(), "none".into()]);
+        }
+        arguments.extend([
             "-icount".into(),
             option_path(
                 &format!("shift=auto,rr={},rrfile=", mode.qemu_value()),
                 &config.replay_log,
                 "",
             )?,
-        ])
+        ]);
+        Ok(arguments)
     }
 
     fn launch(
@@ -234,15 +602,8 @@ impl QemuAdapter {
             }
         }
         let identity = self.identity(config)?;
-        if let Some(expected) = expected_identity
-            && &identity != expected
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "replay environment identity differs from the recording\nexpected: {expected:#?}\nactual: {identity:#?}"
-                ),
-            ));
+        if let Some(expected) = expected_identity {
+            validate_identity_compatibility(expected, &identity)?;
         }
         let qemu_log = File::create(&config.qemu_log)?;
         let mut command = ProcessCommand::new(&self.executable);
@@ -986,7 +1347,12 @@ mod tests {
             qmp_socket: root.join("qmp.sock"),
             serial_log: root.join("serial.log"),
             qemu_log: root.join("qemu.log"),
+            network: None,
         }
+    }
+
+    fn network_config(root: &Path) -> NetworkConfig {
+        NetworkConfig::restricted_tftp(root.join("fixture"), "a".repeat(64), "b".repeat(64))
     }
 
     fn adapter(root: &Path) -> QemuAdapter {
@@ -1034,6 +1400,130 @@ mod tests {
                 argument == "shift=auto,rr=replay,rrfile=/tmp/replay/replay.bin"
             })
         );
+    }
+
+    #[test]
+    fn network_arguments_match_the_proven_restricted_replay_profile() {
+        let root = std::env::temp_dir().join(format!(
+            "simferret-network-arguments-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("fixture")).unwrap();
+        let mut config = config(&root);
+        config.network = Some(network_config(&root));
+        let arguments = adapter(&root)
+            .arguments(&config, ExecutionMode::Record)
+            .unwrap()
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                "-netdev",
+                &format!(
+                    "user,id=simnet,restrict=on,tftp={}",
+                    root.join("fixture").display()
+                ),
+            ]
+        }));
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                "-device",
+                "rtl8139,netdev=simnet,mac=52:54:00:12:34:56,bus=pci.0,addr=0x3,romfile=",
+            ]
+        }));
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                "-object",
+                "filter-replay,id=simnet-replay,netdev=simnet,queue=all",
+            ]
+        }));
+        assert!(!arguments.windows(2).any(|pair| pair == ["-net", "none"]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsafe_and_unrecorded_network_profiles_are_rejected() {
+        let root = std::env::temp_dir().join(format!(
+            "simferret-network-validation-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("fixture")).unwrap();
+        let mut network = network_config(&root);
+        network.identity.backend.kind = "tap".into();
+        let error = network.validate().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("TAP, bridge"));
+
+        let mut network = network_config(&root);
+        network.identity.backend.restricted = false;
+        assert!(
+            network
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("restricted")
+        );
+
+        let mut network = network_config(&root);
+        network.identity.replay_filter = None;
+        assert!(
+            network
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("mandatory")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn network_identity_excludes_runtime_fixture_path() {
+        let first = network_config(Path::new("/tmp/record-runtime"));
+        let second = network_config(Path::new("/tmp/replay-runtime"));
+        assert_eq!(first.identity, second.identity);
+        let encoded = serde_json::to_string(&first.identity).unwrap();
+        assert!(!encoded.contains("record-runtime"));
+        assert!(encoded.contains("immutable-files"));
+        assert!(encoded.contains("restrict"));
+    }
+
+    #[test]
+    fn identity_mismatch_reports_the_first_field_with_both_values() {
+        let root =
+            std::env::temp_dir().join(format!("simferret-network-identity-{}", std::process::id()));
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(root.join("share/qemu")).unwrap();
+        fs::create_dir_all(root.join("fixture")).unwrap();
+        fs::write(
+            root.join("bin/qemu-system-x86_64"),
+            b"#!/bin/sh\necho QEMU test version\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            root.join("bin/qemu-system-x86_64"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        for (path, contents) in [
+            ("kernel", b"kernel".as_slice()),
+            ("initramfs", b"initramfs".as_slice()),
+            ("share/qemu/bios-256k.bin", b"bios".as_slice()),
+            ("share/qemu/linuxboot_dma.bin", b"linuxboot".as_slice()),
+        ] {
+            fs::write(root.join(path), contents).unwrap();
+        }
+        let mut config = config(&root);
+        config.network = Some(network_config(&root));
+        let actual = adapter(&root).identity(&config).unwrap();
+        let mut expected = actual.clone();
+        expected.network.as_mut().unwrap().nic.mac_address = "52:54:00:12:34:57".into();
+        let error = validate_identity_compatibility(&expected, &actual).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("vm.network.nic.mac_address"), "{message}");
+        assert!(message.contains("52:54:00:12:34:57"), "{message}");
+        assert!(message.contains("52:54:00:12:34:56"), "{message}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
