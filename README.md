@@ -111,6 +111,27 @@ corrupt fixture to fail safety with CLI status 1. A fresh evidence directory,
 including durations, sizes, digests, command output, and diagnostics, is kept
 under `.poc/phase4-acceptance/`. CI runs the same command on Ubuntu.
 
+## Network replay spike
+
+The RFD 2 Phase 0 spike adds an explicit RTL8139 NIC with its option ROM
+disabled, restricted QEMU user networking, and a mandatory replay filter. It
+fetches content across the NIC, proves a peer-specific administrative outage,
+restores connectivity, passively replays the run twice after removing fixture
+content, and verifies that corrupted network-returned content fails its safety
+property.
+
+On x86-64 Linux, run:
+
+```shell
+.agents/dev ./scripts/qemu-network-replay-smoke.sh
+```
+
+The command builds a deterministic initramfs containing the pinned static
+BusyBox and matching guest-kernel `mii` and `8139cp` modules. It preserves
+durations, identities, digests, serial output, and QEMU diagnostics under
+`.poc/qemu-network-replay-smoke/`. Set `SIMFERRET_NETWORK_REQUESTS` from 1
+through 1000 for bounded traffic-scaling experiments.
+
 ## Development
 
 The Nix flake provides the pinned Rust toolchain and Jujutsu. On an x86-64 Linux
