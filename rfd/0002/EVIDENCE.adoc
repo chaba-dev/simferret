@@ -86,6 +86,85 @@ All serial streams had SHA-256 digest
 This proves the initial peer-specific route fault with e1000. RFD 2 still must
 repeat the integrated outage scenario with its selected RTL8139 identity.
 
+== Checked-in RTL8139 outage tuple in an Amp orb
+
+The checked-in `scripts/qemu-network-replay-smoke.sh` closes the gap between the
+two disposable spikes. It uses the RFD's selected identity and one integrated
+scenario:
+
+[source,text]
+----
+-machine pc-i440fx-9.2,accel=tcg
+-cpu qemu64
+-netdev user,id=simnet,restrict=on,tftp=<private-run-directory>
+-device rtl8139,netdev=simnet,mac=52:54:00:12:34:56,bus=pci.0,addr=0x3,romfile=
+-object filter-replay,id=simnet-replay,netdev=simnet,queue=all
+-icount shift=auto,rr=<record|replay>,rrfile=<private-run-directory>/replay.bin
+----
+
+The reproducible initramfs contains the pinned static BusyBox and decompressed
+`mii` and `8139cp` modules. The guest verifies that `8139cp` actually binds the
+NIC before testing traffic. Each bounded request maps canonically to
+`request-NNNNNN`; the corresponding TFTP file contains that request identifier
+and `payload-NNNNNN` for guest-side comparison.
+
+The exact checked-in command passed in this Amp orb with one request. The record
+took 10.063 seconds, its two passive replays took 32.681 and 34.212 seconds, and
+the intentional-corruption record took 8.700 seconds. The three successful
+serial streams were byte-identical with SHA-256 digest
+`33ddf17fe726d78ffe495a37f1926284cba9038dcb218ad4874778453671dbf3`.
+The 866,175-byte initramfs produced a 24,399,452-byte replay log.
+
+Before both passive replays, the script deletes every TFTP fixture file while
+retaining the same restricted backend profile. Both replays still pass. The
+guest also proves that a peer-specific `prohibit` route causes `sendto` to fail
+with errno 13 (`EACCES`) before removing the route and refetching the fixture.
+Finally, a separate record serves corrupted bytes for the first request. The
+guest emits a typed `response_mismatch` property failure and does not emit the
+success marker. This demonstrates that success is derived from network-returned
+content rather than the guest command alone.
+
+The accompanying fake-QEMU regression suite passes and checks the exact network
+arguments, mandatory filter, disabled option ROM, passive fixture removal,
+intentional corruption, serial mismatch, missing marker, infrastructure-failure
+event, invalid request bounds, comma-bearing QEMU option path, retained prior
+output, and reproducible initramfs across caller umasks.
+
+=== Bounded traffic sample
+
+The complete one-request run and earlier scaling runs of the same checked-in
+scenario produced:
+
+[cols="1,1,1,1,1",options="header"]
+|===
+| Requests | Record seconds | Replay 1 seconds | Replay 2 seconds | Replay-log bytes
+
+| 1
+| 10.063
+| 32.681
+| 34.212
+| 24,399,452
+
+| 10
+| 9.602
+| 19.215
+| 19.472
+| 9,863,840
+
+| 100
+| 15.542
+| 27.801
+| 28.119
+| 10,201,304
+|===
+
+The one-request row is the later complete run and is not directly comparable to
+the earlier 10- and 100-request rows. Replay-log size also varied substantially
+between repeated runs. These measurements establish bounded execution through
+100 requests, but do not establish smooth scaling, deterministic replay-log
+size, or production throughput. The checked-in command still needs independent
+execution on `sophie` and GitHub-hosted x86-64 Linux before Phase 0 is complete.
+
 == Negative results and constraints
 
 Omitting `filter-replay` allowed recording and ingress but caused replay to hang
@@ -102,9 +181,10 @@ these differences before launch.
 
 Using a TCP `guestfwd` endpoint caused QEMU to connect to its peer during backend
 initialization, including before replay could disable packet interaction. The
-recording peer could not simply be absent. Restricted built-in fixture services
-or a record-time host forward combined with an isolated replay netdev avoid this
-coupling.
+recording peer could not simply be absent. The disposable socket replay proved
+that changing backend types can work, but a listening socket cannot guarantee
+isolation from other local processes. The selected profile instead retains the
+restricted built-in TFTP backend and removes its fixture content before replay.
 
 The pinned kernel builds RTL8139, e1000, and virtio-net drivers as modules. The
 RTL8139 spike required `mii`, `8139cp`, and `8139too`. Its minimal loader could

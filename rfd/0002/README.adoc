@@ -1,6 +1,6 @@
 :authors: Darwin Wu <tough.pasta0068@wunli88.com>
-:state: prediscussion
-:discussion:
+:state: discussion
+:discussion: https://github.com/chaba-dev/simferret/pull/8
 :labels: determinism, faults, network, qemu, replay, testing
 
 = RFD 2 Deterministic network fault model
@@ -55,23 +55,23 @@ network backend and one replay filter:
 -object filter-replay,id=simnet-replay,netdev=simnet
 ----
 
-Replay still requires a netdev object with the recorded identifier, but it does
-not require the recording backend, host forward, or peer. The proven replay
-configuration uses an isolated socket netdev with no connected peer and the same
-replay filter:
+Replay still requires a netdev object with the recorded identifier. The initial
+supported profile retains the same restricted user backend and replay filter but
+removes all fixture files before replay:
 
 [source,text]
 ----
--netdev socket,id=simnet,listen=<private-unused-address>
+-netdev user,id=simnet,restrict=on,tftp=<empty-directory>
 -device rtl8139,netdev=simnet,mac=52:54:00:12:34:56
 -object filter-replay,id=simnet-replay,netdev=simnet
 ----
 
-Record and replay backend configurations are therefore distinct typed parts of
-the VM launch contract. The record backend and fixture identity are semantic
-inputs. The replay backend is a restricted sink selected from a proven allowlist
-and must have no peer interaction. Its runtime address is not compared with the
-record backend as though they were the same device input.
+Using one backend type avoids claiming that a listening socket is isolated from
+other local processes. The fixture identity is a semantic input, while its
+runtime directory is reconstructed for each launch and is empty in replay mode.
+The replay filter must prevent backend packet interaction; the empty directory
+also ensures that an accidental live TFTP request cannot reproduce the recorded
+response.
 
 The record backend is restricted from reaching arbitrary external networks. It
 exposes only the minimum fixture service or forwarding path required by the
@@ -80,10 +80,11 @@ excluded because they require privileges and would make the GitHub-hosted CI
 environment materially different from local execution.
 
 The pinned kernel provides RTL8139 support as compressed modules rather than
-built-in code. The reproducible initramfs includes the exact `mii`, `8139cp`, and
-`8139too` module dependency closure and decompresses modules before loading them.
-The module digests, load order, and decompression tool are part of the initial
-state identity.
+built-in code. The reproducible initramfs includes `mii` and `8139cp`,
+decompresses them at build time, and verifies that `8139cp` binds the NIC. The
+source and decompressed module digests and load order are part of the initial
+state identity. The NIC option ROM is disabled with `romfile=""` because this
+direct-kernel workload does not perform network boot.
 
 == Scenario boundary
 
@@ -108,13 +109,18 @@ content served by QEMU's restricted built-in TFTP service. The controller
 materializes and digests that content in a private run directory. The backend
 has no route to an external service.
 
+Each request identifier maps to one canonical relative TFTP filename. The file
+contains the expected request identifier and payload in a bounded canonical
+encoding. The guest reports values parsed from the received file rather than
+manufacturing a successful response from its command. Intentional corruption
+changes the served bytes while preserving the expected values.
+
 The guest agent continues to emit structured semantic events over the existing
 serial channel. Network traffic is an application input, not a replacement
-control plane. In replay mode the fixture content and recording-time backend are
-absent; QEMU must supply all incoming packets from the recorded replay log while
-an isolated netdev satisfies the structural device attachment. This passive
-replay condition is an acceptance requirement rather than an implementation
-detail.
+control plane. In replay mode the fixture content is absent and the restricted
+backend has no input to serve; QEMU must supply all incoming packets from the
+recorded replay log. This passive replay condition is an acceptance requirement
+rather than an implementation detail.
 
 == Fault contract
 
@@ -148,7 +154,11 @@ The recorded scenario performs this sequence:
 . evaluate structured safety, outage, and recovery properties; and
 . shut down normally.
 
-The route produces an immediate unreachable result for the initial outage.
+The route produces an immediate administrative rejection: the local network
+operation must report `EACCES`. Installing or removing the wrong route, a
+missing fixture file, a malformed response, or an infrastructure timeout cannot
+satisfy the outage property.
+
 Silent packet loss, port-specific filtering, probabilistic loss, latency,
 duplication, corruption, reordering, bandwidth limits, and asymmetric partitions
 are later extensions. The pinned kernel exposes nftables, iptables, and netem as
@@ -164,8 +174,7 @@ A seed alone remains insufficient for exact replay.
 The RFD 1 replay identity is extended with at least:
 
 * NIC model, fixed MAC address, and all device properties;
-* record backend type and complete semantic configuration;
-* the allowed isolated replay backend type and safety properties;
+* restricted backend type and complete semantic configuration;
 * replay-filter type, placement, and properties;
 * guest network address, route, peer, transport, and direction;
 * guest-kernel fault mechanism and rule representation; and
@@ -173,9 +182,9 @@ The RFD 1 replay identity is extended with at least:
 
 Runtime-only socket paths and host-assigned process identifiers are diagnostic,
 not semantic, but their endpoint type and safety behavior remain part of the
-launch contract. Replay rejects missing, extra, reordered, or changed semantic
-network identity fields. It also rejects a replay backend outside the isolated
-allowlist before starting QEMU.
+launch contract. Replay rejects missing, extra, or changed semantic network
+identity fields and changed order-sensitive device or filter sequences before
+starting QEMU. Serialization order of typed object fields is not semantic.
 
 Incoming packets are already represented in QEMU's replay log and are not
 duplicated into SimFerret's semantic event stream. Semantic events identify the
@@ -190,12 +199,17 @@ network fault events. It passes only when:
 * a pre-outage request traverses the configured network and returns the matching
   request identifier and payload;
 * the outage is confirmed active before an under-fault request is attempted;
-* at least one under-fault request reports unavailable within its event bound;
+* at least one under-fault request reports the typed administrative rejection
+  within its event bound;
 * restoration is confirmed before the recovery request is attempted; and
 * a matching post-restoration response arrives within its event bound.
 
 The checker uses structured guest and controller events rather than parsing
 human logs or inferring a partition solely from elapsed host time.
+The outage bound is measured from request-attempt event to typed result event;
+the recovery bound is measured from restoration-confirmed event to matching
+response event. A missing event or host watchdog expiration is an infrastructure
+failure, not a semantic unavailable result.
 
 == Artifacts and compatibility
 
@@ -203,11 +217,11 @@ Run directories retain the RFD 1 manifest, scenario, choices, replay log,
 normalized events, assertions, and diagnostics. The manifest includes the
 extended network identity and digests every additional semantic artifact.
 
-Network diagnostics should make first failures actionable. They include the
-resolved QEMU network command line, backend mode, fault transitions, bounded
-packet counters when available, and QEMU errors. Secrets, ambient environment,
-temporary socket paths, and unrestricted packet payload captures are not added
-to normal run artifacts.
+Network diagnostics should make first failures actionable. They include a
+sanitized QEMU network configuration with runtime paths replaced by typed
+placeholders, backend mode, fault transitions, bounded packet counters when
+available, and QEMU errors. Secrets, ambient environment, temporary socket paths,
+and unrestricted packet payload captures are not added to normal run artifacts.
 
 QEMU does not reliably diagnose replay identity errors itself. In the completed
 spikes, omitting the replay filter or changing the MAC address caused a hang
@@ -227,8 +241,11 @@ GitHub runner remains outside the deterministic guest: placing the Actions agent
 inside the guest would introduce GitHub's network and timing behavior into the
 simulation boundary.
 
-CI uploads complete run diagnostics on failure. A later thin GitHub Action may
-wrap the stable CLI, but Action-specific code is not part of this increment.
+CI uploads a retained, bounded failure bundle distinct from atomically published
+replayable runs. Launch and watchdog failures retain enough sanitized network,
+QEMU, and guest diagnostics to identify the failed boundary. A later thin GitHub
+Action may wrap the stable CLI, but Action-specific code is not part of this
+increment.
 
 == Acceptance criteria
 
@@ -236,8 +253,8 @@ This increment is complete when:
 
 * a documented spike records one successful request through an explicit QEMU
   NIC and replay-filtered backend, then passively replays it twice;
-* replay succeeds with the recording backend, fixture content, host forwarding,
-  and peer interaction absent, using only an approved isolated replay netdev;
+* replay succeeds twice with the fixture content and peer interaction absent,
+  using the same restricted backend profile and mandatory replay filter;
 * the scenario activates and restores a narrowly scoped directional outage at
   materialized choice points without host sleeps controlling semantics;
 * at least one request succeeds before the outage, one bounded request reports
@@ -245,8 +262,8 @@ This increment is complete when:
 * two consecutive replays produce byte-identical normalized event and assertion
   artifacts and matching semantic outcome digests;
 * changing the seed changes the materialized request or fault choice plan;
-* changing any NIC, record backend, filter, address, route, peer, or fault-rule
-  identity is rejected before replay, and an unsafe replay backend is rejected;
+* changing any NIC, backend, filter, address, route, peer, or fault-rule identity
+  is rejected before replay, and an unsafe backend is rejected;
 * omitting the replay filter cannot accidentally produce a run marked
   replayable;
 * attempts to configure unrestricted external networking, TAP, a host bridge,

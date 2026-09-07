@@ -22,7 +22,7 @@ device and replay filter while preserving RFD 1's exact passive replay contract.
 
 * Phase 0 — Network replay spike
 :PROPERTIES:
-:STATUS: DONE
+:STATUS: IN PROGRESS
 :END:
 
 - [X] Select and pin an emulated NIC, fixed MAC address, user-mode backend, and
@@ -31,8 +31,10 @@ device and replay filter while preserving RFD 1's exact passive replay contract.
   fixed address, route, network request, and narrow network rule.
 - [X] Connect the guest through a restricted private network path to
   content-controlled fixture input without external network access.
-- [X] Record real traffic through the NIC and replay it twice with the recording
-  backend, host forward, fixture content, and peer interaction absent.
+- [X] Record the selected RTL8139 success, administrative-outage, and recovery
+  tuple in an Amp orb and replay it twice without fixture content.
+- [ ] Run the same checked-in spike on the ~sophie~ runner.
+- [ ] Run the same checked-in spike on GitHub-hosted x86-64 Linux.
 - [X] Verify that omitting or misplacing the replay filter fails the spike rather
   than producing an artifact marked replayable.
 - [X] Record exact QEMU options, packet direction, device support, duration,
@@ -43,8 +45,8 @@ device and replay filter while preserving RFD 1's exact passive replay contract.
 :STATUS: TODO
 :END:
 
-- [ ] Add the NIC, MAC, record backend, isolated replay backend, replay filter,
-  addressing, route, fixture, and fault settings to typed identities.
+- [ ] Add the NIC, MAC, restricted backend, replay filter, addressing, route,
+  fixture, and fault settings to typed identities.
 - [ ] Construct and supervise all QEMU network options and private peer endpoints
   inside the VM adapter boundary.
 - [ ] Restrict accepted configurations to the proven unprivileged backend and
@@ -79,14 +81,15 @@ device and replay filter while preserving RFD 1's exact passive replay contract.
 
 - [ ] Record a finite successful, outage, and recovery sequence and persist its
   complete network identity and semantic artifacts atomically.
-- [ ] Replay the recording twice through the isolated replay netdev without the
-  record backend, fixture content, host forwarding, or peer interaction.
+- [ ] Replay the recording twice through the restricted replay-filtered backend
+  without fixture content or peer interaction.
 - [ ] Compare normalized events, assertion artifacts, and semantic outcome
   digests while QEMU injects recorded incoming packets.
 - [ ] Reject tampered network identities, missing replay filters, malformed
   fault plans, and network artifact divergence.
 - [ ] Retain bounded QEMU, backend-mode, fault-transition, and packet-count
-  diagnostics for launch, execution, and replay failures.
+  diagnostics in a failure bundle for launch, watchdog, execution, and replay
+  failures.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
