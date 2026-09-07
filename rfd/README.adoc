@@ -12,7 +12,7 @@ authoritative merely because it exists; its `state` says how it should be read.
 | Rust/QEMU execution architecture and a bounded record/replay demonstration with a controlled process failure
 
 | link:0002/README.adoc[2: Deterministic network fault model]
-| Restricted QEMU networking and a bounded, replayable peer-specific outage
+| Record and replay a bounded network outage through an explicit QEMU network boundary
 |===
 
 == Source format
