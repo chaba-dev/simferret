@@ -1,0 +1,8 @@
+version = 1
+name = "echo-process-restart-corrupt"
+request_count = 6
+payload_bytes = 16
+server_address = "127.0.0.1:4000"
+outage_event_bound = 1
+liveness_event_bound = 2
+corrupt_responses = true

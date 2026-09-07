@@ -254,3 +254,77 @@ per-byte acknowledgement framing, passive replay, bounded startup/event/exit
 waits, early termination, malformed or missing frames, and surplus terminal
 events. The workspace has sixty-one unit tests and seven process-level integration
 tests.
+
+== Phase 4 — Acceptance demonstration
+
+The complete acceptance path is automated by
+link:../../scripts/phase4-acceptance.sh[`scripts/phase4-acceptance.sh`] and runs
+in the Linux QEMU CI job. From a clean x86-64 Linux checkout after the documented
+Nix setup, the single command is:
+
+[source,shell]
+----
+.agents/dev ./scripts/phase4-acceptance.sh
+----
+
+The script builds the static guest/controller executable and exercises every
+acceptance criterion. It records the seed-42 scenario, checks the stopped-phase
+attempt and matching unavailable event are one event apart, and requires the
+controlled-outage assertion to pass. It passively replays that recording twice
+and compares the two CLI summaries. It then verifies both an altered event
+artifact and an altered VM memory identity are rejected. Finally, it records
+link:../../scenarios/echo-process-restart-corrupt.toml[the intentional-corruption
+scenario] with seed 43, requires CLI status `1`, and requires its safety
+assertion to fail.
+
+An x86-64 Linux run on 2026-09-06 passed under QEMU 11.1.0 and Linux 6.18.49.
+The normal recording took 63.89 seconds and its two replays took 70.10 and 70.47
+seconds. The intentional-corruption recording took 57.93 seconds. Seed 42 chose
+fault request index 2 and first request ID
+`request-0000-28efe333b266f103`; seed 43 chose index 1 and first request ID
+`request-0000-9cde98852e60034b`. Their complete materialized choice plans were
+different.
+
+The normal run's principal artifact sizes were:
+
+[cols="1,1", options="header"]
+|===
+| Artifact | Bytes
+
+| `replay.bin` | 8,454,205
+| `events.jsonl` | 3,739
+| `assertions.json` | 437
+| `choices.json` | 789
+| `scenario.toml` | 187
+| `manifest.json` | 2,386
+|===
+
+Its semantic outcome digest was
+`49ae101c084a591442365568b1a5f0b33b9a2cb47a904e8b65a1f54ad3be7ed3`.
+The normalized event and assertion digests matched the Phase 3 evidence. The
+replay-log digest for this recording was
+`51659d871af1a57058a1a22b3318f7822243c3f7da3f59ace55e764c912995fe`.
+
+All observed divergences were expected and actionable. Appending bytes to
+`events.jsonl` failed before replay with its expected and actual SHA-256
+digests. Changing the manifest's VM memory from 128 MiB to 129 MiB failed with
+the complete expected and actual VM identities. Intentional response corruption
+failed safety at response event 3 because its request identity or payload did
+not match, while controlled outage and bounded liveness still passed. Normal
+record and replay produced no semantic divergence.
+
+The fidelity limits remain the RFD's initial constraints: x86-64 Linux, the
+pinned QEMU/kernel/firmware tuple, TCG, one vCPU, fixed machine and CPU models,
+and no network, block, passthrough, acceleration, mutable host mount, or external
+service. Exact replay also requires the recorded SimFerret executable and
+content-addressed guest image. Per-byte serial acknowledgement avoids replay
+loss at the ISA UART but makes the approximately one-minute scenario unsuitable
+as a fast unit test. Abrupt host failure can retain temporary run state, and
+absolute dependency paths make artifacts tied to the recorded Nix environment.
+
+The recommended next increment is a deterministic network fault model using a
+QEMU-supported recorded network boundary. It adds materially broader distributed
+failure coverage while preserving the proven controller/VM ownership split and
+without first taking on checkpoint-tree scheduling or general container
+packaging. This RFD does not implement that increment; it should begin with a
+separate design and replay spike.

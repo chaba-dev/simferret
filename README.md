@@ -95,6 +95,22 @@ requires byte-identical event and assertion artifacts and a matching semantic
 outcome digest. Divergence reports the first differing, missing, or surplus
 event.
 
+## Phase 4 acceptance
+
+Run the complete proof-of-concept acceptance demonstration on x86-64 Linux:
+
+```shell
+.agents/dev ./scripts/phase4-acceptance.sh
+```
+
+The command builds the static guest/controller, records the seed-42 restart
+scenario, verifies its bounded outage, replays it twice, rejects artifact and
+VM-identity tampering, and records a seed-43 intentionally corrupt scenario.
+It requires the second seed to produce a different choice plan and requires the
+corrupt fixture to fail safety with CLI status 1. A fresh evidence directory,
+including durations, sizes, digests, command output, and diagnostics, is kept
+under `.poc/phase4-acceptance/`. CI runs the same command on Ubuntu.
+
 ## Development
 
 The Nix flake provides the pinned Rust toolchain and Jujutsu. On an x86-64 Linux

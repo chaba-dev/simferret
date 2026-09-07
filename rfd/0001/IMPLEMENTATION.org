@@ -85,27 +85,27 @@ required by an acceptance criterion in the RFD.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
-- [ ] Automate the record-and-replay demonstration in a supported environment.
-- [ ] Verify a different seed changes the materialized request or fault plan.
-- [ ] Verify at least one request encounters the stopped server and reports a
+- [X] Automate the record-and-replay demonstration in a supported environment.
+- [X] Verify a different seed changes the materialized request or fault plan.
+- [X] Verify at least one request encounters the stopped server and reports a
   bounded failed or unavailable result.
-- [ ] Verify artifact or replay-identity tampering is rejected.
-- [ ] Verify intentional fixture corruption fails its safety assertion and CLI
+- [X] Verify artifact or replay-identity tampering is rejected.
+- [X] Verify intentional fixture corruption fails its safety assertion and CLI
   exit status.
-- [ ] Record record/replay duration, artifact sizes, fidelity limitations, and
+- [X] Record record/replay duration, artifact sizes, fidelity limitations, and
   all observed divergence in ~EVIDENCE.adoc~.
-- [ ] Recommend one next increment without implementing it.
+- [X] Recommend one next increment without implementing it.
 
 * Exit criteria
 
-- [ ] Every acceptance criterion in the RFD has linked automated or captured
+- [X] Every acceptance criterion in the RFD has linked automated or captured
   evidence.
-- [ ] The PoC can be demonstrated from a clean checkout without undocumented
+- [X] The PoC can be demonstrated from a clean checkout without undocumented
   interactive setup.
-- [ ] The implementation uses the documented ownership boundaries rather than
+- [X] The implementation uses the documented ownership boundaries rather than
   invoking QEMU throughout fixture or scenario code.
 - [X] No custom VMM or broad QEMU fork exists without recorded evidence that an
   upstream interface was insufficient.
