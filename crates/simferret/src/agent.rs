@@ -1,67 +1,59 @@
 use std::io::{self, Read, Write};
-use std::net::SocketAddr;
 use std::path::Path;
-use std::process::{Child, Command as ProcessCommand, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::thread;
-use std::time::Duration;
+use std::process::Command as ProcessCommand;
 
 use crate::assertions::evaluate;
-use crate::fixture;
 use crate::protocol::{
-    Command, CommandFrame, DiagnosticFields, Event, EventFrame, PROTOCOL_VERSION,
+    Command, CommandFrame, DiagnosticFields, Event, EventFrame, PROTOCOL_VERSION, RequestError,
     read_acknowledged_line_frame, read_frame, require_version, write_frame, write_line_frame,
 };
 
-const START_TIMEOUT: Duration = Duration::from_secs(2);
+const INTERFACE: &str = "eth0";
+const GUEST_CIDR: &str = "10.0.2.15/24";
+const GATEWAY: &str = "10.0.2.2";
+const PEER_CIDR: &str = "10.0.2.2/32";
+const OUTAGE_RULE: &str = "prohibit 10.0.2.2/32";
+const BUSYBOX: &str = "/bin/busybox";
 
-pub fn run(input: &mut impl Read, output: &mut impl Write, executable: &Path) -> io::Result<i32> {
-    run_with_framing(input, output, executable, false)
+pub fn run(input: &mut impl Read, output: &mut impl Write, _executable: &Path) -> io::Result<i32> {
+    run_with_framing(input, output, false)
 }
 
 pub fn run_serial(
     input: &mut impl Read,
     output: &mut impl Write,
-    executable: &Path,
+    _executable: &Path,
 ) -> io::Result<i32> {
-    run_with_framing(input, output, executable, true)
+    run_with_framing(input, output, true)
 }
 
 fn run_with_framing(
     input: &mut impl Read,
     output: &mut impl Write,
-    executable: &Path,
     line_framing: bool,
 ) -> io::Result<i32> {
-    let mut agent = Agent::new(executable, line_framing);
-    let result = agent.command_loop(input, output);
-    let stop_result = agent.stop_server();
-    result.and(stop_result.map(|()| agent.exit_code))
+    let mut agent = Agent {
+        events: Vec::new(),
+        next_event_id: 1,
+        exit_code: 0,
+        line_framing,
+        network_configured: false,
+        outage_active: false,
+    };
+    agent.command_loop(input, output)?;
+    Ok(agent.exit_code)
 }
 
-struct Agent<'a> {
-    executable: &'a Path,
-    server: Option<Child>,
-    configured_address: Option<String>,
+struct Agent {
     events: Vec<EventFrame>,
     next_event_id: u64,
     exit_code: i32,
     line_framing: bool,
+    network_configured: bool,
+    outage_active: bool,
 }
 
-impl<'a> Agent<'a> {
-    fn new(executable: &'a Path, line_framing: bool) -> Self {
-        Self {
-            executable,
-            server: None,
-            configured_address: None,
-            events: Vec::new(),
-            next_event_id: 1,
-            exit_code: 0,
-            line_framing,
-        }
-    }
-
+impl Agent {
     fn command_loop(&mut self, input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
         loop {
             let frame = if self.line_framing {
@@ -69,48 +61,65 @@ impl<'a> Agent<'a> {
             } else {
                 read_frame::<CommandFrame>(input)?
             };
-            let Some(frame) = frame else {
-                return Ok(());
-            };
+            let Some(frame) = frame else { return Ok(()) };
             require_version(frame.protocol_version)?;
             let command_id = frame.command_id;
             match frame.command {
-                Command::StartServer {
-                    address,
-                    corrupt_responses,
+                Command::ConfigureNetwork {
+                    interface,
+                    guest_cidr,
+                    gateway,
                 } => {
-                    let address = self.start_server(&address, corrupt_responses)?;
+                    require_network_values(&interface, &guest_cidr, &gateway)?;
+                    if self.network_configured {
+                        return Err(invalid("network is already configured"));
+                    }
+                    configure_network()?;
+                    self.network_configured = true;
                     self.emit(
                         command_id,
-                        Event::ServerStarted {
-                            address,
-                            corrupt_responses,
+                        Event::NetworkConfigured {
+                            interface,
+                            guest_cidr,
+                            gateway,
                         },
                         output,
                     )?;
                 }
-                Command::StopServer {} => {
-                    if self.server.is_none() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "server is not running",
-                        ));
+                Command::ActivateOutage { peer_cidr } => {
+                    self.require_network()?;
+                    require_peer(&peer_cidr)?;
+                    if self.outage_active {
+                        return Err(invalid("outage is already active"));
                     }
-                    self.stop_server_controlled()?;
-                    self.emit(command_id, Event::ServerStopped {}, output)?;
+                    set_outage(true)?;
+                    self.outage_active = true;
+                    self.emit(
+                        command_id,
+                        Event::OutageActivated {
+                            peer_cidr,
+                            rule: OUTAGE_RULE.into(),
+                        },
+                        output,
+                    )?;
+                }
+                Command::RestoreNetwork { peer_cidr } => {
+                    self.require_network()?;
+                    require_peer(&peer_cidr)?;
+                    if !self.outage_active {
+                        return Err(invalid("outage is not active"));
+                    }
+                    set_outage(false)?;
+                    self.outage_active = false;
+                    self.emit(command_id, Event::NetworkRestored { peer_cidr }, output)?;
                 }
                 Command::Request {
                     request_id,
                     payload,
                     phase,
                 } => {
-                    validate_request(&request_id, &payload)?;
-                    let address = self.configured_address.clone().ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "server endpoint has not been configured",
-                        )
-                    })?;
+                    self.require_network()?;
+                    validate_request(&request_id, &payload, GATEWAY)?;
                     self.emit(
                         command_id,
                         Event::RequestAttempted {
@@ -120,7 +129,7 @@ impl<'a> Agent<'a> {
                         },
                         output,
                     )?;
-                    let event = match fixture::request(&address, &request_id, &payload) {
+                    let event = match crate::fixture::tftp_request(GATEWAY, &request_id) {
                         Ok((response_id, response_payload)) => Event::RequestSucceeded {
                             request_id,
                             request_payload: payload,
@@ -128,7 +137,22 @@ impl<'a> Agent<'a> {
                             response_payload,
                             phase,
                         },
-                        Err(_) => Event::RequestUnavailable { request_id, phase },
+                        Err(error) => {
+                            let errno = error.raw_os_error();
+                            let error = if errno == Some(libc::EACCES) {
+                                RequestError::AdministrativeProhibited
+                            } else if error.kind() == io::ErrorKind::InvalidData {
+                                RequestError::InvalidResponse
+                            } else {
+                                RequestError::Transport
+                            };
+                            Event::RequestUnavailable {
+                                request_id,
+                                phase,
+                                error,
+                                errno,
+                            }
+                        }
                     };
                     self.emit(command_id, event, output)?;
                 }
@@ -136,17 +160,26 @@ impl<'a> Agent<'a> {
                     outage_event_bound,
                     liveness_event_bound,
                 } => {
-                    self.require_server_healthy()?;
                     let report = evaluate(&self.events, outage_event_bound, liveness_event_bound);
                     self.exit_code = self.exit_code.max(report.exit_code());
                     self.emit(command_id, Event::AssertionsEvaluated { report }, output)?;
                 }
                 Command::Shutdown {} => {
-                    self.stop_server()?;
+                    if self.outage_active {
+                        return Err(invalid("cannot shut down while outage is active"));
+                    }
                     self.emit(command_id, Event::AgentStopped {}, output)?;
                     return Ok(());
                 }
             }
+        }
+    }
+
+    fn require_network(&self) -> io::Result<()> {
+        if self.network_configured {
+            Ok(())
+        } else {
+            Err(invalid("network is not configured"))
         }
     }
 
@@ -160,205 +193,114 @@ impl<'a> Agent<'a> {
         };
         self.next_event_id += 1;
         if self.line_framing {
-            write_line_frame(output, &frame)?;
+            write_line_frame(output, &frame)?
         } else {
-            write_frame(output, &frame)?;
+            write_frame(output, &frame)?
         }
         self.events.push(frame);
         Ok(())
     }
-
-    fn start_server(&mut self, address: &str, corrupt_responses: bool) -> io::Result<String> {
-        if self.server.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "server is already running",
-            ));
-        }
-        let address: SocketAddr = address
-            .parse()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        if address.port() == 0 || !address.ip().is_loopback() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "fixture server address must be a numeric loopback address with a nonzero port",
-            ));
-        }
-        let address = address.to_string();
-        let mut child = ProcessCommand::new(self.executable)
-            .arg("fixture-server")
-            .arg(&address)
-            .arg(if corrupt_responses { "corrupt" } else { "echo" })
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        let mut ready = child
-            .stdout
-            .take()
-            .expect("child stdout was configured as piped");
-        let (sender, receiver) = mpsc::channel();
-        let reader = match thread::Builder::new()
-            .name("fixture-readiness".into())
-            .spawn(move || {
-                let mut marker = vec![0; fixture::SERVER_READY.len()];
-                let result = ready.read_exact(&mut marker).map(|()| marker);
-                let _ = sender.send(result);
-            }) {
-            Ok(reader) => reader,
-            Err(error) => {
-                terminate(&mut child)?;
-                return Err(error);
-            }
-        };
-        let startup = match receiver.recv_timeout(START_TIMEOUT) {
-            Ok(result) => result.and_then(|marker| {
-                if marker == fixture::SERVER_READY {
-                    Ok(())
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "fixture server emitted an invalid readiness marker",
-                    ))
-                }
-            }),
-            Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "fixture server readiness timed out",
-            )),
-            Err(RecvTimeoutError::Disconnected) => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "fixture server readiness pipe disconnected",
-            )),
-        };
-        if let Err(error) = startup {
-            terminate(&mut child)?;
-            reader
-                .join()
-                .map_err(|_| io::Error::other("readiness reader panicked"))?;
-            return Err(error);
-        }
-        reader
-            .join()
-            .map_err(|_| io::Error::other("readiness reader panicked"))?;
-        self.server = Some(child);
-        self.configured_address = Some(address.clone());
-        Ok(address)
-    }
-
-    fn stop_server(&mut self) -> io::Result<()> {
-        if let Some(mut child) = self.server.take() {
-            terminate(&mut child)?;
-        }
-        Ok(())
-    }
-
-    fn stop_server_controlled(&mut self) -> io::Result<()> {
-        let mut child = self
-            .server
-            .take()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "server is not running"))?;
-        if let Some(status) = child.try_wait()? {
-            return Err(io::Error::other(format!(
-                "fixture server exited before controlled stop with {status}"
-            )));
-        }
-        child.kill()?;
-        let status = child.wait()?;
-        if !is_controlled_kill(status) {
-            Err(io::Error::other(format!(
-                "fixture server exited before controlled stop with {status}"
-            )))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn require_server_healthy(&mut self) -> io::Result<()> {
-        let Some(child) = self.server.as_mut() else {
-            return Ok(());
-        };
-        if let Some(status) = child.try_wait()? {
-            self.server.take();
-            Err(io::Error::other(format!(
-                "fixture server exited unexpectedly with {status}"
-            )))
-        } else {
-            Ok(())
-        }
-    }
 }
 
-fn terminate(child: &mut Child) -> io::Result<()> {
-    if child.try_wait()?.is_none() {
-        child.kill()?;
+fn configure_network() -> io::Result<()> {
+    run_busybox(["insmod", "/modules/mii.ko"])?;
+    run_busybox(["insmod", "/modules/8139cp.ko"])?;
+    run_busybox(["ip", "link", "set", INTERFACE, "up"])?;
+    run_busybox(["ip", "address", "add", GUEST_CIDR, "dev", INTERFACE])?;
+    run_busybox(["ip", "route", "add", "default", "via", GATEWAY])?;
+    let driver = std::fs::read_link("/sys/class/net/eth0/device/driver")?;
+    if driver.file_name() != Some(std::ffi::OsStr::new("8139cp")) {
+        return Err(io::Error::other("rtl8139 NIC did not bind to 8139cp"));
     }
-    child.wait()?;
     Ok(())
 }
 
-#[cfg(unix)]
-fn is_controlled_kill(status: std::process::ExitStatus) -> bool {
-    use std::os::unix::process::ExitStatusExt;
-
-    status.signal() == Some(9)
+fn set_outage(active: bool) -> io::Result<()> {
+    let action = if active { "add" } else { "del" };
+    run_busybox(["ip", "route", action, "prohibit", PEER_CIDR])?;
+    let output = ProcessCommand::new(BUSYBOX)
+        .args(["ip", "route", "show", "exact", PEER_CIDR])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("could not inspect peer-specific route"));
+    }
+    let route = String::from_utf8_lossy(&output.stdout);
+    let present = route.starts_with(OUTAGE_RULE)
+        || route.trim_end() == "prohibit 10.0.2.2"
+        || route.starts_with("prohibit 10.0.2.2 ");
+    if present != active {
+        return Err(io::Error::other(
+            "peer-specific prohibit route transition was not confirmed",
+        ));
+    }
+    Ok(())
 }
 
-#[cfg(not(unix))]
-fn is_controlled_kill(status: std::process::ExitStatus) -> bool {
-    !status.success()
-}
-
-fn validate_request(request_id: &str, payload: &str) -> io::Result<()> {
-    if request_id.len().saturating_add(payload.len()) <= crate::protocol::MAX_REQUEST_DATA_LENGTH {
+fn run_busybox<const N: usize>(arguments: [&str; N]) -> io::Result<()> {
+    let status = ProcessCommand::new(BUSYBOX).args(arguments).status()?;
+    if status.success() {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "request identifier and payload exceed the protocol limit",
+        Err(io::Error::other(format!(
+            "busybox command failed with {status}"
+        )))
+    }
+}
+
+fn require_network_values(interface: &str, guest_cidr: &str, gateway: &str) -> io::Result<()> {
+    if (interface, guest_cidr, gateway) == (INTERFACE, GUEST_CIDR, GATEWAY) {
+        Ok(())
+    } else {
+        Err(invalid(
+            "network configuration differs from the version-2 profile",
         ))
     }
 }
 
+fn require_peer(peer_cidr: &str) -> io::Result<()> {
+    if peer_cidr == PEER_CIDR {
+        Ok(())
+    } else {
+        Err(invalid("fault peer differs from the version-2 profile"))
+    }
+}
+
+fn validate_request(request_id: &str, payload: &str, peer: &str) -> io::Result<()> {
+    if request_id.is_empty()
+        || !request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || request_id.len().saturating_add(payload.len()) > crate::protocol::MAX_REQUEST_DATA_LENGTH
+        || peer != GATEWAY
+    {
+        Err(invalid(
+            "request differs from the bounded network fixture contract",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::process::Command as ProcessCommand;
-
     use super::*;
 
     #[test]
-    fn request_data_limit_is_inclusive() {
-        let maximum = "x".repeat(crate::protocol::MAX_REQUEST_DATA_LENGTH - 2);
-        assert!(validate_request("id", &maximum).is_ok());
-        assert!(validate_request("id", &(maximum + "x")).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn only_sigkill_is_a_controlled_kill_status() {
-        let mut killed = ProcessCommand::new("sleep").arg("10").spawn().unwrap();
-        killed.kill().unwrap();
-        assert!(is_controlled_kill(killed.wait().unwrap()));
-
-        let status = ProcessCommand::new("sh")
-            .args(["-c", "kill -TERM $$"])
-            .status()
-            .unwrap();
-        assert!(!is_controlled_kill(status));
+    fn network_and_fault_commands_are_fixed_to_the_versioned_profile() {
+        require_network_values(INTERFACE, GUEST_CIDR, GATEWAY).unwrap();
+        assert!(require_network_values("lo", GUEST_CIDR, GATEWAY).is_err());
+        require_peer(PEER_CIDR).unwrap();
+        assert!(require_peer("0.0.0.0/0").is_err());
     }
 
     #[test]
-    fn controlled_stop_rejects_an_already_exited_child() {
-        let mut child = ProcessCommand::new("sh")
-            .args(["-c", "exit 23"])
-            .spawn()
-            .unwrap();
-        while child.try_wait().unwrap().is_none() {
-            thread::yield_now();
-        }
-        let mut agent = Agent::new(Path::new("unused"), false);
-        agent.server = Some(child);
-        assert!(agent.stop_server_controlled().is_err());
+    fn fixture_filenames_and_peer_are_bounded() {
+        validate_request("request-0001", "payload", GATEWAY).unwrap();
+        assert!(validate_request("../escape", "payload", GATEWAY).is_err());
+        assert!(validate_request("request", "payload", "127.0.0.1").is_err());
     }
 }

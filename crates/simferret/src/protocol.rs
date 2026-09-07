@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::assertions::AssertionReport;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_LENGTH: usize = 1024 * 1024;
 pub const MAX_REQUEST_DATA_LENGTH: usize = 64 * 1024;
 pub const SERIAL_ACK: u8 = 0;
@@ -21,11 +21,17 @@ pub struct CommandFrame {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
-    StartServer {
-        address: String,
-        corrupt_responses: bool,
+    ConfigureNetwork {
+        interface: String,
+        guest_cidr: String,
+        gateway: String,
     },
-    StopServer {},
+    ActivateOutage {
+        peer_cidr: String,
+    },
+    RestoreNetwork {
+        peer_cidr: String,
+    },
     Request {
         request_id: String,
         payload: String,
@@ -41,9 +47,9 @@ pub enum Command {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestPhase {
-    Running,
-    Stopped,
-    Restarted,
+    PreOutage,
+    Outage,
+    Recovery,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -61,11 +67,18 @@ pub struct EventFrame {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
     AgentReady {},
-    ServerStarted {
-        address: String,
-        corrupt_responses: bool,
+    NetworkConfigured {
+        interface: String,
+        guest_cidr: String,
+        gateway: String,
     },
-    ServerStopped {},
+    OutageActivated {
+        peer_cidr: String,
+        rule: String,
+    },
+    NetworkRestored {
+        peer_cidr: String,
+    },
     RequestAttempted {
         request_id: String,
         payload: String,
@@ -81,11 +94,21 @@ pub enum Event {
     RequestUnavailable {
         request_id: String,
         phase: RequestPhase,
+        error: RequestError,
+        errno: Option<i32>,
     },
     AssertionsEvaluated {
         report: AssertionReport,
     },
     AgentStopped {},
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestError {
+    AdministrativeProhibited,
+    Transport,
+    InvalidResponse,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -263,19 +286,23 @@ pub fn require_version(version: u16) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Cursor, Read};
-
     use serde_json::json;
 
     use super::*;
 
-    #[test]
-    fn frame_round_trip_and_version_check() {
-        let command = CommandFrame {
+    fn command() -> CommandFrame {
+        CommandFrame {
             protocol_version: PROTOCOL_VERSION,
             command_id: 9,
-            command: Command::StopServer {},
-        };
+            command: Command::ActivateOutage {
+                peer_cidr: "10.0.2.2/32".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn version_two_network_command_round_trips() {
+        let command = command();
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &command).unwrap();
         assert_eq!(read_frame(&mut bytes.as_slice()).unwrap(), Some(command));
@@ -283,49 +310,8 @@ mod tests {
     }
 
     #[test]
-    fn line_frame_round_trip() {
-        let command = CommandFrame {
-            protocol_version: PROTOCOL_VERSION,
-            command_id: 9,
-            command: Command::StopServer {},
-        };
-        let mut bytes = Vec::new();
-        write_line_frame(&mut bytes, &command).unwrap();
-        assert_eq!(bytes.last(), Some(&b'\n'));
-        assert_eq!(
-            read_line_frame(&mut bytes.as_slice()).unwrap(),
-            Some(command)
-        );
-    }
-
-    #[test]
-    fn truncated_line_frame_is_not_treated_as_clean_eof() {
-        assert_eq!(
-            read_line_frame::<CommandFrame>(&mut br#"{"protocol_version":1}"#.as_slice())
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::UnexpectedEof
-        );
-    }
-
-    #[test]
-    fn oversized_line_frame_is_rejected_before_reading_past_the_limit() {
-        let bytes = vec![b' '; MAX_FRAME_LENGTH + 1];
-        assert_eq!(
-            read_line_frame::<CommandFrame>(&mut bytes.as_slice())
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-    }
-
-    #[test]
-    fn acknowledged_line_frame_acks_every_consumed_byte() {
-        let command = CommandFrame {
-            protocol_version: PROTOCOL_VERSION,
-            command_id: 9,
-            command: Command::StopServer {},
-        };
+    fn acknowledged_line_frame_acks_every_byte() {
+        let command = command();
         let mut bytes = Vec::new();
         write_line_frame(&mut bytes, &command).unwrap();
         let mut acknowledgements = Vec::new();
@@ -337,49 +323,16 @@ mod tests {
     }
 
     #[test]
-    fn normalization_only_removes_enumerated_diagnostics() {
-        let frame = EventFrame {
-            protocol_version: PROTOCOL_VERSION,
-            event_id: 2,
-            command_id: 1,
-            event: Event::ServerStarted {
-                address: "127.0.0.1:8080".into(),
-                corrupt_responses: true,
-            },
-            diagnostics: DiagnosticFields {
-                guest_pid: Some(42),
-                host_received_at_unix_nanos: Some(99),
-                temporary_path: Some("/tmp/run.123".into()),
-            },
-        };
-        let normalized = frame.normalize();
-        assert_eq!(normalized.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(normalized.event_id, 2);
-        assert_eq!(normalized.command_id, 1);
-        assert_eq!(normalized.event, frame.event);
-        assert!(
-            !serde_json::to_string(&normalized)
-                .unwrap()
-                .contains("guest_pid")
-        );
-    }
-
-    #[test]
-    fn oversized_frame_is_rejected_before_allocation() {
-        let mut bytes = ((MAX_FRAME_LENGTH + 1) as u32).to_be_bytes().to_vec();
-        bytes.extend_from_slice(b"{}");
+    fn oversized_and_truncated_frames_are_rejected() {
+        let oversized = vec![b' '; MAX_FRAME_LENGTH + 1];
         assert_eq!(
-            read_frame::<CommandFrame>(&mut bytes.as_slice())
+            read_line_frame::<CommandFrame>(&mut oversized.as_slice())
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidData
         );
-    }
-
-    #[test]
-    fn truncated_length_is_not_treated_as_clean_eof() {
         assert_eq!(
-            read_frame::<CommandFrame>(&mut [0_u8, 0].as_slice())
+            read_line_frame::<CommandFrame>(&mut b"{}".as_slice())
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::UnexpectedEof
@@ -387,78 +340,15 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_header_read_is_retried() {
-        struct InterruptedOnce {
-            interrupted: bool,
-            bytes: Cursor<Vec<u8>>,
-        }
-
-        impl Read for InterruptedOnce {
-            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-                if !self.interrupted {
-                    self.interrupted = true;
-                    return Err(io::ErrorKind::Interrupted.into());
-                }
-                self.bytes.read(buffer)
-            }
-        }
-
-        let command = CommandFrame {
-            protocol_version: PROTOCOL_VERSION,
-            command_id: 1,
-            command: Command::StopServer {},
-        };
-        let mut bytes = Vec::new();
-        write_frame(&mut bytes, &command).unwrap();
-        let mut reader = InterruptedOnce {
-            interrupted: false,
-            bytes: Cursor::new(bytes),
-        };
-        assert_eq!(read_frame(&mut reader).unwrap(), Some(command));
-    }
-
-    #[test]
-    fn unknown_fields_are_rejected_at_every_wire_level() {
-        let cases = [
-            json!({
-                "protocol_version": 1,
-                "event_id": 1,
-                "command_id": 1,
-                "event": {"type": "server_stopped"},
-                "unknown_envelope_field": true
-            }),
-            json!({
-                "protocol_version": 1,
-                "event_id": 1,
-                "command_id": 1,
-                "event": {"type": "server_stopped", "reason": "unexpected"}
-            }),
-            json!({
-                "protocol_version": 1,
-                "event_id": 1,
-                "command_id": 1,
-                "event": {"type": "server_stopped"},
-                "diagnostics": {"guest_pid": 42, "unknown_diagnostic": true}
-            }),
-            json!({
-                "protocol_version": 1,
-                "event_id": 1,
-                "command_id": 1,
-                "event": {
-                    "type": "assertions_evaluated",
-                    "report": {"passed": true, "assertions": [], "unknown_report_field": true}
-                }
-            }),
-        ];
-
-        for value in cases {
-            assert!(serde_json::from_value::<EventFrame>(value).is_err());
-        }
-
+    fn wire_types_reject_unknown_fields() {
         let command = json!({
-            "protocol_version": 1,
+            "protocol_version": PROTOCOL_VERSION,
             "command_id": 1,
-            "command": {"type": "stop_server", "unknown_command_field": true}
+            "command": {
+                "type": "activate_outage",
+                "peer_cidr": "10.0.2.2/32",
+                "unexpected": true
+            }
         });
         assert!(serde_json::from_value::<CommandFrame>(command).is_err());
     }

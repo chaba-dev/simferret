@@ -2093,7 +2093,7 @@ stream.write(b'{{"QMP":{{}}}}\n')
 for _ in range(2):
     request = json.loads(stream.readline())
     stream.write(json.dumps({{"return": {{}}, "id": request["id"]}}).encode() + b"\n")
-print('{{"protocol_version":1,"event_id":0,"command_id":0,"event":{{"type":"agent_ready"}}}}', flush=True)
+print('{{"protocol_version":2,"event_id":0,"command_id":0,"event":{{"type":"agent_ready"}}}}', flush=True)
 time.sleep(30)
 "#
         );
@@ -2195,7 +2195,7 @@ time.sleep(30)
             command: crate::protocol::Command::Request {
                 request_id: "request".into(),
                 payload: "x".repeat(crate::protocol::MAX_FRAME_LENGTH - 1024),
-                phase: crate::protocol::RequestPhase::Running,
+                phase: crate::protocol::RequestPhase::PreOutage,
             },
         };
         assert_eq!(
@@ -2212,7 +2212,9 @@ time.sleep(30)
             protocol_version: PROTOCOL_VERSION,
             event_id: 1,
             command_id: 1,
-            event: Event::ServerStopped {},
+            event: Event::NetworkRestored {
+                peer_cidr: "10.0.2.2/32".into(),
+            },
             diagnostics: crate::protocol::DiagnosticFields::default(),
         };
         let mut bytes = vec![SERIAL_ACK, SERIAL_ACK];
