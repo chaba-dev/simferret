@@ -40,10 +40,13 @@
             pkgs.gzip
             pkgs.pkgsStatic.stdenv.cc
             pkgs.qemu
+            pkgs.xz
           ];
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
           shellHook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+            export SIMFERRET_BUSYBOX="${pkgs.pkgsStatic.busybox}/bin/busybox"
             export SIMFERRET_KERNEL="${pkgs.linuxPackages.kernel}/bzImage"
+            export SIMFERRET_KERNEL_MODULES="${pkgs.linuxPackages.kernel.modules}"
           '';
         };
       });
