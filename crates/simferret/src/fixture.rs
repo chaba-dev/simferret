@@ -85,6 +85,12 @@ fn parse_fixture_response(contents: &[u8]) -> io::Result<(String, String)> {
             "extra fixture response fields",
         ));
     }
+    if format!("request_id={request_id}\npayload={payload}\n").as_bytes() != contents {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixture response is not canonically encoded",
+        ));
+    }
     Ok((request_id.into(), payload.into()))
 }
 
@@ -99,5 +105,7 @@ mod tests {
             ("request-1".into(), "opaque".into())
         );
         assert!(parse_fixture_response(b"request_id=request-1\nwrong=opaque\n").is_err());
+        assert!(parse_fixture_response(b"request_id=request-1\r\npayload=opaque\r\n").is_err());
+        assert!(parse_fixture_response(b"request_id=request-1\npayload=opaque").is_err());
     }
 }
