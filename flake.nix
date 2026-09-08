@@ -35,6 +35,7 @@
             rustToolchain
             pkgs.jujutsu
             pkgs.jq
+            pkgs.python3
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             pkgs.cpio
             pkgs.gzip

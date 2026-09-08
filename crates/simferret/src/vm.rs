@@ -1,7 +1,9 @@
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, ExitStatus, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
@@ -25,6 +27,10 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(180);
 const QMP_MESSAGE_LIMIT: usize = 64 * 1024;
 const PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
 const PROBE_READ_BUDGET: usize = 64 * 1024;
+const MAX_FIXTURE_FILES: usize = 256;
+const MAX_FIXTURE_FILE_BYTES: usize = 1024 * 1024;
+const MAX_FIXTURE_BYTES: usize = 8 * 1024 * 1024;
+static NETWORK_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub struct RecordConfig {
@@ -34,6 +40,7 @@ pub struct RecordConfig {
     pub qmp_socket: PathBuf,
     pub serial_log: PathBuf,
     pub qemu_log: PathBuf,
+    pub network: Option<NetworkConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -57,6 +64,656 @@ pub struct VmIdentity {
     pub accelerator: String,
     pub firmware: Vec<FileIdentity>,
     pub devices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkIdentity>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NetworkConfig {
+    pub identity: NetworkIdentity,
+    fixture_directory: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkIdentity {
+    pub nic: NicIdentity,
+    pub backend: BackendIdentity,
+    pub replay_filter: Option<ReplayFilterIdentity>,
+    pub addressing: AddressingIdentity,
+    pub route: RouteIdentity,
+    pub fixture: FixtureIdentity,
+    pub fault: FaultIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NicIdentity {
+    pub model: String,
+    pub mac_address: String,
+    pub bus: String,
+    pub pci_address: String,
+    pub option_rom: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendIdentity {
+    pub kind: String,
+    pub id: String,
+    pub restricted: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayFilterIdentity {
+    pub kind: String,
+    pub id: String,
+    pub backend_id: String,
+    pub queue: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddressingIdentity {
+    pub guest_cidr: String,
+    pub gateway: String,
+    pub peer: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteIdentity {
+    pub destination: String,
+    pub gateway: String,
+    pub interface: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureIdentity {
+    pub transport: String,
+    pub behavior: String,
+    pub content_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FaultIdentity {
+    pub mechanism: String,
+    pub direction: String,
+    pub peer_cidr: String,
+    pub rule: String,
+    pub tool: FileIdentity,
+}
+
+impl NetworkConfig {
+    pub fn restricted_tftp_record(fixture_directory: PathBuf, busybox: &Path) -> io::Result<Self> {
+        let fixture_content_sha256 = fixture_digest(&fixture_directory)?;
+        let busybox_sha256 = sha256_file(busybox)?;
+        Ok(Self::restricted_tftp(
+            Some(fixture_directory),
+            fixture_content_sha256,
+            busybox_sha256,
+        ))
+    }
+
+    pub fn restricted_tftp_replay(fixture_content_sha256: String, busybox_sha256: String) -> Self {
+        Self::restricted_tftp(None, fixture_content_sha256, busybox_sha256)
+    }
+
+    fn restricted_tftp(
+        fixture_directory: Option<PathBuf>,
+        fixture_content_sha256: String,
+        busybox_sha256: String,
+    ) -> Self {
+        Self {
+            identity: NetworkIdentity {
+                nic: NicIdentity {
+                    model: "rtl8139".into(),
+                    mac_address: "52:54:00:12:34:56".into(),
+                    bus: "pci.0".into(),
+                    pci_address: "0x3".into(),
+                    option_rom: false,
+                },
+                backend: BackendIdentity {
+                    kind: "user".into(),
+                    id: "simnet".into(),
+                    restricted: true,
+                },
+                replay_filter: Some(ReplayFilterIdentity {
+                    kind: "filter-replay".into(),
+                    id: "simnet-replay".into(),
+                    backend_id: "simnet".into(),
+                    queue: "all".into(),
+                }),
+                addressing: AddressingIdentity {
+                    guest_cidr: "10.0.2.15/24".into(),
+                    gateway: "10.0.2.2".into(),
+                    peer: "10.0.2.2".into(),
+                },
+                route: RouteIdentity {
+                    destination: "0.0.0.0/0".into(),
+                    gateway: "10.0.2.2".into(),
+                    interface: "eth0".into(),
+                },
+                fixture: FixtureIdentity {
+                    transport: "tftp".into(),
+                    behavior: "immutable-files".into(),
+                    content_sha256: fixture_content_sha256,
+                },
+                fault: FaultIdentity {
+                    mechanism: "prohibit-route".into(),
+                    direction: "outbound".into(),
+                    peer_cidr: "10.0.2.2/32".into(),
+                    rule: "prohibit 10.0.2.2/32".into(),
+                    tool: FileIdentity {
+                        path: "/bin/busybox".into(),
+                        sha256: busybox_sha256,
+                    },
+                },
+            },
+            fixture_directory,
+        }
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        self.identity.validate()
+    }
+}
+
+impl NetworkIdentity {
+    fn validate(&self) -> io::Result<()> {
+        macro_rules! require {
+            ($condition:expr, $message:literal) => {
+                if !$condition {
+                    return Err(invalid_network($message));
+                }
+            };
+        }
+        require!(
+            self.nic.model == "rtl8139",
+            "only the rtl8139 NIC is supported"
+        );
+        require!(
+            self.nic.mac_address == "52:54:00:12:34:56",
+            "the NIC MAC must match the proven fixed address"
+        );
+        require!(
+            self.nic.bus == "pci.0" && self.nic.pci_address == "0x3",
+            "the NIC must use the proven fixed PCI attachment"
+        );
+        require!(!self.nic.option_rom, "the NIC option ROM must be disabled");
+        require!(
+            self.backend.kind == "user",
+            "TAP, bridge, socket, passthrough, and other network backends are not supported"
+        );
+        require!(
+            self.backend.id == "simnet" && self.backend.restricted,
+            "the user network backend must be restricted and use the fixed identifier"
+        );
+        let filter = self.replay_filter.as_ref().ok_or_else(|| {
+            invalid_network("the replay filter is mandatory for every network backend")
+        })?;
+        require!(
+            filter.kind == "filter-replay"
+                && filter.id == "simnet-replay"
+                && filter.backend_id == self.backend.id
+                && filter.queue == "all",
+            "the replay filter must use the proven backend attachment and all queues"
+        );
+        require!(
+            self.addressing.guest_cidr == "10.0.2.15/24"
+                && self.addressing.gateway == "10.0.2.2"
+                && self.addressing.peer == "10.0.2.2",
+            "guest addressing must match the proven private user-network profile"
+        );
+        require!(
+            self.route.destination == "0.0.0.0/0"
+                && self.route.gateway == self.addressing.gateway
+                && self.route.interface == "eth0",
+            "the guest route must match the proven private user-network profile"
+        );
+        require!(
+            self.fixture.transport == "tftp" && self.fixture.behavior == "immutable-files",
+            "only immutable content served by restricted TFTP is supported"
+        );
+        require!(
+            valid_sha256(&self.fixture.content_sha256),
+            "fixture content must have a lowercase SHA-256 identity"
+        );
+        require!(
+            self.fault.mechanism == "prohibit-route"
+                && self.fault.direction == "outbound"
+                && self.fault.peer_cidr == "10.0.2.2/32"
+                && self.fault.rule == "prohibit 10.0.2.2/32",
+            "the fault must be the proven outbound peer-specific prohibit route"
+        );
+        require!(
+            self.fault.tool.path == "/bin/busybox" && valid_sha256(&self.fault.tool.sha256),
+            "the fault tool must be the digested /bin/busybox executable"
+        );
+        Ok(())
+    }
+}
+
+fn invalid_network(message: impl Into<String>) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "unsafe or unsupported network configuration: {}",
+            message.into()
+        ),
+    )
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn fixture_digest(directory: &Path) -> io::Result<String> {
+    let entries = read_fixture_entries(directory)?;
+    Ok(digest_fixture_entries(&entries))
+}
+
+fn read_fixture_entries(directory: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
+    if !directory.is_absolute() || directory.to_str().is_none() {
+        return Err(invalid_network(
+            "record fixture must be an absolute UTF-8 directory and may not be a symlink",
+        ));
+    }
+    let directory_handle = open_directory_without_symlinks(directory)?;
+    read_fixture_entries_from_handle(&directory_handle)
+}
+
+fn read_fixture_entries_from_handle(directory_handle: &File) -> io::Result<Vec<(String, Vec<u8>)>> {
+    let mut names = read_directory_names(directory_handle)?;
+    names.sort_unstable();
+    if names.is_empty() {
+        return Err(invalid_network(format!(
+            "record fixture must contain between 1 and {MAX_FIXTURE_FILES} regular files"
+        )));
+    }
+    let mut total = 0_usize;
+    names
+        .into_iter()
+        .map(|name| {
+            let name_c = std::ffi::CString::new(name.as_bytes()).expect("validated filename");
+            let descriptor = unsafe {
+                libc::openat(
+                    directory_handle.as_raw_fd(),
+                    name_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                )
+            };
+            if descriptor < 0 {
+                let error = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("fixture entry is not a readable regular file: {name}: {error}"),
+                ));
+            }
+            let mut file = unsafe { File::from_raw_fd(descriptor) };
+            let metadata = file.metadata()?;
+            if !metadata.file_type().is_file()
+                || metadata.len() > MAX_FIXTURE_FILE_BYTES as u64
+            {
+                return Err(invalid_network(format!(
+                    "fixture entry must be a regular file no larger than {MAX_FIXTURE_FILE_BYTES} bytes: {name}"
+                )));
+            }
+            let mut contents = Vec::with_capacity(metadata.len() as usize);
+            Read::by_ref(&mut file)
+                .take(MAX_FIXTURE_FILE_BYTES as u64 + 1)
+                .read_to_end(&mut contents)?;
+            if contents.len() != metadata.len() as usize {
+                return Err(invalid_network(format!(
+                    "fixture entry changed while it was read: {name}"
+                )));
+            }
+            total = total
+                .checked_add(contents.len())
+                .ok_or_else(|| invalid_network("fixture size overflowed"))?;
+            if total > MAX_FIXTURE_BYTES {
+                return Err(invalid_network(format!(
+                    "fixture contents must not exceed {MAX_FIXTURE_BYTES} bytes"
+                )));
+            }
+            Ok((name, contents))
+        })
+        .collect()
+}
+
+struct DirectoryStream(*mut libc::DIR);
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+fn read_directory_names(directory: &File) -> io::Result<Vec<String>> {
+    let descriptor = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let pointer = unsafe { libc::fdopendir(descriptor) };
+    if pointer.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe { libc::close(descriptor) };
+        return Err(error);
+    }
+    let stream = DirectoryStream(pointer);
+    let mut names = Vec::new();
+    loop {
+        set_errno(0);
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = current_errno();
+            if error == 0 {
+                break;
+            }
+            return Err(io::Error::from_raw_os_error(error));
+        }
+        let name = unsafe {
+            std::ffi::CStr::from_ptr((*entry).d_name.as_ptr().cast())
+                .to_str()
+                .map_err(|_| {
+                    invalid_network("fixture filenames must be valid UTF-8 path components")
+                })?
+        };
+        if name == "." || name == ".." {
+            continue;
+        }
+        if names.len() == MAX_FIXTURE_FILES {
+            return Err(invalid_network(format!(
+                "record fixture must contain no more than {MAX_FIXTURE_FILES} regular files"
+            )));
+        }
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        {
+            return Err(invalid_network(
+                "fixture filenames may contain only ASCII letters, digits, dot, underscore, and hyphen",
+            ));
+        }
+        names.push(name.into());
+    }
+    Ok(names)
+}
+
+#[cfg(target_os = "linux")]
+fn errno_pointer() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+fn errno_pointer() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+fn set_errno(value: libc::c_int) {
+    unsafe { *errno_pointer() = value };
+}
+
+fn current_errno() -> libc::c_int {
+    unsafe { *errno_pointer() }
+}
+
+fn open_directory_without_symlinks(path: &Path) -> io::Result<File> {
+    let root = std::ffi::CString::new("/").expect("root contains no NUL");
+    let components = path.components().collect::<Vec<_>>();
+    #[cfg(target_os = "linux")]
+    let root_access = if components.len() == 1 {
+        libc::O_RDONLY
+    } else {
+        libc::O_PATH
+    };
+    // Network VM execution is Linux-only. The portable test implementation uses
+    // readable ancestor handles on other Unix targets because O_PATH is Linux-specific.
+    #[cfg(not(target_os = "linux"))]
+    let root_access = libc::O_RDONLY;
+    let descriptor = unsafe {
+        libc::open(
+            root.as_ptr(),
+            root_access | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut directory = unsafe { File::from_raw_fd(descriptor) };
+    for (index, component) in components.iter().enumerate() {
+        use std::path::Component;
+        let name = match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => name,
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(invalid_network(
+                    "fixture directory must be normalized and contain no dot components",
+                ));
+            }
+        };
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| invalid_network("fixture directory contains a NUL byte"))?;
+        let _final_component = index + 1 == components.len();
+        #[cfg(target_os = "linux")]
+        let access = if _final_component {
+            libc::O_RDONLY
+        } else {
+            libc::O_PATH
+        };
+        #[cfg(not(target_os = "linux"))]
+        let access = libc::O_RDONLY;
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                access | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if descriptor < 0 {
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "fixture directory component is not a real directory: {}: {error}",
+                    name.to_string_lossy()
+                ),
+            ));
+        }
+        directory = unsafe { File::from_raw_fd(descriptor) };
+    }
+    Ok(directory)
+}
+
+fn digest_fixture_entries(entries: &[(String, Vec<u8>)]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"simferret-tftp-fixture-v1\0");
+    digest.update((entries.len() as u64).to_le_bytes());
+    for (name, contents) in entries {
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update((contents.len() as u64).to_le_bytes());
+        digest.update(contents);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+#[derive(Debug)]
+struct PreparedFixture {
+    path: PathBuf,
+}
+
+impl PreparedFixture {
+    fn create(network: &NetworkConfig, mode: ExecutionMode) -> io::Result<Self> {
+        Self::create_in(network, mode, &absolute_temp_directory()?)
+    }
+
+    fn create_in(network: &NetworkConfig, mode: ExecutionMode, base: &Path) -> io::Result<Self> {
+        let base = if base.is_absolute() {
+            base.to_owned()
+        } else {
+            std::env::current_dir()?.join(base)
+        };
+        if base.to_str().is_none() {
+            return Err(invalid_network(
+                "temporary fixture base must be an absolute UTF-8 path",
+            ));
+        }
+        let counter = NETWORK_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = base.join(format!(
+            "sf-network-{}-{counter}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
+        let prepared = Self { path };
+        match (mode, &network.fixture_directory) {
+            (ExecutionMode::Record, Some(source)) => {
+                let entries = read_fixture_entries(source)?;
+                let actual = digest_fixture_entries(&entries);
+                if actual != network.identity.fixture.content_sha256 {
+                    return Err(invalid_network(format!(
+                        "fixture content changed after configuration: expected {}, actual {actual}",
+                        network.identity.fixture.content_sha256
+                    )));
+                }
+                for (name, contents) in entries {
+                    let mut file = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(prepared.path.join(name))?;
+                    file.write_all(&contents)?;
+                }
+            }
+            (ExecutionMode::Record, None) => {
+                return Err(invalid_network(
+                    "record mode requires content-controlled fixture input",
+                ));
+            }
+            (ExecutionMode::Replay, None) => {}
+            (ExecutionMode::Replay, Some(_)) => {
+                return Err(invalid_network(
+                    "replay mode does not accept live fixture input",
+                ));
+            }
+        }
+        Ok(prepared)
+    }
+}
+
+fn absolute_temp_directory() -> io::Result<PathBuf> {
+    let directory = std::env::temp_dir();
+    if directory.is_absolute() {
+        Ok(directory)
+    } else {
+        Ok(std::env::current_dir()?.join(directory))
+    }
+}
+
+impl Drop for PreparedFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn validate_identity_compatibility(expected: &VmIdentity, actual: &VmIdentity) -> io::Result<()> {
+    if expected == actual {
+        return Ok(());
+    }
+    let expected = serde_json::to_value(expected).map_err(io::Error::other)?;
+    let actual = serde_json::to_value(actual).map_err(io::Error::other)?;
+    let (field, expected, actual) = first_identity_difference("vm", &expected, &actual)
+        .expect("unequal identities have a differing field");
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "replay environment identity differs at {field}: expected {expected}, actual {actual}"
+        ),
+    ))
+}
+
+fn validate_replay_network_identity(
+    expected: &VmIdentity,
+    actual: Option<&NetworkIdentity>,
+) -> io::Result<()> {
+    if expected.network.as_ref() == actual {
+        return Ok(());
+    }
+    let expected = serde_json::to_value(&expected.network).map_err(io::Error::other)?;
+    let actual = serde_json::to_value(actual).map_err(io::Error::other)?;
+    let (field, expected, actual) = first_identity_difference("vm.network", &expected, &actual)
+        .expect("unequal network identities have a differing field");
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "replay environment identity differs at {field}: expected {expected}, actual {actual}"
+        ),
+    ))
+}
+
+fn first_identity_difference(
+    path: &str,
+    expected: &serde_json::Value,
+    actual: &serde_json::Value,
+) -> Option<(String, String, String)> {
+    match (expected, actual) {
+        (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => {
+            for (name, expected_value) in expected {
+                let child = format!("{path}.{name}");
+                let Some(actual_value) = actual.get(name) else {
+                    return Some((child, expected_value.to_string(), "<missing>".into()));
+                };
+                if let Some(difference) =
+                    first_identity_difference(&child, expected_value, actual_value)
+                {
+                    return Some(difference);
+                }
+            }
+            actual
+                .iter()
+                .find(|(name, _)| !expected.contains_key(*name))
+                .map(|(name, value)| {
+                    (
+                        format!("{path}.{name}"),
+                        "<missing>".into(),
+                        value.to_string(),
+                    )
+                })
+        }
+        (serde_json::Value::Array(expected), serde_json::Value::Array(actual)) => {
+            for (index, expected_value) in expected.iter().enumerate() {
+                let child = format!("{path}[{index}]");
+                let Some(actual_value) = actual.get(index) else {
+                    return Some((child, expected_value.to_string(), "<missing>".into()));
+                };
+                if let Some(difference) =
+                    first_identity_difference(&child, expected_value, actual_value)
+                {
+                    return Some(difference);
+                }
+            }
+            actual.get(expected.len()).map(|value| {
+                (
+                    format!("{path}[{}]", expected.len()),
+                    "<missing>".into(),
+                    value.to_string(),
+                )
+            })
+        }
+        _ if expected == actual => None,
+        _ => Some((path.into(), expected.to_string(), actual.to_string())),
+    }
 }
 
 pub trait VmAdapter {
@@ -138,6 +795,9 @@ impl QemuAdapter {
 
     fn identity(&self, config: &RecordConfig) -> io::Result<VmIdentity> {
         validate_utf8_paths(config)?;
+        if let Some(network) = &config.network {
+            network.validate()?;
+        }
         let output = bounded_output(&self.executable, &["--version"], START_TIMEOUT)?;
         if !output.status.success() {
             return Err(io::Error::other("qemu --version failed"));
@@ -156,12 +816,21 @@ impl QemuAdapter {
             accelerator: "tcg".into(),
             firmware: vec![file_identity(&self.bios)?, file_identity(&self.linuxboot)?],
             devices: vec!["isa-serial:diagnostics".into(), "isa-serial:agent".into()],
+            network: config
+                .network
+                .as_ref()
+                .map(|network| network.identity.clone()),
         })
     }
 
-    fn arguments(&self, config: &RecordConfig, mode: ExecutionMode) -> io::Result<Vec<OsString>> {
+    fn arguments(
+        &self,
+        config: &RecordConfig,
+        mode: ExecutionMode,
+        fixture_directory: Option<&Path>,
+    ) -> io::Result<Vec<OsString>> {
         validate_utf8_paths(config)?;
-        Ok(vec![
+        let mut arguments = vec![
             "-machine".into(),
             format!("{MACHINE},accel=tcg").into(),
             "-cpu".into(),
@@ -185,8 +854,6 @@ impl QemuAdapter {
             "-serial".into(),
             "chardev:diagnostics".into(),
             "-no-reboot".into(),
-            "-net".into(),
-            "none".into(),
             "-rtc".into(),
             "base=2000-01-01T00:00:00,clock=vm".into(),
             "-kernel".into(),
@@ -202,13 +869,56 @@ impl QemuAdapter {
             "chardev:agent".into(),
             "-qmp".into(),
             option_path("unix:path=", &config.qmp_socket, ",server=on,wait=off")?,
+        ];
+        if let Some(network) = &config.network {
+            network.validate()?;
+            let fixture_directory = fixture_directory.ok_or_else(|| {
+                invalid_network("adapter-controlled fixture directory was not prepared")
+            })?;
+            let identity = &network.identity;
+            let filter = identity
+                .replay_filter
+                .as_ref()
+                .expect("validated network has a replay filter");
+            arguments.extend([
+                "-netdev".into(),
+                option_path(
+                    &format!(
+                        "{},id={},restrict=on,tftp=",
+                        identity.backend.kind, identity.backend.id
+                    ),
+                    fixture_directory,
+                    "",
+                )?,
+                "-device".into(),
+                format!(
+                    "{},netdev={},mac={},bus={},addr={},romfile=",
+                    identity.nic.model,
+                    identity.backend.id,
+                    identity.nic.mac_address,
+                    identity.nic.bus,
+                    identity.nic.pci_address
+                )
+                .into(),
+                "-object".into(),
+                format!(
+                    "{},id={},netdev={},queue={}",
+                    filter.kind, filter.id, filter.backend_id, filter.queue
+                )
+                .into(),
+            ]);
+        } else {
+            arguments.extend(["-net".into(), "none".into()]);
+        }
+        arguments.extend([
             "-icount".into(),
             option_path(
                 &format!("shift=auto,rr={},rrfile=", mode.qemu_value()),
                 &config.replay_log,
                 "",
             )?,
-        ])
+        ]);
+        Ok(arguments)
     }
 
     fn launch(
@@ -217,6 +927,30 @@ impl QemuAdapter {
         mode: ExecutionMode,
         expected_identity: Option<&VmIdentity>,
     ) -> io::Result<Box<dyn RunningVm>> {
+        validate_utf8_paths(config)?;
+        if let Some(expected) = expected_identity {
+            validate_replay_network_identity(
+                expected,
+                config.network.as_ref().map(|network| &network.identity),
+            )?;
+        }
+        if let Some(network) = &config.network {
+            network.validate()?;
+        }
+        let fixture = config
+            .network
+            .as_ref()
+            .map(|network| PreparedFixture::create(network, mode))
+            .transpose()?;
+        let identity = self.identity(config)?;
+        if let Some(expected) = expected_identity {
+            validate_identity_compatibility(expected, &identity)?;
+        }
+        let arguments = self.arguments(
+            config,
+            mode,
+            fixture.as_ref().map(|item| item.path.as_path()),
+        )?;
         let mut stale_paths = vec![&config.qmp_socket];
         if matches!(mode, ExecutionMode::Record) {
             stale_paths.push(&config.replay_log);
@@ -233,21 +967,10 @@ impl QemuAdapter {
                 Err(error) => return Err(error),
             }
         }
-        let identity = self.identity(config)?;
-        if let Some(expected) = expected_identity
-            && &identity != expected
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "replay environment identity differs from the recording\nexpected: {expected:#?}\nactual: {identity:#?}"
-                ),
-            ));
-        }
         let qemu_log = File::create(&config.qemu_log)?;
         let mut command = ProcessCommand::new(&self.executable);
         command
-            .args(self.arguments(config, mode)?)
+            .args(arguments)
             .current_dir(config.qmp_socket.parent().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "QMP socket has no parent")
             })?)
@@ -275,6 +998,7 @@ impl QemuAdapter {
             Ok(writer) => writer,
             Err(error) => {
                 terminate(&mut child);
+                let _ = fs::remove_file(&config.qmp_socket);
                 return Err(error);
             }
         };
@@ -294,6 +1018,7 @@ impl QemuAdapter {
             Err(error) => {
                 terminate(&mut child);
                 let _ = writer.join();
+                let _ = fs::remove_file(&config.qmp_socket);
                 return Err(error);
             }
         };
@@ -304,6 +1029,7 @@ impl QemuAdapter {
             event_reader: Some(event_reader),
             identity,
             qmp_socket: config.qmp_socket.clone(),
+            _fixture: fixture,
             child_reaped: false,
         };
         let ready = vm.receive()?;
@@ -481,6 +1207,7 @@ struct QemuVm {
     event_reader: Option<JoinHandle<()>>,
     identity: VmIdentity,
     qmp_socket: PathBuf,
+    _fixture: Option<PreparedFixture>,
     child_reaped: bool,
 }
 
@@ -973,7 +1700,7 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
@@ -986,7 +1713,21 @@ mod tests {
             qmp_socket: root.join("qmp.sock"),
             serial_log: root.join("serial.log"),
             qemu_log: root.join("qemu.log"),
+            network: None,
         }
+    }
+
+    fn network_config(root: &Path) -> NetworkConfig {
+        fs::create_dir_all(root.join("fixture")).unwrap();
+        fs::write(root.join("fixture/request-000001"), b"fixture").unwrap();
+        fs::write(root.join("busybox"), b"busybox").unwrap();
+        NetworkConfig::restricted_tftp_record(root.join("fixture"), &root.join("busybox")).unwrap()
+    }
+
+    fn network_test_root(name: &str) -> PathBuf {
+        fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("simferret-network-{name}-{}", std::process::id()))
     }
 
     fn adapter(root: &Path) -> QemuAdapter {
@@ -998,11 +1739,34 @@ mod tests {
         }
     }
 
+    fn identity_with_network(network: NetworkIdentity) -> VmIdentity {
+        VmIdentity {
+            qemu: FileIdentity {
+                path: "qemu".into(),
+                sha256: "0".repeat(64),
+            },
+            qemu_version: "test".into(),
+            kernel: FileIdentity {
+                path: "kernel".into(),
+                sha256: "1".repeat(64),
+            },
+            initramfs_sha256: "2".repeat(64),
+            machine: MACHINE.into(),
+            cpu: CPU.into(),
+            memory_mib: MEMORY_MIB,
+            vcpus: 1,
+            accelerator: "tcg".into(),
+            firmware: vec![],
+            devices: vec![],
+            network: Some(network),
+        }
+    }
+
     #[test]
     fn record_arguments_fix_identity_and_escape_option_paths() {
         let root = Path::new("/tmp/directory=with,comma");
         let arguments = adapter(root)
-            .arguments(&config(root), ExecutionMode::Record)
+            .arguments(&config(root), ExecutionMode::Record, None)
             .unwrap();
         let arguments = arguments
             .iter()
@@ -1027,13 +1791,386 @@ mod tests {
     fn replay_arguments_consume_the_existing_replay_log() {
         let root = Path::new("/tmp/replay");
         let arguments = adapter(root)
-            .arguments(&config(root), ExecutionMode::Replay)
+            .arguments(&config(root), ExecutionMode::Replay, None)
             .unwrap();
         assert!(
             arguments.iter().any(|argument| {
                 argument == "shift=auto,rr=replay,rrfile=/tmp/replay/replay.bin"
             })
         );
+    }
+
+    #[test]
+    fn network_arguments_match_the_proven_restricted_replay_profile() {
+        let root = network_test_root("arguments");
+        let mut config = config(&root);
+        config.network = Some(network_config(&root));
+        let fixture =
+            PreparedFixture::create(config.network.as_ref().unwrap(), ExecutionMode::Record)
+                .unwrap();
+        let arguments = adapter(&root)
+            .arguments(&config, ExecutionMode::Record, Some(&fixture.path))
+            .unwrap()
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                "-netdev",
+                &format!(
+                    "user,id=simnet,restrict=on,tftp={}",
+                    fixture.path.to_string_lossy().replace(',', ",,")
+                ),
+            ]
+        }));
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                "-device",
+                "rtl8139,netdev=simnet,mac=52:54:00:12:34:56,bus=pci.0,addr=0x3,romfile=",
+            ]
+        }));
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                "-object",
+                "filter-replay,id=simnet-replay,netdev=simnet,queue=all",
+            ]
+        }));
+        assert!(!arguments.windows(2).any(|pair| pair == ["-net", "none"]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsafe_and_unrecorded_network_profiles_are_rejected() {
+        let root = network_test_root("validation");
+        let mut network = network_config(&root);
+        network.identity.backend.kind = "tap".into();
+        let error = network.validate().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("TAP, bridge"));
+
+        let mut network = network_config(&root);
+        network.identity.backend.restricted = false;
+        assert!(
+            network
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("restricted")
+        );
+
+        let mut network = network_config(&root);
+        network.identity.replay_filter = None;
+        assert!(
+            network
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("mandatory")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn network_identity_excludes_runtime_fixture_path() {
+        let first_root = network_test_root("identity-path-first");
+        let second_root = network_test_root("identity-path-second");
+        let first = network_config(&first_root);
+        let second = network_config(&second_root);
+        assert_eq!(first.identity, second.identity);
+        let replay = NetworkConfig::restricted_tftp_replay(
+            first.identity.fixture.content_sha256.clone(),
+            first.identity.fault.tool.sha256.clone(),
+        );
+        assert_eq!(first.identity, replay.identity);
+        let encoded = serde_json::to_string(&first.identity).unwrap();
+        assert!(!encoded.contains(first_root.to_str().unwrap()));
+        assert!(!encoded.contains(second_root.to_str().unwrap()));
+        assert!(encoded.contains("immutable-files"));
+        assert!(encoded.contains("restrict"));
+        fs::remove_dir_all(first_root).unwrap();
+        fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[test]
+    fn record_fixture_rejects_symlinks_and_special_files() {
+        use std::os::unix::fs::symlink;
+
+        let root = network_test_root("special-fixture");
+        fs::create_dir_all(root.join("fixture")).unwrap();
+        fs::write(root.join("outside"), b"secret").unwrap();
+        fs::write(root.join("busybox"), b"busybox").unwrap();
+        symlink(root.join("outside"), root.join("fixture/request-000001")).unwrap();
+        let error =
+            NetworkConfig::restricted_tftp_record(root.join("fixture"), &root.join("busybox"))
+                .unwrap_err();
+        assert!(error.to_string().contains("regular file"), "{error}");
+
+        fs::remove_file(root.join("fixture/request-000001")).unwrap();
+        let fifo =
+            std::ffi::CString::new(root.join("fixture/request-000001").as_os_str().as_bytes())
+                .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let error =
+            NetworkConfig::restricted_tftp_record(root.join("fixture"), &root.join("busybox"))
+                .unwrap_err();
+        assert!(error.to_string().contains("regular file"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn record_fixture_rejects_symlinked_directories_and_binds_reads_to_the_open_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = network_test_root("directory-symlink");
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::write(root.join("real/request-000001"), b"safe").unwrap();
+        fs::write(root.join("real/request-000002"), b"also-safe").unwrap();
+        symlink(root.join("real"), root.join("linked")).unwrap();
+        for suffix in ["", "/", "/."] {
+            let path = PathBuf::from(format!("{}{suffix}", root.join("linked").display()));
+            let error = fixture_digest(&path).unwrap_err();
+            assert!(
+                error.to_string().contains("not a real directory"),
+                "{path:?}: {error}"
+            );
+        }
+
+        let handle = open_directory_without_symlinks(&root.join("real")).unwrap();
+        fs::rename(root.join("real"), root.join("moved")).unwrap();
+        fs::create_dir(root.join("outside")).unwrap();
+        fs::write(root.join("outside/request-000001"), b"secret").unwrap();
+        symlink(root.join("outside"), root.join("real")).unwrap();
+        let entries = read_fixture_entries_from_handle(&handle).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                ("request-000001".into(), b"safe".to_vec()),
+                ("request-000002".into(), b"also-safe".to_vec()),
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fixture_file_count_is_bounded_during_enumeration() {
+        let root = network_test_root("fixture-count");
+        fs::create_dir_all(root.join("fixture")).unwrap();
+        for index in 0..=MAX_FIXTURE_FILES {
+            fs::write(root.join(format!("fixture/request-{index:06}")), []).unwrap();
+        }
+        let error = fixture_digest(&root.join("fixture")).unwrap_err();
+        assert!(error.to_string().contains("no more than 256"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fixture_file_size_is_bounded_before_copy() {
+        let root = network_test_root("fixture-size");
+        fs::create_dir_all(root.join("fixture")).unwrap();
+        fs::write(
+            root.join("fixture/request-000001"),
+            vec![0_u8; MAX_FIXTURE_FILE_BYTES + 1],
+        )
+        .unwrap();
+        let error = fixture_digest(&root.join("fixture")).unwrap_err();
+        assert!(
+            error.to_string().contains("no larger than 1048576"),
+            "{error}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fixture_identity_is_derived_and_rechecked_before_record() {
+        let root = network_test_root("fixture-digest");
+        let first = network_config(&root);
+        let prepared = PreparedFixture::create(&first, ExecutionMode::Record).unwrap();
+        let prepared_path = prepared.path.clone();
+        assert_eq!(
+            fs::read(prepared.path.join("request-000001")).unwrap(),
+            b"fixture"
+        );
+        fs::write(root.join("fixture/request-000001"), b"changed").unwrap();
+        assert_eq!(
+            fs::read(prepared.path.join("request-000001")).unwrap(),
+            b"fixture"
+        );
+        drop(prepared);
+        assert!(!prepared_path.exists());
+        let second =
+            NetworkConfig::restricted_tftp_record(root.join("fixture"), &root.join("busybox"))
+                .unwrap();
+        assert_ne!(
+            first.identity.fixture.content_sha256,
+            second.identity.fixture.content_sha256
+        );
+        let error = PreparedFixture::create(&first, ExecutionMode::Record).unwrap_err();
+        assert!(error.to_string().contains("expected"), "{error}");
+        assert!(error.to_string().contains("actual"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replay_uses_an_empty_adapter_owned_fixture() {
+        let network = NetworkConfig::restricted_tftp_replay("a".repeat(64), "b".repeat(64));
+        let fixture = PreparedFixture::create(&network, ExecutionMode::Replay).unwrap();
+        assert_eq!(fs::read_dir(&fixture.path).unwrap().count(), 0);
+        assert_eq!(
+            fs::metadata(&fixture.path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let root = network_test_root("live-replay");
+        let record = network_config(&root);
+        let error = PreparedFixture::create(&record, ExecutionMode::Replay).unwrap_err();
+        assert!(error.to_string().contains("does not accept live fixture"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_fixture_path_is_absolute_for_a_relative_temporary_base() {
+        let network = NetworkConfig::restricted_tftp_replay("a".repeat(64), "b".repeat(64));
+        let fixture =
+            PreparedFixture::create_in(&network, ExecutionMode::Replay, Path::new(".")).unwrap();
+        assert!(fixture.path.is_absolute());
+    }
+
+    #[test]
+    fn fixture_rejection_does_not_delete_an_existing_recording() {
+        let root = network_test_root("preserve-recording");
+        fs::create_dir_all(&root).unwrap();
+        let mut config = config(&root);
+        config.network = Some(network_config(&root));
+        fs::write(&config.replay_log, b"existing recording").unwrap();
+        fs::write(root.join("fixture/request-000001"), b"changed").unwrap();
+        let error = match adapter(&root).launch_record(&config) {
+            Ok(_) => panic!("changed fixture unexpectedly launched"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("fixture content changed"));
+        assert_eq!(fs::read(&config.replay_log).unwrap(), b"existing recording");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn launched_vm_owns_snapshot_after_source_removal_and_cleans_it_on_drop() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("sf-net-life-{}", std::process::id()));
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(root.join("share/qemu")).unwrap();
+        fs::write(root.join("kernel"), b"kernel").unwrap();
+        fs::write(root.join("initramfs"), b"initramfs").unwrap();
+        fs::write(root.join("share/qemu/bios-256k.bin"), b"bios").unwrap();
+        fs::write(root.join("share/qemu/linuxboot_dma.bin"), b"linuxboot").unwrap();
+        let mut config = config(&root);
+        config.network = Some(network_config(&root));
+        let source = root.join("fixture");
+        let captured = root.join("prepared-path");
+        let source_json = serde_json::to_string(source.to_str().unwrap()).unwrap();
+        let captured_json = serde_json::to_string(captured.to_str().unwrap()).unwrap();
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json, os, shutil, socket, sys, time
+if "--version" in sys.argv:
+    shutil.rmtree({source_json})
+    print("QEMU test version")
+    raise SystemExit(0)
+def option(name):
+    index = sys.argv.index(name)
+    return sys.argv[index + 1]
+netdev = option("-netdev")
+fixture = netdev.split("tftp=", 1)[1].replace(",,", ",")
+with open({captured_json}, "w", encoding="utf-8") as output:
+    output.write(fixture)
+qmp = option("-qmp").split("unix:path=", 1)[1].split(",server=", 1)[0]
+server = socket.socket(socket.AF_UNIX)
+server.bind(qmp)
+server.listen(1)
+connection, _ = server.accept()
+stream = connection.makefile("rwb", buffering=0)
+stream.write(b'{{"QMP":{{}}}}\n')
+for _ in range(2):
+    request = json.loads(stream.readline())
+    stream.write(json.dumps({{"return": {{}}, "id": request["id"]}}).encode() + b"\n")
+print('{{"protocol_version":1,"event_id":0,"command_id":0,"event":{{"type":"agent_ready"}}}}', flush=True)
+time.sleep(30)
+"#
+        );
+        let executable = root.join("bin/qemu-system-x86_64");
+        fs::write(&executable, script).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let vm = adapter(&root).launch_record(&config).unwrap();
+        assert!(!source.exists(), "version probe did not remove live source");
+        let prepared = PathBuf::from(fs::read_to_string(&captured).unwrap());
+        assert!(prepared.is_absolute());
+        assert_eq!(
+            fs::read(prepared.join("request-000001")).unwrap(),
+            b"fixture"
+        );
+        assert!(config.qmp_socket.exists());
+        drop(vm);
+        assert!(!prepared.exists());
+        assert!(!config.qmp_socket.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn actual_replay_network_mismatch_has_field_and_values() {
+        let root = network_test_root("actual-mismatch");
+        fs::create_dir_all(&root).unwrap();
+        let mut actual = network_config(&root);
+        let expected = identity_with_network(actual.identity.clone());
+        actual.identity.nic.mac_address = "52:54:00:12:34:57".into();
+        let mut config = config(&root);
+        config.network = Some(actual);
+        let error = match adapter(&root).launch_replay(&config, &expected) {
+            Ok(_) => panic!("mismatched replay unexpectedly launched"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("vm.network.nic.mac_address"), "{message}");
+        assert!(message.contains("52:54:00:12:34:56"), "{message}");
+        assert!(message.contains("52:54:00:12:34:57"), "{message}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identity_mismatch_reports_the_first_field_with_both_values() {
+        let root = network_test_root("identity");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(root.join("share/qemu")).unwrap();
+        fs::create_dir_all(root.join("fixture")).unwrap();
+        fs::write(
+            root.join("bin/qemu-system-x86_64"),
+            b"#!/bin/sh\necho QEMU test version\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            root.join("bin/qemu-system-x86_64"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        for (path, contents) in [
+            ("kernel", b"kernel".as_slice()),
+            ("initramfs", b"initramfs".as_slice()),
+            ("share/qemu/bios-256k.bin", b"bios".as_slice()),
+            ("share/qemu/linuxboot_dma.bin", b"linuxboot".as_slice()),
+        ] {
+            fs::write(root.join(path), contents).unwrap();
+        }
+        let mut config = config(&root);
+        config.network = Some(network_config(&root));
+        let actual = adapter(&root).identity(&config).unwrap();
+        let mut expected = actual.clone();
+        expected.network.as_mut().unwrap().nic.mac_address = "52:54:00:12:34:57".into();
+        let error = validate_identity_compatibility(&expected, &actual).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("vm.network.nic.mac_address"), "{message}");
+        assert!(message.contains("52:54:00:12:34:57"), "{message}");
+        assert!(message.contains("52:54:00:12:34:56"), "{message}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -42,18 +42,18 @@ device and replay filter while preserving RFD 1's exact passive replay contract.
 
 * Phase 1 — Network identity and VM adapter
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
-- [ ] Add the NIC, MAC, restricted backend, replay filter, addressing, route,
+- [X] Add the NIC, MAC, restricted backend, replay filter, addressing, route,
   fixture, and fault settings to typed identities.
-- [ ] Construct and supervise all QEMU network options and private peer endpoints
+- [X] Construct and supervise all QEMU network options and private peer endpoints
   inside the VM adapter boundary.
-- [ ] Restrict accepted configurations to the proven unprivileged backend and
+- [X] Restrict accepted configurations to the proven unprivileged backend and
   reject unrestricted, TAP, bridge, passthrough, and unrecorded networking.
-- [ ] Validate all network identity fields before replay and report the first
+- [X] Validate all network identity fields before replay and report the first
   incompatibility with expected and actual values.
-- [ ] Keep runtime-only socket paths and host process identifiers diagnostic
+- [X] Keep runtime-only socket paths and host process identifiers diagnostic
   without removing endpoint type and safety behavior from the launch contract.
 
 * Phase 2 — Fault protocol and properties
