@@ -2164,6 +2164,58 @@ time.sleep(30)
     }
 
     #[test]
+    fn replay_compatibility_covers_every_network_identity_class() {
+        let root = network_test_root("identity-classes");
+        let network = network_config(&root).identity;
+        let expected = identity_with_network(network.clone());
+        macro_rules! check {
+            ($field:literal, $change:expr) => {{
+                let mut actual = network.clone();
+                $change(&mut actual);
+                let error = validate_replay_network_identity(&expected, Some(&actual)).unwrap_err();
+                assert!(error.to_string().contains($field), "{}: {error}", $field);
+            }};
+        }
+        check!("vm.network.nic.model", |identity: &mut NetworkIdentity| {
+            identity.nic.model = "e1000".into();
+        });
+        check!("vm.network.backend.id", |identity: &mut NetworkIdentity| {
+            identity.backend.id = "other".into();
+        });
+        check!(
+            "vm.network.replay_filter.id",
+            |identity: &mut NetworkIdentity| {
+                identity.replay_filter.as_mut().unwrap().id = "other".into();
+            }
+        );
+        check!(
+            "vm.network.addressing.peer",
+            |identity: &mut NetworkIdentity| {
+                identity.addressing.peer = "10.0.2.3".into();
+            }
+        );
+        check!(
+            "vm.network.route.interface",
+            |identity: &mut NetworkIdentity| {
+                identity.route.interface = "eth1".into();
+            }
+        );
+        check!(
+            "vm.network.fixture.behavior",
+            |identity: &mut NetworkIdentity| {
+                identity.fixture.behavior = "mutable-files".into();
+            }
+        );
+        check!(
+            "vm.network.fault.direction",
+            |identity: &mut NetworkIdentity| {
+                identity.fault.direction = "inbound".into();
+            }
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn identity_mismatch_reports_the_first_field_with_both_values() {
         let root = network_test_root("identity");
         fs::create_dir_all(root.join("bin")).unwrap();

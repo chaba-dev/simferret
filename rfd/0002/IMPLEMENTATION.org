@@ -93,31 +93,31 @@ device and replay filter while preserving RFD 1's exact passive replay contract.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
-- [ ] Automate the record-and-two-replays demonstration on a GitHub-hosted
+- [X] Automate the record-and-two-replays demonstration on a GitHub-hosted
   x86-64 Linux runner without elevated privileges.
-- [ ] Verify another seed changes the materialized request or outage plan.
-- [ ] Verify every network identity class is covered by compatibility or
+- [X] Verify another seed changes the materialized request or outage plan.
+- [X] Verify every network identity class is covered by compatibility or
   tampering tests.
-- [ ] Verify forbidden external and privileged network configurations fail
+- [X] Verify forbidden external and privileged network configurations fail
   before QEMU starts.
-- [ ] Verify intentional response corruption returns a nonzero CLI result.
-- [ ] Document the equivalent self-hosted-runner requirements and invocation.
-- [ ] Record runtime, replay-log growth, traffic volume, event-bounded fault
+- [X] Verify intentional response corruption returns a nonzero CLI result.
+- [X] Document the equivalent self-hosted-runner requirements and invocation.
+- [X] Record runtime, replay-log growth, traffic volume, event-bounded fault
   latency, device limitations, and all observed divergence in ~EVIDENCE.adoc~.
-- [ ] Recommend the next RFD from the measured network and CI evidence.
+- [X] Recommend the next RFD from the measured network and CI evidence.
 
 * Exit criteria
 
-- [ ] Every acceptance criterion in the RFD has linked automated or captured
+- [X] Every acceptance criterion in the RFD has linked automated or captured
   evidence.
-- [ ] Replay is passive with respect to the host network backend and fixture
+- [X] Replay is passive with respect to the host network backend and fixture
   input.
-- [ ] The acceptance traffic demonstrably traverses the configured QEMU NIC and
+- [X] The acceptance traffic demonstrably traverses the configured QEMU NIC and
   replay filter.
-- [ ] The implementation preserves RFD 1's VM adapter, artifact, identity,
+- [X] The implementation preserves RFD 1's VM adapter, artifact, identity,
   normalization, and assertion ownership boundaries.
-- [ ] No privileged networking, external service, second guest, custom network
+- [X] No privileged networking, external service, second guest, custom network
   stack, custom VMM, or broad QEMU fork exists without new evidence and an RFD.

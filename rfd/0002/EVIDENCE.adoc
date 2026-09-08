@@ -1,11 +1,11 @@
-= RFD 2 Preliminary Evidence
+= RFD 2 Evidence
 
 == Purpose
 
-These pre-implementation spikes test whether the network boundary proposed by
-RFD 2 is feasible with the QEMU, kernel, machine, and unprivileged CI constraints
-committed by RFD 1. They establish viability, not completion of RFD 2's
-controller integration or acceptance criteria.
+This record starts with the pre-implementation spikes that tested whether the
+network boundary proposed by RFD 2 was feasible with the QEMU, kernel, machine,
+and unprivileged CI constraints committed by RFD 1. The final sections record
+the integrated implementation and acceptance evidence.
 
 == Sophie runner baseline
 
@@ -303,3 +303,81 @@ are each limited to 64 KiB. Report-only dependency and runtime-creation bundles
 do not inspect unvalidated recording logs. Real artifact- and VM-identity
 preflight rejections each produced and retained a bundle during the acceptance
 run.
+
+== Phase 4 — Acceptance
+
+The complete integration is automated by `scripts/phase4-acceptance.sh` and the
+repository's `QEMU record/replay` GitHub Actions job. The September 9, 2026 main
+run at commit `aa4c78a96444d27e564cb2946c02a9022cb0841e` passed all five jobs.
+The unprivileged GitHub-hosted Ubuntu QEMU job completed in 8 minutes 42 seconds:
+
+* https://github.com/chaba-dev/simferret/actions/runs/34316273634[CI run 34316273634]
+* https://github.com/chaba-dev/simferret/actions/runs/34316273634/job/102353043771[QEMU record/replay job]
+
+A final local rerun against that integrated implementation recorded in 58.08
+seconds, replayed in 66.62 and 66.35 seconds, and completed the intentional
+corruption run in 59.09 seconds. Its 10,089,520-byte replay log had SHA-256
+digest `c64b6b74c827a2df43775e84f823b97f55d4f9def05fb1d1bf946be6333a17d1`.
+Both replays matched the recorded semantic outcome digest
+`be5ec6342d82234bc8d28ad538cf1dca34d38e42106fd9e12aec3e918fc0c927`.
+Artifact and VM-identity rejection each retained the expected bounded failure
+bundle.
+
+The six-request seed-42 choice plan activates the outage before request index 2
+and restores it before index 4. Its semantic traffic consists of six attempts,
+four matching TFTP responses through the RTL8139 NIC, and two immediate
+administrative rejections while the peer route is prohibited. The six canonical
+fixture files materialized for recording contain 492 bytes in total and are
+removed before atomic publication; this is application-level traffic evidence,
+not a packet or link-byte count. QEMU exposes no packet-counter API for the
+selected user backend and replay filter, so the bounded failure report marks
+packet counters unavailable.
+
+The first unavailable result follows its request attempt by one semantic event,
+meeting the configured outage bound of one. The first matching response after
+restoration follows the restoration confirmation by two semantic events,
+meeting the configured recovery bound of two. Seed 43 changes both request
+content and the fault plan: activation moves to index 1 and restoration to index
+5. Its intentionally corrupted first network response fails safety and returns
+CLI status 1 while the outage, restoration, and recovery assertions still pass.
+
+Compatibility regressions alter one field in each typed network identity class:
+NIC, backend, replay filter, addressing, route, fixture, and fault. Every change
+is rejected before launch with the first differing field. Validation regressions
+separately reject unrestricted user networking, TAP and other unsupported
+backends, and a missing replay filter. Artifact tests cover every persisted
+artifact, malformed choice plans, semantic inconsistencies, and normalized event
+divergence.
+
+An equivalent self-hosted run requires x86-64 Linux, Nix, and the repository's
+pinned QEMU, kernel, modules, BusyBox, and Rust environment. It runs as an
+ordinary unprivileged user and requires neither KVM nor TAP, a bridge, firewall
+changes, or external network access. The invocation is identical:
+
+[source,shell]
+----
+.agents/dev ./scripts/phase4-acceptance.sh
+----
+
+=== Limitations and observed divergence
+
+The semantic artifacts and outcome digest are stable across passive replays,
+but replay-log size and wall-clock duration vary across recordings and hosts.
+They are measurements, not replay identity. The selected boundary supports one
+RTL8139 NIC, one restricted user-mode backend, immutable TFTP fixtures, and one
+outbound peer-specific prohibit route. It does not establish packet loss,
+latency, reordering, multiple guests, or production throughput. No semantic
+divergence was observed in accepted record/replay runs. Intentional content
+corruption, identity changes, artifact changes, missing filters, and malformed
+plans produced the expected explicit failures.
+
+== Recommendation
+
+QEMU's replay-filtered user network is reliable enough for the bounded model:
+the same integrated scenario passed locally and on GitHub-hosted x86-64 Linux,
+passive replays reproduced exact semantic artifacts, and preflight checks turned
+QEMU's otherwise hanging identity failures into actionable errors. The next RFD
+should add reproducible OCI workload packaging so users can apply the proven
+process and network faults to their own software. Checkpoint branching should
+follow once a real packaged workload supplies representative snapshot and
+exploration costs.
