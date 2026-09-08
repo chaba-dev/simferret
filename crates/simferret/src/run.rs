@@ -17,7 +17,7 @@ use crate::protocol::{
 };
 use crate::scenario::{ChoicePlan, MAX_SCENARIO_SOURCE_BYTES, Scenario};
 use crate::vm::{
-    NetworkConfig, QemuAdapter, RecordConfig, RunningVm, VmAdapter, VmIdentity,
+    NetworkConfig, NetworkIdentity, QemuAdapter, RecordConfig, RunningVm, VmAdapter, VmIdentity,
     digest_fixture_entries, sha256_file, validate_replay_network_identity,
 };
 
@@ -25,6 +25,8 @@ const MANIFEST_VERSION: u16 = 1;
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_SEMANTIC_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIAGNOSTIC_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FAILURE_LOG_BYTES: usize = 64 * 1024;
+const MAX_FAILURE_TEXT_BYTES: usize = 64 * 1024;
 const MAX_REPLAY_LOG_BYTES: usize = 1024 * 1024 * 1024;
 const ARTIFACT_NAMES: [&str; 7] = [
     "scenario.toml",
@@ -95,6 +97,106 @@ struct Manifest {
     artifacts: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Serialize)]
+struct FailureDiagnostics {
+    operation: String,
+    stage: String,
+    backend_mode: String,
+    fixture_mode: String,
+    network_status: &'static str,
+    network: Option<NetworkIdentity>,
+    fault_transitions: Vec<FaultTransitionDiagnostic>,
+    traffic: TrafficDiagnostics,
+    packet_counters: PacketCounterDiagnostics,
+}
+
+#[derive(Debug, Serialize)]
+struct FaultTransitionDiagnostic {
+    event_id: u64,
+    transition: &'static str,
+    peer_cidr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TrafficDiagnostics {
+    requests_attempted: u64,
+    requests_succeeded: u64,
+    requests_unavailable: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct PacketCounterDiagnostics {
+    available: bool,
+    incoming: Option<u64>,
+    outgoing: Option<u64>,
+    reason: &'static str,
+}
+
+#[derive(Serialize)]
+struct FailureReport<'a> {
+    version: u16,
+    error_kind: &'a str,
+    error: &'a str,
+    diagnostics: &'a FailureDiagnostics,
+}
+
+impl FailureDiagnostics {
+    fn new(operation: &str) -> Self {
+        Self {
+            operation: operation.into(),
+            stage: "launch".into(),
+            backend_mode: operation.into(),
+            fixture_mode: if operation == "record" {
+                "controlled-content".into()
+            } else {
+                "empty-passive".into()
+            },
+            network_status: "not-yet-validated",
+            network: None,
+            fault_transitions: Vec::new(),
+            traffic: TrafficDiagnostics::default(),
+            packet_counters: PacketCounterDiagnostics {
+                available: false,
+                incoming: None,
+                outgoing: None,
+                reason: "the selected QEMU user backend and replay filter expose no packet-counter API",
+            },
+        }
+    }
+
+    fn set_network(&mut self, network: &NetworkIdentity) {
+        self.network_status = "validated-local-profile";
+        self.network = Some(network.clone());
+    }
+
+    fn observe(&mut self, event: &NormalizedEvent) {
+        match &event.event {
+            Event::OutageActivated { peer_cidr, rule } => {
+                self.fault_transitions.push(FaultTransitionDiagnostic {
+                    event_id: event.event_id,
+                    transition: "activated",
+                    peer_cidr: peer_cidr.clone(),
+                    rule: Some(rule.clone()),
+                });
+            }
+            Event::NetworkRestored { peer_cidr } => {
+                self.fault_transitions.push(FaultTransitionDiagnostic {
+                    event_id: event.event_id,
+                    transition: "restored",
+                    peer_cidr: peer_cidr.clone(),
+                    rule: None,
+                });
+            }
+            Event::RequestAttempted { .. } => self.traffic.requests_attempted += 1,
+            Event::RequestSucceeded { .. } => self.traffic.requests_succeeded += 1,
+            Event::RequestUnavailable { .. } => self.traffic.requests_unavailable += 1,
+            _ => {}
+        }
+    }
+}
+
 pub fn record(options: &RunOptions) -> io::Result<RunResult> {
     if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
         return Err(io::Error::new(
@@ -102,7 +204,8 @@ pub fn record(options: &RunOptions) -> io::Result<RunResult> {
             "record mode supports x86-64 Linux only",
         ));
     }
-    let adapter = QemuAdapter::from_environment()?;
+    let adapter = QemuAdapter::from_environment()
+        .map_err(|error| dependency_failure(error, &options.runs_directory, "record"))?;
     record_with_adapter(options, &adapter)
 }
 
@@ -113,12 +216,22 @@ pub fn replay(options: &ReplayOptions) -> io::Result<ReplayResult> {
             "replay mode supports x86-64 Linux only",
         ));
     }
-    let adapter = QemuAdapter::from_environment()?;
+    let adapter = QemuAdapter::from_environment()
+        .map_err(|error| replay_dependency_failure(error, options))?;
     replay_with_adapter(options, &adapter)
 }
 
 pub fn record_with_adapter(options: &RunOptions, adapter: &dyn VmAdapter) -> io::Result<RunResult> {
-    let assets = GuestImageAssets::load()?;
+    record_with_adapter_and_asset_loader(options, adapter, GuestImageAssets::load)
+}
+
+fn record_with_adapter_and_asset_loader(
+    options: &RunOptions,
+    adapter: &dyn VmAdapter,
+    load_assets: impl FnOnce() -> io::Result<GuestImageAssets>,
+) -> io::Result<RunResult> {
+    let assets = load_assets()
+        .map_err(|error| dependency_failure(error, &options.runs_directory, "record"))?;
     record_with_adapter_and_assets(options, adapter, &assets)
 }
 
@@ -127,84 +240,106 @@ fn record_with_adapter_and_assets(
     adapter: &dyn VmAdapter,
     assets: &GuestImageAssets,
 ) -> io::Result<RunResult> {
-    let (scenario, scenario_source) = Scenario::read(&options.scenario)?;
-    let choices = scenario.choices(options.seed);
-    let image =
-        build_guest_image_with_assets(&options.executable, &options.runs_directory, assets)?;
     let run_id = new_run_id(options.seed)?;
     let mut staging = StagingDirectory::create(&options.runs_directory, &run_id)?;
-    fs::create_dir(staging.path.join("logs"))?;
-    fs::write(staging.path.join("scenario.toml"), scenario_source)?;
-    write_json(staging.path.join("choices.json"), &choices)?;
-    let fixture_directory = staging.path.join("fixture");
-    let fixture_entries = fixture_entries(&choices, scenario.corrupt_responses);
-    materialize_fixture(&fixture_directory, &fixture_entries)?;
-    let network = NetworkConfig::restricted_tftp_record_with_tool_digest(
-        fixture_directory,
-        sha256_bytes(&assets.busybox),
-    )?;
-
-    let qmp = QmpDirectory::create(&run_id)?;
-    let config = RecordConfig {
-        kernel: fs::canonicalize(&options.kernel)?,
-        initramfs: image.path,
-        replay_log: staging.path.join("replay.bin"),
-        qmp_socket: qmp.path.join("qmp.sock"),
-        serial_log: staging.path.join("logs/serial.log"),
-        qemu_log: staging.path.join("logs/qemu.log"),
-        network: Some(network),
-    };
-    let execution = (|| {
+    let mut diagnostics = FailureDiagnostics::new("record");
+    diagnostics.stage = "preparation".into();
+    let qmp = QmpDirectory::create(&run_id).map_err(|error| {
+        failure_with_bundle(
+            error,
+            staging.destination.parent().expect("run root is present"),
+            &run_id,
+            None,
+            None,
+            &diagnostics,
+        )
+    })?;
+    let attempt = (|| {
+        let (scenario, scenario_source) = Scenario::read(&options.scenario)?;
+        let choices = scenario.choices(options.seed);
+        let image =
+            build_guest_image_with_assets(&options.executable, &options.runs_directory, assets)?;
+        fs::create_dir(staging.path.join("logs"))?;
+        fs::write(staging.path.join("scenario.toml"), scenario_source)?;
+        write_json(staging.path.join("choices.json"), &choices)?;
+        let fixture_directory = staging.path.join("fixture");
+        let fixture_entries = fixture_entries(&choices, scenario.corrupt_responses);
+        materialize_fixture(&fixture_directory, &fixture_entries)?;
+        let network = NetworkConfig::restricted_tftp_record_with_tool_digest(
+            fixture_directory,
+            sha256_bytes(&assets.busybox),
+        )?;
+        diagnostics.set_network(&network.identity);
+        let config = RecordConfig {
+            kernel: fs::canonicalize(&options.kernel)?,
+            initramfs: image.path,
+            replay_log: staging.path.join("replay.bin"),
+            qmp_socket: qmp.path.join("qmp.sock"),
+            serial_log: staging.path.join("logs/serial.log"),
+            qemu_log: staging.path.join("logs/qemu.log"),
+            network: Some(network),
+        };
+        diagnostics.stage = "launch".into();
         let mut vm = adapter.launch_record(&config)?;
+        diagnostics.stage = "execution".into();
         let identity = vm.identity().clone();
-        let (events, assertions) = drive_scenario(&scenario, &choices, vm.as_mut())?;
+        let (events, assertions) =
+            drive_scenario(&scenario, &choices, vm.as_mut(), &mut diagnostics)?;
+        diagnostics.stage = "shutdown".into();
         let status = vm.wait()?;
         if !status.success() {
             return Err(io::Error::other(format!("QEMU exited with {status}")));
         }
-        Ok((identity, events, assertions))
+        diagnostics.stage = "publication".into();
+        let event_bytes = encode_events(&events)?;
+        fs::write(staging.path.join("events.jsonl"), &event_bytes)?;
+        let assertion_bytes = json_bytes(&assertions)?;
+        fs::write(staging.path.join("assertions.json"), &assertion_bytes)?;
+        let choice_bytes = fs::read(staging.path.join("choices.json"))?;
+        let scenario_bytes = fs::read(staging.path.join("scenario.toml"))?;
+        let semantic_outcome_sha256 = digest_parts([
+            scenario_bytes.as_slice(),
+            choice_bytes.as_slice(),
+            event_bytes.as_slice(),
+            assertion_bytes.as_slice(),
+        ]);
+        let artifacts = artifact_digests(&staging.path)?;
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            run_id: run_id.clone(),
+            scenario_name: scenario.name,
+            seed: options.seed,
+            simferret_version: env!("CARGO_PKG_VERSION").into(),
+            simferret_path: options
+                .executable
+                .to_str()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "executable path is not UTF-8")
+                })?
+                .into(),
+            simferret_sha256: image.executable_sha256,
+            initial_state_sha256: identity.initramfs_sha256.clone(),
+            semantic_outcome_sha256,
+            vm: identity,
+            artifacts,
+        };
+        write_json(staging.path.join("manifest.json"), &manifest)?;
+        let directory = staging.publish()?;
+        Ok(RunResult {
+            run_id: run_id.clone(),
+            directory,
+            assertions,
+        })
     })();
-    let (identity, events, assertions) =
-        execution.map_err(|error| error_with_diagnostics(error, &staging.path))?;
-
-    let event_bytes = encode_events(&events)?;
-    fs::write(staging.path.join("events.jsonl"), &event_bytes)?;
-    let assertion_bytes = json_bytes(&assertions)?;
-    fs::write(staging.path.join("assertions.json"), &assertion_bytes)?;
-    let choice_bytes = fs::read(staging.path.join("choices.json"))?;
-    let scenario_bytes = fs::read(staging.path.join("scenario.toml"))?;
-    let semantic_outcome_sha256 = digest_parts([
-        scenario_bytes.as_slice(),
-        choice_bytes.as_slice(),
-        event_bytes.as_slice(),
-        assertion_bytes.as_slice(),
-    ]);
-    let artifacts = artifact_digests(&staging.path)?;
-    let manifest = Manifest {
-        version: MANIFEST_VERSION,
-        run_id: run_id.clone(),
-        scenario_name: scenario.name,
-        seed: options.seed,
-        simferret_version: env!("CARGO_PKG_VERSION").into(),
-        simferret_path: options
-            .executable
-            .to_str()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "executable path is not UTF-8")
-            })?
-            .into(),
-        simferret_sha256: image.executable_sha256,
-        initial_state_sha256: identity.initramfs_sha256.clone(),
-        semantic_outcome_sha256,
-        vm: identity,
-        artifacts,
-    };
-    write_json(staging.path.join("manifest.json"), &manifest)?;
-    let directory = staging.publish()?;
-    Ok(RunResult {
-        run_id,
-        directory,
-        assertions,
+    attempt.map_err(|error| {
+        failure_with_bundle(
+            error,
+            staging.destination.parent().expect("run root is present"),
+            &run_id,
+            Some(&staging.path),
+            Some(&qmp.path),
+            &diagnostics,
+        )
     })
 }
 
@@ -212,7 +347,8 @@ pub fn replay_with_adapter(
     options: &ReplayOptions,
     adapter: &dyn VmAdapter,
 ) -> io::Result<ReplayResult> {
-    let assets = GuestImageAssets::load()?;
+    let assets =
+        GuestImageAssets::load().map_err(|error| replay_dependency_failure(error, options))?;
     replay_with_adapter_and_assets(options, adapter, &assets)
 }
 
@@ -222,151 +358,171 @@ fn replay_with_adapter_and_assets(
     assets: &GuestImageAssets,
 ) -> io::Result<ReplayResult> {
     let directory = fs::canonicalize(&options.directory)?;
-    let manifest: Manifest = read_json(&directory.join("manifest.json"), MAX_MANIFEST_BYTES)?;
-    validate_manifest(&directory, &manifest)?;
-    validate_artifacts(&directory, &manifest.artifacts)?;
-
-    let scenario_bytes = read_bounded(&directory.join("scenario.toml"), MAX_SCENARIO_SOURCE_BYTES)?;
-    let (scenario, scenario_bytes) = Scenario::parse(scenario_bytes)?;
-    if scenario.name != manifest.scenario_name {
-        return Err(invalid_data(format!(
-            "scenario name differs from manifest: expected {:?}, found {:?}",
-            manifest.scenario_name, scenario.name
-        )));
-    }
-    let choice_bytes = read_bounded(&directory.join("choices.json"), MAX_SEMANTIC_ARTIFACT_BYTES)?;
-    let choices: ChoicePlan = serde_json::from_slice(&choice_bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let materialized_choices = scenario.choices(manifest.seed);
-    if choices != materialized_choices {
-        return Err(invalid_data(
-            "recorded choice plan does not match the scenario and seed",
-        ));
-    }
-    let expected_event_bytes =
-        read_bounded(&directory.join("events.jsonl"), MAX_SEMANTIC_ARTIFACT_BYTES)?;
-    let expected_events = decode_events(&expected_event_bytes)?;
-    let expected_event_count = scenario
-        .request_count
-        .checked_mul(2)
-        .and_then(|count| count.checked_add(5))
-        .ok_or_else(|| invalid_data("expected event count overflowed"))?;
-    if expected_events.len() != expected_event_count {
-        return Err(invalid_data(format!(
-            "recorded event count is inconsistent with scenario: expected {expected_event_count}, found {}",
-            expected_events.len()
-        )));
-    }
-    for (index, event) in expected_events.iter().enumerate() {
-        if event.protocol_version != PROTOCOL_VERSION || event.event_id != index as u64 + 1 {
-            return Err(invalid_data(format!(
-                "recorded event envelope is invalid at index {index}: {event:#?}"
-            )));
-        }
-    }
-    let expected_assertion_bytes = read_bounded(
-        &directory.join("assertions.json"),
-        MAX_SEMANTIC_ARTIFACT_BYTES,
-    )?;
-    let expected_assertions: AssertionReport = serde_json::from_slice(&expected_assertion_bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if !valid_report(&expected_assertions) {
-        return Err(invalid_data(
-            "recorded assertion report has an invalid shape",
-        ));
-    }
-    let expected_frames = expected_events
-        .iter()
-        .map(|event| EventFrame {
-            protocol_version: event.protocol_version,
-            event_id: event.event_id,
-            command_id: event.command_id,
-            event: event.event.clone(),
-            diagnostics: Default::default(),
-        })
-        .collect::<Vec<_>>();
-    let evaluated_assertions = evaluate(
-        &expected_frames,
-        scenario.outage_event_bound,
-        scenario.liveness_event_bound,
-    );
-    if expected_assertions != evaluated_assertions {
-        return Err(invalid_data(
-            "recorded assertion report does not match recorded events",
-        ));
-    }
-    let recorded_semantic_digest = digest_parts([
-        scenario_bytes.as_slice(),
-        choice_bytes.as_slice(),
-        expected_event_bytes.as_slice(),
-        expected_assertion_bytes.as_slice(),
-    ]);
-    if recorded_semantic_digest != manifest.semantic_outcome_sha256 {
-        return Err(invalid_data(format!(
-            "recorded semantic outcome digest mismatch: expected {}, found {recorded_semantic_digest}",
-            manifest.semantic_outcome_sha256
-        )));
-    }
-
     let runs_directory = directory
         .parent()
         .ok_or_else(|| invalid_data("run directory has no parent"))?;
-    let image = build_guest_image_with_assets(&options.executable, runs_directory, assets)?;
-    if image.executable_sha256 != manifest.simferret_sha256 {
-        return Err(invalid_data(format!(
-            "SimFerret executable digest differs from recording: expected {}, found {}",
-            manifest.simferret_sha256, image.executable_sha256
-        )));
-    }
-    if sha256_file(&image.path)? != manifest.initial_state_sha256 {
-        return Err(invalid_data(
-            "rebuilt initial state digest differs from recording",
-        ));
-    }
+    let bundle_id = new_failure_bundle_id("replay", "attempt");
+    let mut diagnostics = FailureDiagnostics::new("replay");
+    diagnostics.stage = "preflight".into();
+    let runtime = QmpDirectory::create("replay-attempt").map_err(|error| {
+        failure_with_bundle(error, runs_directory, &bundle_id, None, None, &diagnostics)
+    })?;
+    let attempt = (|| {
+        fs::create_dir(runtime.path.join("logs"))?;
+        let manifest: Manifest = read_json(&directory.join("manifest.json"), MAX_MANIFEST_BYTES)?;
+        validate_manifest(&directory, &manifest)?;
+        validate_artifacts(&directory, &manifest.artifacts)?;
 
-    let runtime = QmpDirectory::create(&format!("replay-{}", manifest.run_id))?;
-    fs::create_dir(runtime.path.join("logs"))?;
-    let replay_log = runtime.path.join("replay.bin");
-    copy_regular_file(
-        &directory.join("replay.bin"),
-        &replay_log,
-        MAX_REPLAY_LOG_BYTES,
-    )?;
-    let expected_replay_digest = &manifest.artifacts["replay.bin"];
-    let copied_replay_digest = sha256_file(&replay_log)?;
-    if &copied_replay_digest != expected_replay_digest {
-        return Err(invalid_data(format!(
-            "replay log changed while preparing replay: expected {expected_replay_digest}, found {copied_replay_digest}"
-        )));
-    }
-    if manifest.vm.network.is_none() {
-        return Err(invalid_data("recording has no network identity"));
-    }
-    let actual_fixture_digest =
-        digest_fixture_entries(&fixture_entries(&choices, scenario.corrupt_responses));
-    let actual_busybox_digest = sha256_bytes(&assets.busybox);
-    let network =
-        NetworkConfig::restricted_tftp_replay(actual_fixture_digest, actual_busybox_digest);
-    validate_replay_network_identity(&manifest.vm, Some(&network.identity))?;
-    let config = RecordConfig {
-        kernel: fs::canonicalize(&options.kernel)?,
-        initramfs: image.path,
-        replay_log,
-        qmp_socket: runtime.path.join("qmp.sock"),
-        serial_log: runtime.path.join("logs/serial.log"),
-        qemu_log: runtime.path.join("logs/qemu.log"),
-        network: Some(network),
-    };
-    let execution = (|| {
+        let scenario_bytes =
+            read_bounded(&directory.join("scenario.toml"), MAX_SCENARIO_SOURCE_BYTES)?;
+        let (scenario, scenario_bytes) = Scenario::parse(scenario_bytes)?;
+        if scenario.name != manifest.scenario_name {
+            return Err(invalid_data(format!(
+                "scenario name differs from manifest: expected {:?}, found {:?}",
+                manifest.scenario_name, scenario.name
+            )));
+        }
+        let materialized_choices = scenario.choices(manifest.seed);
+        let network = NetworkConfig::restricted_tftp_replay(
+            digest_fixture_entries(&fixture_entries(
+                &materialized_choices,
+                scenario.corrupt_responses,
+            )),
+            sha256_bytes(&assets.busybox),
+        );
+        diagnostics.set_network(&network.identity);
+        let choice_bytes =
+            read_bounded(&directory.join("choices.json"), MAX_SEMANTIC_ARTIFACT_BYTES)?;
+        let choices: ChoicePlan = serde_json::from_slice(&choice_bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if choices != materialized_choices {
+            return Err(invalid_data(
+                "recorded choice plan does not match the scenario and seed",
+            ));
+        }
+        let expected_event_bytes =
+            read_bounded(&directory.join("events.jsonl"), MAX_SEMANTIC_ARTIFACT_BYTES)?;
+        let expected_events = decode_events(&expected_event_bytes)?;
+        let expected_event_count = scenario
+            .request_count
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(5))
+            .ok_or_else(|| invalid_data("expected event count overflowed"))?;
+        if expected_events.len() != expected_event_count {
+            return Err(invalid_data(format!(
+                "recorded event count is inconsistent with scenario: expected {expected_event_count}, found {}",
+                expected_events.len()
+            )));
+        }
+        for (index, event) in expected_events.iter().enumerate() {
+            if event.protocol_version != PROTOCOL_VERSION || event.event_id != index as u64 + 1 {
+                return Err(invalid_data(format!(
+                    "recorded event envelope is invalid at index {index}: {event:#?}"
+                )));
+            }
+        }
+        let expected_assertion_bytes = read_bounded(
+            &directory.join("assertions.json"),
+            MAX_SEMANTIC_ARTIFACT_BYTES,
+        )?;
+        let expected_assertions: AssertionReport =
+            serde_json::from_slice(&expected_assertion_bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if !valid_report(&expected_assertions) {
+            return Err(invalid_data(
+                "recorded assertion report has an invalid shape",
+            ));
+        }
+        let expected_frames = expected_events
+            .iter()
+            .map(|event| EventFrame {
+                protocol_version: event.protocol_version,
+                event_id: event.event_id,
+                command_id: event.command_id,
+                event: event.event.clone(),
+                diagnostics: Default::default(),
+            })
+            .collect::<Vec<_>>();
+        let evaluated_assertions = evaluate(
+            &expected_frames,
+            scenario.outage_event_bound,
+            scenario.liveness_event_bound,
+        );
+        if expected_assertions != evaluated_assertions {
+            return Err(invalid_data(
+                "recorded assertion report does not match recorded events",
+            ));
+        }
+        let recorded_semantic_digest = digest_parts([
+            scenario_bytes.as_slice(),
+            choice_bytes.as_slice(),
+            expected_event_bytes.as_slice(),
+            expected_assertion_bytes.as_slice(),
+        ]);
+        if recorded_semantic_digest != manifest.semantic_outcome_sha256 {
+            return Err(invalid_data(format!(
+                "recorded semantic outcome digest mismatch: expected {}, found {recorded_semantic_digest}",
+                manifest.semantic_outcome_sha256
+            )));
+        }
+
+        let image = build_guest_image_with_assets(&options.executable, runs_directory, assets)?;
+        if image.executable_sha256 != manifest.simferret_sha256 {
+            return Err(invalid_data(format!(
+                "SimFerret executable digest differs from recording: expected {}, found {}",
+                manifest.simferret_sha256, image.executable_sha256
+            )));
+        }
+        if sha256_file(&image.path)? != manifest.initial_state_sha256 {
+            return Err(invalid_data(
+                "rebuilt initial state digest differs from recording",
+            ));
+        }
+
+        let replay_log = runtime.path.join("replay.bin");
+        copy_regular_file(
+            &directory.join("replay.bin"),
+            &replay_log,
+            MAX_REPLAY_LOG_BYTES,
+        )?;
+        let expected_replay_digest = &manifest.artifacts["replay.bin"];
+        let copied_replay_digest = sha256_file(&replay_log)?;
+        if &copied_replay_digest != expected_replay_digest {
+            return Err(invalid_data(format!(
+                "replay log changed while preparing replay: expected {expected_replay_digest}, found {copied_replay_digest}"
+            )));
+        }
+        if manifest.vm.network.is_none() {
+            return Err(invalid_data("recording has no network identity"));
+        }
+        validate_replay_network_identity(&manifest.vm, Some(&network.identity))?;
+        let config = RecordConfig {
+            kernel: fs::canonicalize(&options.kernel)?,
+            initramfs: image.path,
+            replay_log,
+            qmp_socket: runtime.path.join("qmp.sock"),
+            serial_log: runtime.path.join("logs/serial.log"),
+            qemu_log: runtime.path.join("logs/qemu.log"),
+            network: Some(network),
+        };
+        diagnostics.stage = "launch".into();
         let mut vm = adapter.launch_replay(&config, &manifest.vm)?;
-        let (events, assertions) =
-            drive_replay_scenario(&scenario, &choices, &expected_events, vm.as_mut())?;
+        diagnostics.stage = "execution".into();
+        let (events, assertions) = drive_replay_scenario(
+            &scenario,
+            &choices,
+            &expected_events,
+            vm.as_mut(),
+            &mut diagnostics,
+        )?;
+        diagnostics.stage = "shutdown".into();
         let status = vm.wait()?;
         if !status.success() {
             return Err(io::Error::other(format!(
                 "QEMU replay exited with {status}"
             )));
         }
+        diagnostics.stage = "replay-validation".into();
         compare_events(&expected_events, &events)?;
         if assertions != expected_assertions {
             return Err(invalid_data(format!(
@@ -404,15 +560,25 @@ fn replay_with_adapter_and_assets(
             assertions,
         })
     })();
-    execution.map_err(|error| error_with_diagnostics(error, &runtime.path))
+    attempt.map_err(|error| {
+        failure_with_bundle(
+            error,
+            runs_directory,
+            &bundle_id,
+            Some(&runtime.path),
+            Some(&runtime.path),
+            &diagnostics,
+        )
+    })
 }
 
 fn drive_scenario(
     scenario: &Scenario,
     choices: &ChoicePlan,
     vm: &mut dyn RunningVm,
+    diagnostics: &mut FailureDiagnostics,
 ) -> io::Result<(Vec<NormalizedEvent>, AssertionReport)> {
-    drive_scenario_inner(scenario, choices, vm, true, None)
+    drive_scenario_inner(scenario, choices, vm, true, None, diagnostics)
 }
 
 fn drive_replay_scenario(
@@ -420,8 +586,16 @@ fn drive_replay_scenario(
     choices: &ChoicePlan,
     expected_events: &[NormalizedEvent],
     vm: &mut dyn RunningVm,
+    diagnostics: &mut FailureDiagnostics,
 ) -> io::Result<(Vec<NormalizedEvent>, AssertionReport)> {
-    drive_scenario_inner(scenario, choices, vm, false, Some(expected_events))
+    drive_scenario_inner(
+        scenario,
+        choices,
+        vm,
+        false,
+        Some(expected_events),
+        diagnostics,
+    )
 }
 
 fn drive_scenario_inner(
@@ -430,8 +604,9 @@ fn drive_scenario_inner(
     vm: &mut dyn RunningVm,
     send_commands: bool,
     expected_events: Option<&[NormalizedEvent]>,
+    diagnostics: &mut FailureDiagnostics,
 ) -> io::Result<(Vec<NormalizedEvent>, AssertionReport)> {
-    let mut controller = Controller::new(vm, send_commands, expected_events);
+    let mut controller = Controller::new(vm, send_commands, expected_events, diagnostics);
     controller.issue(Command::ConfigureNetwork {
         interface: "eth0".into(),
         guest_cidr: "10.0.2.15/24".into(),
@@ -501,6 +676,7 @@ fn drive_scenario_inner(
 
 struct Controller<'a> {
     vm: &'a mut dyn RunningVm,
+    diagnostics: &'a mut FailureDiagnostics,
     next_command_id: u64,
     next_event_id: u64,
     send_commands: bool,
@@ -514,9 +690,11 @@ impl<'a> Controller<'a> {
         vm: &'a mut dyn RunningVm,
         send_commands: bool,
         expected_events: Option<&[NormalizedEvent]>,
+        diagnostics: &'a mut FailureDiagnostics,
     ) -> Self {
         Self {
             vm,
+            diagnostics,
             next_command_id: 1,
             next_event_id: 1,
             send_commands,
@@ -568,6 +746,7 @@ impl<'a> Controller<'a> {
             self.next_event_id += 1;
             validate_response(&command, event_index, &event)?;
             let normalized = event.normalize();
+            self.diagnostics.observe(&normalized);
             if let Some(expected) = &self.expected_events {
                 let index = self.events.len();
                 match expected.get(index) {
@@ -1308,6 +1487,196 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn dependency_failure(error: io::Error, runs_directory: &Path, operation: &str) -> io::Error {
+    let mut diagnostics = FailureDiagnostics::new(operation);
+    diagnostics.stage = "dependency-initialization".into();
+    failure_with_bundle(
+        error,
+        runs_directory,
+        &new_failure_bundle_id(operation, "dependency"),
+        None,
+        None,
+        &diagnostics,
+    )
+}
+
+fn replay_dependency_failure(error: io::Error, options: &ReplayOptions) -> io::Error {
+    let Ok(directory) = fs::canonicalize(&options.directory) else {
+        return error;
+    };
+    let Some(runs_directory) = directory.parent() else {
+        return error;
+    };
+    dependency_failure(error, runs_directory, "replay")
+}
+
+fn failure_with_bundle(
+    error: io::Error,
+    runs_directory: &Path,
+    bundle_id: &str,
+    diagnostic_source: Option<&Path>,
+    runtime_directory: Option<&Path>,
+    diagnostics: &FailureDiagnostics,
+) -> io::Error {
+    let kind = error.kind();
+    let error_text = error.to_string();
+    let detailed = match diagnostic_source {
+        Some(source) => error_with_diagnostics(error, source),
+        None => error,
+    };
+    let report = FailureReport {
+        version: 1,
+        error_kind: error_kind_name(kind),
+        error: &error_text,
+        diagnostics,
+    };
+    let mut message = detailed.to_string();
+    match retain_failure_bundle(
+        runs_directory,
+        bundle_id,
+        diagnostic_source,
+        runtime_directory,
+        &report,
+    ) {
+        Ok(path) => message.push_str(&format!("\nfailure bundle: {}", path.display())),
+        Err(bundle_error) => {
+            message.push_str(&format!(
+                "\nfailed to retain failure bundle: {bundle_error}"
+            ));
+        }
+    }
+    io::Error::new(kind, message)
+}
+
+fn retain_failure_bundle(
+    runs_directory: &Path,
+    bundle_id: &str,
+    diagnostic_source: Option<&Path>,
+    runtime_directory: Option<&Path>,
+    report: &FailureReport<'_>,
+) -> io::Result<PathBuf> {
+    let root = runs_directory.join("failures");
+    fs::create_dir_all(&root)?;
+    let destination = root.join(bundle_id);
+    let temporary = root.join(format!(".{bundle_id}.tmp-{}", std::process::id()));
+    fs::DirBuilder::new().mode(0o700).create(&temporary)?;
+    let result = (|| {
+        let private_paths = diagnostic_source
+            .into_iter()
+            .chain(runtime_directory)
+            .collect::<Vec<_>>();
+        let error = String::from_utf8(sanitize_diagnostic_log(
+            report.error.as_bytes(),
+            &private_paths,
+        ))
+        .expect("sanitized diagnostic text is UTF-8");
+        write_json(
+            temporary.join("failure.json"),
+            &FailureReport {
+                version: report.version,
+                error_kind: report.error_kind,
+                error: &error,
+                diagnostics: report.diagnostics,
+            },
+        )?;
+        let log_directory = temporary.join("logs");
+        fs::create_dir(&log_directory)?;
+        if let Some(diagnostic_source) = diagnostic_source {
+            for name in ["qemu.log", "serial.log"] {
+                let source = diagnostic_source.join("logs").join(name);
+                if let Ok(bytes) = read_sanitized_log_tail(&source, &private_paths) {
+                    fs::write(log_directory.join(name), bytes)?;
+                }
+            }
+        }
+        fs::rename(&temporary, &destination)?;
+        Ok(destination.clone())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&temporary);
+    }
+    result
+}
+
+fn read_sanitized_log_tail(path: &Path, private_paths: &[&Path]) -> io::Result<Vec<u8>> {
+    let overlap = private_paths
+        .iter()
+        .filter_map(|path| path.to_str())
+        .map(|path| qemu_escape_path(path).len())
+        .max()
+        .unwrap_or(0);
+    let limit = MAX_FAILURE_LOG_BYTES
+        .saturating_add(overlap)
+        .saturating_add(1);
+    let length = fs::metadata(path)?.len();
+    let mut bytes = read_tail(path, limit)?;
+    if length > bytes.len() as u64 {
+        discard_partial_private_path(&mut bytes, private_paths);
+    }
+    Ok(sanitize_diagnostic_log(&bytes, private_paths))
+}
+
+fn discard_partial_private_path(bytes: &mut Vec<u8>, private_paths: &[&Path]) {
+    let mut discard = 0;
+    for path in private_paths.iter().filter_map(|path| path.to_str()) {
+        for representation in [path.to_owned(), qemu_escape_path(path)] {
+            for start in 0..representation.len() {
+                let suffix = &representation.as_bytes()[start..];
+                if bytes.starts_with(suffix) {
+                    discard = discard.max(suffix.len());
+                }
+            }
+        }
+    }
+    if discard > 0 && bytes.get(discard) == Some(&b'\n') {
+        discard += 1;
+    }
+    bytes.drain(..discard);
+}
+
+fn sanitize_diagnostic_log(bytes: &[u8], private_paths: &[&Path]) -> Vec<u8> {
+    let mut log = String::from_utf8_lossy(bytes).into_owned();
+    for path in private_paths {
+        if let Some(path) = path.to_str()
+            && !path.is_empty()
+        {
+            log = log.replace(&qemu_escape_path(path), "<runtime-directory>");
+            log = log.replace(path, "<runtime-directory>");
+        }
+    }
+    if log.len() <= MAX_FAILURE_TEXT_BYTES {
+        return log.into_bytes();
+    }
+    let mut start = log.len() - MAX_FAILURE_TEXT_BYTES;
+    while !log.is_char_boundary(start) {
+        start += 1;
+    }
+    log.as_bytes()[start..].to_vec()
+}
+
+fn qemu_escape_path(path: &str) -> String {
+    path.replace(',', ",,")
+}
+
+fn error_kind_name(kind: io::ErrorKind) -> &'static str {
+    match kind {
+        io::ErrorKind::TimedOut => "watchdog",
+        io::ErrorKind::InvalidData => "invalid-data",
+        io::ErrorKind::UnexpectedEof => "early-termination",
+        io::ErrorKind::BrokenPipe => "channel-failure",
+        io::ErrorKind::NotFound => "not-found",
+        io::ErrorKind::PermissionDenied => "permission-denied",
+        _ => "infrastructure",
+    }
+}
+
+fn new_failure_bundle_id(operation: &str, run_id: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("{operation}-{run_id}-{nanos:032x}")
+}
+
 fn error_with_diagnostics(error: io::Error, staging: &Path) -> io::Error {
     let mut message = error.to_string();
     for (label, path) in [
@@ -1383,6 +1752,8 @@ mod tests {
 
     struct FailingAdapter;
 
+    struct ArtifactFailingAdapter(FakeAdapter);
+
     fn synthetic_assets() -> GuestImageAssets {
         GuestImageAssets {
             busybox: b"synthetic busybox".to_vec(),
@@ -1437,7 +1808,13 @@ mod tests {
 
     impl VmAdapter for FailingAdapter {
         fn launch_record(&self, config: &RecordConfig) -> io::Result<Box<dyn RunningVm>> {
-            fs::write(&config.qemu_log, b"distinctive startup failure")?;
+            fs::write(
+                &config.qemu_log,
+                format!(
+                    "{}\ndistinctive startup failure",
+                    config.qmp_socket.display()
+                ),
+            )?;
             fs::write(&config.serial_log, b"guest boot failed")?;
             Err(io::Error::other("adapter failed"))
         }
@@ -1447,9 +1824,22 @@ mod tests {
             config: &RecordConfig,
             _expected_identity: &VmIdentity,
         ) -> io::Result<Box<dyn RunningVm>> {
-            fs::write(&config.qemu_log, b"distinctive replay failure")?;
+            fs::write(
+                &config.qemu_log,
+                format!(
+                    "{}\ndistinctive replay failure",
+                    config.qmp_socket.display()
+                ),
+            )?;
             fs::write(&config.serial_log, b"replayed guest failed")?;
             Err(io::Error::other("replay adapter failed"))
+        }
+    }
+
+    impl VmAdapter for ArtifactFailingAdapter {
+        fn launch_record(&self, config: &RecordConfig) -> io::Result<Box<dyn RunningVm>> {
+            fs::create_dir(config.replay_log.parent().unwrap().join("events.jsonl"))?;
+            self.0.launch_record(config)
         }
     }
 
@@ -1693,8 +2083,16 @@ mod tests {
             recorded_events: None,
             playback: false,
         };
-        let (events, report) = drive_scenario(&scenario, &choices, &mut vm).unwrap();
+        let mut diagnostics = failure_diagnostics("record");
+        let (events, report) =
+            drive_scenario(&scenario, &choices, &mut vm, &mut diagnostics).unwrap();
         assert!(report.passed);
+        assert_eq!(diagnostics.fault_transitions.len(), 2);
+        assert_eq!(diagnostics.traffic.requests_attempted, 4);
+        assert_eq!(
+            diagnostics.traffic.requests_succeeded + diagnostics.traffic.requests_unavailable,
+            4
+        );
         assert!(events.iter().any(|frame| matches!(
             frame.event,
             Event::RequestUnavailable {
@@ -1961,7 +2359,8 @@ mod tests {
         let mut vm = fake_vm(false, false, false);
         vm.playback = true;
         vm.queued.push_back(actual);
-        let mut controller = Controller::new(&mut vm, false, Some(&[expected]));
+        let mut diagnostics = failure_diagnostics("replay");
+        let mut controller = Controller::new(&mut vm, false, Some(&[expected]), &mut diagnostics);
         let error = controller.issue(command).unwrap_err();
         assert!(
             error
@@ -2035,6 +2434,20 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("distinctive replay failure"), "{message}");
         assert!(message.contains("replayed guest failed"), "{message}");
+        let bundle = only_failure_bundle(&root.join("runs"));
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle.join("failure.json")).unwrap()).unwrap();
+        assert_eq!(report["error_kind"], "infrastructure");
+        assert_eq!(report["diagnostics"]["operation"], "replay");
+        assert_eq!(report["diagnostics"]["stage"], "launch");
+        assert_eq!(report["diagnostics"]["backend_mode"], "replay");
+        assert_eq!(report["diagnostics"]["fixture_mode"], "empty-passive");
+        assert_eq!(report["diagnostics"]["packet_counters"]["available"], false);
+        assert!(report["diagnostics"]["network"]["replay_filter"].is_object());
+        let qemu_log = fs::read_to_string(bundle.join("logs/qemu.log")).unwrap();
+        assert!(qemu_log.contains("distinctive replay failure"));
+        assert!(qemu_log.contains("<runtime-directory>/qmp.sock"));
+        assert!(!qemu_log.contains("/tmp/sf-"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2178,6 +2591,47 @@ mod tests {
     }
 
     #[test]
+    fn replay_rejects_missing_filter_and_malformed_fault_plan_before_launch() {
+        let root = temporary_root("network-replay-preflight");
+        let options = test_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        let manifest_path = recorded.directory.join("manifest.json");
+        let original_manifest = fs::read(&manifest_path).unwrap();
+
+        let mut manifest: Manifest = serde_json::from_slice(&original_manifest).unwrap();
+        manifest.vm.network.as_mut().unwrap().replay_filter = None;
+        write_json(manifest_path.clone(), &manifest).unwrap();
+        let replay_options = ReplayOptions {
+            directory: recorded.directory.clone(),
+            kernel: options.kernel.clone(),
+            executable: options.executable.clone(),
+        };
+        let error = replay_with_adapter(&replay_options, &FailingAdapter).unwrap_err();
+        assert!(error.to_string().contains("replay_filter"), "{error}");
+        assert!(!error.to_string().contains("replay adapter failed"));
+        assert_eq!(failure_bundles(&options.runs_directory).len(), 1);
+
+        fs::write(&manifest_path, original_manifest).unwrap();
+        let choices_path = recorded.directory.join("choices.json");
+        let mut choices: ChoicePlan =
+            read_json(&choices_path, MAX_SEMANTIC_ARTIFACT_BYTES).unwrap();
+        choices.restoration_request_index = choices.outage_activation_request_index;
+        let choice_bytes = json_bytes(&choices).unwrap();
+        fs::write(&choices_path, &choice_bytes).unwrap();
+        let mut manifest: Manifest = read_json(&manifest_path, MAX_MANIFEST_BYTES).unwrap();
+        manifest
+            .artifacts
+            .insert("choices.json".into(), sha256_bytes(&choice_bytes));
+        write_json(manifest_path, &manifest).unwrap();
+        let error = replay_with_adapter(&replay_options, &FailingAdapter).unwrap_err();
+        assert!(error.to_string().contains("choice plan"), "{error}");
+        assert!(!error.to_string().contains("replay adapter failed"));
+        assert_eq!(failure_bundles(&options.runs_directory).len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn record_rejects_mismatched_and_trailing_protocol_events() {
         let scenario = test_scenario(false);
         let choices = scenario.choices(42);
@@ -2191,7 +2645,8 @@ mod tests {
                 extra_after_shutdown,
                 malformed_after_shutdown,
             );
-            let error = drive_scenario(&scenario, &choices, &mut vm).unwrap_err();
+            let mut diagnostics = failure_diagnostics("record");
+            let error = drive_scenario(&scenario, &choices, &mut vm, &mut diagnostics).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
     }
@@ -2237,6 +2692,19 @@ mod tests {
         let options = test_options(&root, false);
         let error = record_with_adapter(&options, &FailingAdapter).unwrap_err();
         assert!(error.to_string().contains("distinctive startup failure"));
+        let bundle = only_failure_bundle(&options.runs_directory);
+        assert!(error.to_string().contains(&bundle.display().to_string()));
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle.join("failure.json")).unwrap()).unwrap();
+        assert_eq!(report["diagnostics"]["operation"], "record");
+        assert_eq!(report["diagnostics"]["backend_mode"], "record");
+        assert_eq!(report["diagnostics"]["fixture_mode"], "controlled-content");
+        assert_eq!(
+            report["diagnostics"]["fault_transitions"],
+            serde_json::json!([])
+        );
+        assert!(bundle.join("logs/qemu.log").is_file());
+        assert!(bundle.join("logs/serial.log").is_file());
         let runs = fs::read_dir(root.join("runs")).unwrap();
         assert_eq!(
             runs.filter_map(Result::ok)
@@ -2244,6 +2712,162 @@ mod tests {
                 .count(),
             0
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn execution_failure_bundle_retains_fault_transitions_and_traffic_counts() {
+        let root = temporary_root("execution-failure");
+        let options = test_options(&root, false);
+        let mut adapter = fake_adapter(None);
+        adapter.malformed_after_shutdown = true;
+        let error = record_with_adapter(&options, &adapter).unwrap_err();
+        assert!(error.to_string().contains("malformed trailing frame"));
+
+        let bundle = only_failure_bundle(&options.runs_directory);
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle.join("failure.json")).unwrap()).unwrap();
+        assert_eq!(report["diagnostics"]["stage"], "execution");
+        assert_eq!(
+            report["diagnostics"]["fault_transitions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(report["diagnostics"]["traffic"]["requests_attempted"], 4);
+        assert_eq!(
+            report["diagnostics"]["traffic"]["requests_succeeded"]
+                .as_u64()
+                .unwrap()
+                + report["diagnostics"]["traffic"]["requests_unavailable"]
+                    .as_u64()
+                    .unwrap(),
+            4
+        );
+        assert!(
+            !options
+                .runs_directory
+                .join(bundle.file_name().unwrap())
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn post_execution_artifact_failure_retains_a_bundle() {
+        let root = temporary_root("artifact-publication-failure");
+        let options = test_options(&root, false);
+        let adapter = ArtifactFailingAdapter(fake_adapter(None));
+        let error = record_with_adapter(&options, &adapter).unwrap_err();
+        assert!(error.to_string().contains("Is a directory"), "{error}");
+        let bundle = only_failure_bundle(&options.runs_directory);
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle.join("failure.json")).unwrap()).unwrap();
+        assert_eq!(report["diagnostics"]["stage"], "publication");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failure_bundle_sanitizes_escaped_and_split_paths_and_enforces_size_limits() {
+        let root = temporary_root("private,name");
+        let source = root.join("runtime,private");
+        fs::create_dir_all(source.join("logs")).unwrap();
+        let escaped = source.to_string_lossy().replace(',', ",,");
+        fs::write(source.join("logs/qemu.log"), format!("path={escaped}\n")).unwrap();
+        let literal = source.to_string_lossy();
+        let serial_log = format!("{literal}\n").repeat(2_000);
+        fs::write(source.join("logs/serial.log"), serial_log).unwrap();
+
+        let diagnostics = failure_diagnostics("replay");
+        let oversized_error = "error ".repeat(MAX_FAILURE_LOG_BYTES);
+        let report = FailureReport {
+            version: 1,
+            error_kind: "invalid-data",
+            error: &oversized_error,
+            diagnostics: &diagnostics,
+        };
+        let bundle = retain_failure_bundle(
+            &root.join("runs"),
+            "bounded",
+            Some(&source),
+            Some(&source),
+            &report,
+        )
+        .unwrap();
+        let retained_log = fs::read(bundle.join("logs/qemu.log")).unwrap();
+        assert!(retained_log.len() <= MAX_FAILURE_LOG_BYTES);
+        assert!(!String::from_utf8_lossy(&retained_log).contains(&escaped));
+        let retained_serial = fs::read_to_string(bundle.join("logs/serial.log")).unwrap();
+        assert!(
+            retained_serial
+                .lines()
+                .all(|line| line == "<runtime-directory>"),
+            "{retained_serial}"
+        );
+        let expanded = sanitize_diagnostic_log(&vec![0xff; MAX_FAILURE_LOG_BYTES], &[]);
+        assert!(expanded.len() <= MAX_FAILURE_LOG_BYTES);
+
+        let multiline_path = Path::new("/tmp/private\nsecret/runtime");
+        let multiline_log = format!("{}\n", multiline_path.display()).repeat(3_000);
+        let multiline_log_path = source.join("logs/multiline.log");
+        fs::write(&multiline_log_path, multiline_log).unwrap();
+        let retained_multiline =
+            read_sanitized_log_tail(&multiline_log_path, &[multiline_path]).unwrap();
+        let retained_multiline = String::from_utf8(retained_multiline).unwrap();
+        assert!(!retained_multiline.starts_with("secret/runtime"));
+        assert!(!retained_multiline.contains("/tmp/private"));
+
+        let retained_report = fs::read(bundle.join("failure.json")).unwrap();
+        let retained_report: serde_json::Value = serde_json::from_slice(&retained_report).unwrap();
+        assert!(retained_report["error"].as_str().unwrap().len() <= MAX_FAILURE_LOG_BYTES);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_only_bundle_does_not_read_unvalidated_recording_logs() {
+        let root = temporary_root("unvalidated-replay-logs");
+        let recording = root.join("recording");
+        fs::create_dir_all(recording.join("logs")).unwrap();
+        let fifo = recording.join("logs/qemu.log");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        std::os::unix::fs::symlink("/etc/passwd", recording.join("logs/serial.log")).unwrap();
+
+        let diagnostics = FailureDiagnostics::new("replay");
+        let report = FailureReport {
+            version: 1,
+            error_kind: "infrastructure",
+            error: "runtime creation failed",
+            diagnostics: &diagnostics,
+        };
+        let started = std::time::Instant::now();
+        let bundle =
+            retain_failure_bundle(&root.join("runs"), "report-only", None, None, &report).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(fs::read_dir(bundle.join("logs")).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dependency_initialization_failure_retains_a_report_only_bundle() {
+        let root = temporary_root("dependency-failure");
+        let options = test_options(&root, false);
+        let error = record_with_adapter_and_asset_loader(&options, &FailingAdapter, || {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "guest assets unavailable",
+            ))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("guest assets unavailable"));
+        let bundle = only_failure_bundle(&options.runs_directory);
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle.join("failure.json")).unwrap()).unwrap();
+        assert_eq!(report["diagnostics"]["stage"], "dependency-initialization");
+        assert_eq!(report["diagnostics"]["network_status"], "not-yet-validated");
+        assert!(report["diagnostics"]["network"].is_null());
+        assert_eq!(fs::read_dir(bundle.join("logs")).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2400,6 +3024,26 @@ mod tests {
             corrupt: false,
             recorded_events: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn failure_diagnostics(operation: &str) -> FailureDiagnostics {
+        let network = NetworkConfig::restricted_tftp_replay("0".repeat(64), "1".repeat(64));
+        let mut diagnostics = FailureDiagnostics::new(operation);
+        diagnostics.set_network(&network.identity);
+        diagnostics
+    }
+
+    fn only_failure_bundle(runs_directory: &Path) -> PathBuf {
+        let bundles = failure_bundles(runs_directory);
+        assert_eq!(bundles.len(), 1);
+        bundles.into_iter().next().unwrap()
+    }
+
+    fn failure_bundles(runs_directory: &Path) -> Vec<PathBuf> {
+        fs::read_dir(runs_directory.join("failures"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
     }
 
     fn test_scenario(corrupt: bool) -> Scenario {

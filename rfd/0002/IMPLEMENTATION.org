@@ -76,18 +76,18 @@ device and replay filter while preserving RFD 1's exact passive replay contract.
 
 * Phase 3 — Record and passive replay integration
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
-- [ ] Record a finite successful, outage, and recovery sequence and persist its
+- [X] Record a finite successful, outage, and recovery sequence and persist its
   complete network identity and semantic artifacts atomically.
-- [ ] Replay the recording twice through the restricted replay-filtered backend
+- [X] Replay the recording twice through the restricted replay-filtered backend
   without fixture content or peer interaction.
-- [ ] Compare normalized events, assertion artifacts, and semantic outcome
+- [X] Compare normalized events, assertion artifacts, and semantic outcome
   digests while QEMU injects recorded incoming packets.
-- [ ] Reject tampered network identities, missing replay filters, malformed
+- [X] Reject tampered network identities, missing replay filters, malformed
   fault plans, and network artifact divergence.
-- [ ] Retain bounded QEMU, backend-mode, fault-transition, and packet-count
+- [X] Retain bounded QEMU, backend-mode, fault-transition, and packet-count
   diagnostics in a failure bundle for launch, watchdog, execution, and replay
   failures.
 

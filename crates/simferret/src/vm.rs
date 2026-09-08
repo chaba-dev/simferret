@@ -560,6 +560,7 @@ struct PreparedFixture {
 }
 
 impl PreparedFixture {
+    #[cfg(test)]
     fn create(network: &NetworkConfig, mode: ExecutionMode) -> io::Result<Self> {
         Self::create_in(network, mode, &absolute_temp_directory()?)
     }
@@ -621,6 +622,7 @@ impl PreparedFixture {
     }
 }
 
+#[cfg(test)]
 fn absolute_temp_directory() -> io::Result<PathBuf> {
     let directory = std::env::temp_dir();
     if directory.is_absolute() {
@@ -946,10 +948,13 @@ impl QemuAdapter {
         if let Some(network) = &config.network {
             network.validate()?;
         }
+        let runtime_directory = config.qmp_socket.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "QMP socket has no parent")
+        })?;
         let fixture = config
             .network
             .as_ref()
-            .map(|network| PreparedFixture::create(network, mode))
+            .map(|network| PreparedFixture::create_in(network, mode, runtime_directory))
             .transpose()?;
         let identity = self.identity(config)?;
         if let Some(expected) = expected_identity {
@@ -1318,19 +1323,7 @@ impl Drop for QemuVm {
 
 fn qmp_negotiate(child: &mut Child, socket: &Path) -> io::Result<()> {
     let deadline = Instant::now() + START_TIMEOUT;
-    let stream = loop {
-        match std::os::unix::net::UnixStream::connect(socket) {
-            Ok(stream) => break stream,
-            Err(error) if Instant::now() < deadline => {
-                if child_exited(child)? {
-                    return Err(io::Error::other("QEMU exited during startup"));
-                }
-                let _ = error;
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => return Err(error),
-        }
-    };
+    let stream = qmp_connect(child, socket, deadline)?;
     stream.set_nonblocking(true)?;
     let mut qmp = QmpConnection {
         stream,
@@ -1345,6 +1338,31 @@ fn qmp_negotiate(child: &mut Child, socket: &Path) -> io::Result<()> {
     }
     qmp.execute("qmp_capabilities", 1, deadline)?;
     qmp.execute("query-status", 2, deadline)
+}
+
+fn qmp_connect(
+    child: &mut Child,
+    socket: &Path,
+    deadline: Instant,
+) -> io::Result<std::os::unix::net::UnixStream> {
+    let stream = loop {
+        match std::os::unix::net::UnixStream::connect(socket) {
+            Ok(stream) => break stream,
+            Err(error) => {
+                if child_exited(child)? {
+                    return Err(io::Error::other("QEMU exited during startup"));
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("timed out waiting for QMP socket: {error}"),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    Ok(stream)
 }
 
 struct QmpConnection {
@@ -2369,6 +2387,25 @@ time.sleep(30)
         assert!(error.to_string().contains("exited during startup"));
         assert!(child_exited(&mut child).unwrap());
         terminate(&mut child);
+    }
+
+    #[test]
+    fn missing_qmp_socket_deadline_is_a_timeout() {
+        let root = network_test_root("missing-qmp-socket");
+        fs::create_dir_all(&root).unwrap();
+        let mut command = ProcessCommand::new("sh");
+        command.args(["-c", "sleep 30"]);
+        configure_parent_death(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        let error = qmp_connect(
+            &mut child,
+            &root.join("missing.sock"),
+            Instant::now() + Duration::from_millis(25),
+        )
+        .unwrap_err();
+        terminate(&mut child);
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "linux")]

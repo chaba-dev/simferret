@@ -85,7 +85,14 @@ QEMU injects the recorded serial input from an isolated replay-log copy. The
 controller validates and compares each normalized event as it arrives, then
 requires byte-identical event and assertion artifacts and a matching semantic
 outcome digest. Divergence reports the first differing, missing, or surplus
-event.
+event. Dependency, preflight, runtime, and publication failures retain an
+atomically published diagnostic bundle under `runs/failures/`. Its
+`failure.json` records the validated local network identity when available,
+record or passive-replay backend mode, completed fault transitions, semantic
+traffic counts, and the explicit unavailability of packet counters in the
+selected QEMU backend. Error text and sanitized QEMU and guest log tails are
+each capped at 64 KiB. Report-only preflight bundles never read unvalidated run
+logs.
 
 ## Phase 4 acceptance
 
@@ -124,7 +131,7 @@ durations, identities, digests, serial output, and QEMU diagnostics under
 `.poc/qemu-network-replay-smoke/`. Set `SIMFERRET_NETWORK_REQUESTS` from 1
 through 1000 for bounded traffic-scaling experiments.
 
-## RFD 2 Phase 2 network scenario
+## RFD 2 network scenario
 
 The proof-of-concept scenario, choice-plan, and guest protocols remain at
 version 1. The seeded choice plan records
@@ -139,7 +146,10 @@ The assertion report covers a matching pre-outage response, bounded typed
 outage, confirmed restoration, and bounded matching recovery. The regular
 record command shown above now runs this network scenario; the corrupt scenario
 still publishes evidence but exits with status 1 after receiving mismatched
-fixture content across the NIC.
+fixture content across the NIC. Phase 3 validates this complete identity and
+choice plan before launch, uses an empty adapter-owned TFTP directory for
+passive replay, and verifies normalized events, assertion bytes, and the
+semantic outcome digest on every replay.
 
 ## Development
 
