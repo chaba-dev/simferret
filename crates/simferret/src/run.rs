@@ -17,7 +17,8 @@ use crate::protocol::{
 };
 use crate::scenario::{ChoicePlan, MAX_SCENARIO_SOURCE_BYTES, Scenario};
 use crate::vm::{
-    NetworkConfig, QemuAdapter, RecordConfig, RunningVm, VmAdapter, VmIdentity, sha256_file,
+    NetworkConfig, QemuAdapter, RecordConfig, RunningVm, VmAdapter, VmIdentity,
+    digest_fixture_entries, sha256_file, validate_replay_network_identity,
 };
 
 const MANIFEST_VERSION: u16 = 1;
@@ -117,18 +118,31 @@ pub fn replay(options: &ReplayOptions) -> io::Result<ReplayResult> {
 }
 
 pub fn record_with_adapter(options: &RunOptions, adapter: &dyn VmAdapter) -> io::Result<RunResult> {
+    let assets = GuestImageAssets::load()?;
+    record_with_adapter_and_assets(options, adapter, &assets)
+}
+
+fn record_with_adapter_and_assets(
+    options: &RunOptions,
+    adapter: &dyn VmAdapter,
+    assets: &GuestImageAssets,
+) -> io::Result<RunResult> {
     let (scenario, scenario_source) = Scenario::read(&options.scenario)?;
     let choices = scenario.choices(options.seed);
-    let image = build_guest_image(&options.executable, &options.runs_directory)?;
+    let image =
+        build_guest_image_with_assets(&options.executable, &options.runs_directory, assets)?;
     let run_id = new_run_id(options.seed)?;
     let mut staging = StagingDirectory::create(&options.runs_directory, &run_id)?;
     fs::create_dir(staging.path.join("logs"))?;
     fs::write(staging.path.join("scenario.toml"), scenario_source)?;
     write_json(staging.path.join("choices.json"), &choices)?;
     let fixture_directory = staging.path.join("fixture");
-    materialize_fixture(&fixture_directory, &choices, scenario.corrupt_responses)?;
-    let busybox = required_environment_path("SIMFERRET_BUSYBOX")?;
-    let network = NetworkConfig::restricted_tftp_record(fixture_directory, &busybox)?;
+    let fixture_entries = fixture_entries(&choices, scenario.corrupt_responses);
+    materialize_fixture(&fixture_directory, &fixture_entries)?;
+    let network = NetworkConfig::restricted_tftp_record_with_tool_digest(
+        fixture_directory,
+        sha256_bytes(&assets.busybox),
+    )?;
 
     let qmp = QmpDirectory::create(&run_id)?;
     let config = RecordConfig {
@@ -197,6 +211,15 @@ pub fn record_with_adapter(options: &RunOptions, adapter: &dyn VmAdapter) -> io:
 pub fn replay_with_adapter(
     options: &ReplayOptions,
     adapter: &dyn VmAdapter,
+) -> io::Result<ReplayResult> {
+    let assets = GuestImageAssets::load()?;
+    replay_with_adapter_and_assets(options, adapter, &assets)
+}
+
+fn replay_with_adapter_and_assets(
+    options: &ReplayOptions,
+    adapter: &dyn VmAdapter,
+    assets: &GuestImageAssets,
 ) -> io::Result<ReplayResult> {
     let directory = fs::canonicalize(&options.directory)?;
     let manifest: Manifest = read_json(&directory.join("manifest.json"), MAX_MANIFEST_BYTES)?;
@@ -288,7 +311,7 @@ pub fn replay_with_adapter(
     let runs_directory = directory
         .parent()
         .ok_or_else(|| invalid_data("run directory has no parent"))?;
-    let image = build_guest_image(&options.executable, runs_directory)?;
+    let image = build_guest_image_with_assets(&options.executable, runs_directory, assets)?;
     if image.executable_sha256 != manifest.simferret_sha256 {
         return Err(invalid_data(format!(
             "SimFerret executable digest differs from recording: expected {}, found {}",
@@ -316,11 +339,15 @@ pub fn replay_with_adapter(
             "replay log changed while preparing replay: expected {expected_replay_digest}, found {copied_replay_digest}"
         )));
     }
-    let recorded_network = manifest
-        .vm
-        .network
-        .as_ref()
-        .ok_or_else(|| invalid_data("recording has no network identity"))?;
+    if manifest.vm.network.is_none() {
+        return Err(invalid_data("recording has no network identity"));
+    }
+    let actual_fixture_digest =
+        digest_fixture_entries(&fixture_entries(&choices, scenario.corrupt_responses));
+    let actual_busybox_digest = sha256_bytes(&assets.busybox);
+    let network =
+        NetworkConfig::restricted_tftp_replay(actual_fixture_digest, actual_busybox_digest);
+    validate_replay_network_identity(&manifest.vm, Some(&network.identity))?;
     let config = RecordConfig {
         kernel: fs::canonicalize(&options.kernel)?,
         initramfs: image.path,
@@ -328,10 +355,7 @@ pub fn replay_with_adapter(
         qmp_socket: runtime.path.join("qmp.sock"),
         serial_log: runtime.path.join("logs/serial.log"),
         qemu_log: runtime.path.join("logs/qemu.log"),
-        network: Some(NetworkConfig::restricted_tftp_replay(
-            recorded_network.fixture.content_sha256.clone(),
-            recorded_network.fault.tool.sha256.clone(),
-        )),
+        network: Some(network),
     };
     let execution = (|| {
         let mut vm = adapter.launch_replay(&config, &manifest.vm)?;
@@ -717,7 +741,32 @@ struct GuestImage {
     executable_sha256: String,
 }
 
-fn build_guest_image(executable: &Path, runs_directory: &Path) -> io::Result<GuestImage> {
+struct GuestImageAssets {
+    busybox: Vec<u8>,
+    mii: Vec<u8>,
+    rtl8139cp: Vec<u8>,
+}
+
+impl GuestImageAssets {
+    fn load() -> io::Result<Self> {
+        let busybox = required_environment_path("SIMFERRET_BUSYBOX")?;
+        let kernel_modules = required_environment_path("SIMFERRET_KERNEL_MODULES")?;
+        Ok(Self {
+            busybox: fs::read(busybox)?,
+            mii: decompress_kernel_module(&find_kernel_module(&kernel_modules, "mii.ko.xz")?)?,
+            rtl8139cp: decompress_kernel_module(&find_kernel_module(
+                &kernel_modules,
+                "8139cp.ko.xz",
+            )?)?,
+        })
+    }
+}
+
+fn build_guest_image_with_assets(
+    executable: &Path,
+    runs_directory: &Path,
+    assets: &GuestImageAssets,
+) -> io::Result<GuestImage> {
     let executable_bytes = fs::read(executable)?;
     let executable_sha256 = sha256_bytes(&executable_bytes);
     if elf_has_interpreter(&executable_bytes)? {
@@ -726,12 +775,6 @@ fn build_guest_image(executable: &Path, runs_directory: &Path) -> io::Result<Gue
             "simferret must be a statically linked x86_64 Linux executable for record mode",
         ));
     }
-    let busybox = required_environment_path("SIMFERRET_BUSYBOX")?;
-    let kernel_modules = required_environment_path("SIMFERRET_KERNEL_MODULES")?;
-    let busybox_bytes = fs::read(busybox)?;
-    let mii = decompress_kernel_module(&find_kernel_module(&kernel_modules, "mii.ko.xz")?)?;
-    let rtl8139cp =
-        decompress_kernel_module(&find_kernel_module(&kernel_modules, "8139cp.ko.xz")?)?;
     let mut archive = Vec::new();
     append_cpio(&mut archive, ".", 0o040755, &[])?;
     append_cpio(&mut archive, "bin", 0o040755, &[])?;
@@ -740,9 +783,14 @@ fn build_guest_image(executable: &Path, runs_directory: &Path) -> io::Result<Gue
     append_cpio(&mut archive, "proc", 0o040755, &[])?;
     append_cpio(&mut archive, "sys", 0o040755, &[])?;
     append_cpio(&mut archive, "tmp", 0o040755, &[])?;
-    append_cpio(&mut archive, "bin/busybox", 0o100755, &busybox_bytes)?;
-    append_cpio(&mut archive, "modules/mii.ko", 0o100644, &mii)?;
-    append_cpio(&mut archive, "modules/8139cp.ko", 0o100644, &rtl8139cp)?;
+    append_cpio(&mut archive, "bin/busybox", 0o100755, &assets.busybox)?;
+    append_cpio(&mut archive, "modules/mii.ko", 0o100644, &assets.mii)?;
+    append_cpio(
+        &mut archive,
+        "modules/8139cp.ko",
+        0o100644,
+        &assets.rtl8139cp,
+    )?;
     append_cpio(&mut archive, "init", 0o100755, &executable_bytes)?;
     append_cpio(&mut archive, "TRAILER!!!", 0, &[])?;
 
@@ -870,22 +918,29 @@ fn decompress_kernel_module(path: &Path) -> io::Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-fn materialize_fixture(
-    directory: &Path,
-    choices: &ChoicePlan,
-    corrupt_responses: bool,
-) -> io::Result<()> {
+fn fixture_entries(choices: &ChoicePlan, corrupt_responses: bool) -> Vec<(String, Vec<u8>)> {
+    choices
+        .requests
+        .iter()
+        .enumerate()
+        .map(|(index, request)| {
+            let payload = if corrupt_responses && index == 0 {
+                format!("{}-corrupted", request.payload)
+            } else {
+                request.payload.clone()
+            };
+            (
+                request.request_id.clone(),
+                format!("request_id={}\npayload={payload}\n", request.request_id).into_bytes(),
+            )
+        })
+        .collect()
+}
+
+fn materialize_fixture(directory: &Path, entries: &[(String, Vec<u8>)]) -> io::Result<()> {
     fs::create_dir(directory)?;
-    for (index, request) in choices.requests.iter().enumerate() {
-        let payload = if corrupt_responses && index == 0 {
-            format!("{}-corrupted", request.payload)
-        } else {
-            request.payload.clone()
-        };
-        fs::write(
-            directory.join(&request.request_id),
-            format!("request_id={}\npayload={payload}\n", request.request_id),
-        )?;
+    for (name, contents) in entries {
+        fs::write(directory.join(name), contents)?;
     }
     Ok(())
 }
@@ -1327,6 +1382,29 @@ mod tests {
     }
 
     struct FailingAdapter;
+
+    fn synthetic_assets() -> GuestImageAssets {
+        GuestImageAssets {
+            busybox: b"synthetic busybox".to_vec(),
+            mii: b"synthetic mii module".to_vec(),
+            rtl8139cp: b"synthetic rtl8139cp module".to_vec(),
+        }
+    }
+
+    fn record_with_adapter(options: &RunOptions, adapter: &dyn VmAdapter) -> io::Result<RunResult> {
+        record_with_adapter_and_assets(options, adapter, &synthetic_assets())
+    }
+
+    fn replay_with_adapter(
+        options: &ReplayOptions,
+        adapter: &dyn VmAdapter,
+    ) -> io::Result<ReplayResult> {
+        replay_with_adapter_and_assets(options, adapter, &synthetic_assets())
+    }
+
+    fn build_guest_image(executable: &Path, runs_directory: &Path) -> io::Result<GuestImage> {
+        build_guest_image_with_assets(executable, runs_directory, &synthetic_assets())
+    }
 
     impl FakeAdapter {
         fn vm(&self, config: &RecordConfig, playback: bool) -> io::Result<FakeVm> {
@@ -2053,6 +2131,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("environment identity differs"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replay_rejects_manifest_only_network_digest_tampering_before_launch() {
+        let root = temporary_root("network-digest-tampering");
+        let options = test_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        let manifest_path = recorded.directory.join("manifest.json");
+        let original = fs::read(&manifest_path).unwrap();
+
+        for field in ["fixture", "tool"] {
+            let mut manifest: Manifest = serde_json::from_slice(&original).unwrap();
+            let network = manifest.vm.network.as_mut().unwrap();
+            if field == "fixture" {
+                network.fixture.content_sha256 = "a".repeat(64);
+            } else {
+                network.fault.tool.sha256 = "b".repeat(64);
+            }
+            write_json(manifest_path.clone(), &manifest).unwrap();
+            let error = replay_with_adapter(
+                &ReplayOptions {
+                    directory: recorded.directory.clone(),
+                    kernel: options.kernel.clone(),
+                    executable: options.executable.clone(),
+                },
+                &FailingAdapter,
+            )
+            .unwrap_err();
+            assert!(
+                !error.to_string().contains("replay adapter failed"),
+                "{field} digest reached VM launch: {error}"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

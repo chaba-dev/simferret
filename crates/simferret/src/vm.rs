@@ -149,8 +149,15 @@ pub struct FaultIdentity {
 
 impl NetworkConfig {
     pub fn restricted_tftp_record(fixture_directory: PathBuf, busybox: &Path) -> io::Result<Self> {
-        let fixture_content_sha256 = fixture_digest(&fixture_directory)?;
         let busybox_sha256 = sha256_file(busybox)?;
+        Self::restricted_tftp_record_with_tool_digest(fixture_directory, busybox_sha256)
+    }
+
+    pub(crate) fn restricted_tftp_record_with_tool_digest(
+        fixture_directory: PathBuf,
+        busybox_sha256: String,
+    ) -> io::Result<Self> {
+        let fixture_content_sha256 = fixture_digest(&fixture_directory)?;
         Ok(Self::restricted_tftp(
             Some(fixture_directory),
             fixture_content_sha256,
@@ -532,7 +539,9 @@ fn open_directory_without_symlinks(path: &Path) -> io::Result<File> {
     Ok(directory)
 }
 
-fn digest_fixture_entries(entries: &[(String, Vec<u8>)]) -> String {
+pub(crate) fn digest_fixture_entries(entries: &[(String, Vec<u8>)]) -> String {
+    let mut entries = entries.iter().collect::<Vec<_>>();
+    entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
     let mut digest = Sha256::new();
     digest.update(b"simferret-tftp-fixture-v1\0");
     digest.update((entries.len() as u64).to_le_bytes());
@@ -643,7 +652,7 @@ fn validate_identity_compatibility(expected: &VmIdentity, actual: &VmIdentity) -
     ))
 }
 
-fn validate_replay_network_identity(
+pub(crate) fn validate_replay_network_identity(
     expected: &VmIdentity,
     actual: Option<&NetworkIdentity>,
 ) -> io::Result<()> {
