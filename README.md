@@ -44,19 +44,10 @@ without deleting earlier evidence. This spike validates the execution-engine
 boundary only; it does not yet implement the Rust controller, guest agent,
 process restart, or scenario assertions.
 
-## Phase 1 fixtures
-
-The Rust crate now contains the version-1 framed guest-agent protocol, TCP echo
-server and workload client, event normalization, and the safety, outage, and
-liveness checker. Process-level tests exercise server termination and restart
-outside QEMU, including an intentional response-corruption mode. The
-`guest-agent` and `fixture-server` commands are internal boundaries for the
-phase-2 controller rather than the final user-facing CLI.
-
-## Phase 2 record path
+## Record path
 
 On x86-64 Linux, build the static guest/controller executable and record the
-bounded restart scenario with:
+bounded network-outage scenario with:
 
 ```shell
 .agents/dev cargo build --release --target x86_64-unknown-linux-musl
@@ -65,15 +56,16 @@ bounded restart scenario with:
 ```
 
 The command boots the executable as PID 1 in a fixed one-vCPU QEMU TCG guest,
-drives requests over a recorded serial boundary, stops and restarts the real
-echo-server process at the seed-derived choice point, and evaluates structured
-assertions. A successful run prints its identifier, assertion result, artifact
-directory, and the Phase 3 replay command. Complete runs are atomically
-published under `runs/`; incomplete staging directories are removed when the
-controller unwinds normally. Abrupt termination can leave hidden temporary
-directories that require manual removal. The replay identity guarantee assumes
-the documented pinned, immutable Nix QEMU, kernel, and firmware inputs; mutable
-environment overrides are outside the Phase 2 contract.
+configures its RTL8139 NIC, fetches materialized TFTP fixtures through QEMU's
+restricted replay-filtered backend, activates and restores the seed-planned
+peer-specific outage, and evaluates structured assertions. A successful run
+prints its identifier, assertion result, artifact directory, and replay command.
+Complete runs are atomically published under `runs/`; incomplete staging
+directories are removed when the controller unwinds normally. Abrupt
+termination can leave hidden temporary directories that require manual removal.
+The replay identity guarantee assumes the documented pinned, immutable Nix
+QEMU, kernel, modules, BusyBox, and firmware inputs; mutable environment
+overrides are outside the contract.
 
 ## Phase 3 replay path
 
@@ -131,6 +123,22 @@ BusyBox and matching guest-kernel `mii` and `8139cp` modules. It preserves
 durations, identities, digests, serial output, and QEMU diagnostics under
 `.poc/qemu-network-replay-smoke/`. Set `SIMFERRET_NETWORK_REQUESTS` from 1
 through 1000 for bounded traffic-scaling experiments.
+
+## RFD 2 Phase 2 network scenario
+
+The production scenario protocol is version 2. Its seeded choice plan records
+separate request indexes for outage activation and restoration. The controller
+materializes one canonical TFTP file per request, and the guest fetches those
+bytes through the RTL8139 NIC from the restricted QEMU backend. Guest commands
+configure the fixed address, install and confirm `prohibit 10.0.2.2/32`, then
+remove and confirm that route. Structured events distinguish an administrative
+`EACCES` from transport and response-format failures.
+
+The assertion report covers a matching pre-outage response, bounded typed
+outage, confirmed restoration, and bounded matching recovery. The regular
+record command shown above now runs this network scenario; the corrupt scenario
+still publishes evidence but exits with status 1 after receiving mismatched
+fixture content across the NIC.
 
 ## Development
 
