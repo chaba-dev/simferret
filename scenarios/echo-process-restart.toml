@@ -1,8 +1,8 @@
 version = 1
-name = "echo-process-restart"
+name = "network-outage"
 request_count = 6
 payload_bytes = 16
-server_address = "127.0.0.1:4000"
+fixture_peer = "10.0.2.2"
 outage_event_bound = 1
 liveness_event_bound = 2
 corrupt_responses = false

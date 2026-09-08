@@ -1,84 +1,111 @@
 use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-
-use crate::protocol::{read_frame, write_frame};
-
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
-pub const SERVER_READY: &[u8] = b"SIMFERRET_SERVER_READY_V1\n";
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct EchoMessage {
-    request_id: String,
-    payload: String,
-}
-
-pub fn serve(address: &str, corrupt_responses: bool) -> io::Result<()> {
-    let listener = bind(address)?;
-    serve_listener(listener, corrupt_responses)
-}
-
-pub fn bind(address: &str) -> io::Result<TcpListener> {
-    TcpListener::bind(address)
-}
-
-pub fn serve_listener(listener: TcpListener, corrupt_responses: bool) -> io::Result<()> {
-    for connection in listener.incoming() {
-        let mut stream = connection?;
-        stream.set_read_timeout(Some(IO_TIMEOUT))?;
-        stream.set_write_timeout(Some(IO_TIMEOUT))?;
-        let Some(mut message) = read_frame::<EchoMessage>(&mut stream)? else {
-            continue;
-        };
-        if corrupt_responses {
-            message.payload.push_str("-corrupted");
-        }
-        write_frame(&mut stream, &message)?;
-    }
-    Ok(())
-}
-
-pub fn request(address: &str, request_id: &str, payload: &str) -> io::Result<(String, String)> {
-    let address: SocketAddr = address
+pub fn tftp_request(peer: &str, filename: &str) -> io::Result<(String, String)> {
+    let peer: std::net::IpAddr = peer
         .parse()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let mut stream = TcpStream::connect_timeout(&address, IO_TIMEOUT)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    write_frame(
-        &mut stream,
-        &EchoMessage {
-            request_id: request_id.into(),
-            payload: payload.into(),
-        },
-    )?;
-    let response: EchoMessage = read_frame(&mut stream)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "server closed connection"))?;
-    Ok((response.request_id, response.payload))
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(IO_TIMEOUT))?;
+    socket.set_write_timeout(Some(IO_TIMEOUT))?;
+    let mut request = vec![0, 1];
+    request.extend_from_slice(filename.as_bytes());
+    request.extend_from_slice(b"\0octet\0");
+    socket.send_to(&request, SocketAddr::new(peer, 69))?;
+
+    let mut contents = Vec::new();
+    let mut expected_block = 1_u16;
+    let mut server = None;
+    loop {
+        let mut packet = [0_u8; 516];
+        let (length, source) = socket.recv_from(&mut packet)?;
+        if let Some(server) = server {
+            if source != server {
+                continue;
+            }
+        } else {
+            server = Some(source);
+        }
+        if length < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated TFTP packet",
+            ));
+        }
+        let opcode = u16::from_be_bytes([packet[0], packet[1]]);
+        if opcode == 5 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "TFTP server returned an error",
+            ));
+        }
+        let block = u16::from_be_bytes([packet[2], packet[3]]);
+        if opcode != 3 || block != expected_block {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected TFTP packet",
+            ));
+        }
+        contents.extend_from_slice(&packet[4..length]);
+        if contents.len() > crate::protocol::MAX_REQUEST_DATA_LENGTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TFTP response exceeds protocol limit",
+            ));
+        }
+        socket.send_to(&[0, 4, packet[2], packet[3]], source)?;
+        if length < packet.len() {
+            break;
+        }
+        expected_block = expected_block
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "TFTP block overflow"))?;
+    }
+    parse_fixture_response(&contents)
+}
+
+fn parse_fixture_response(contents: &[u8]) -> io::Result<(String, String)> {
+    let text = std::str::from_utf8(contents)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut lines = text.lines();
+    let request_id = lines
+        .next()
+        .and_then(|line| line.strip_prefix("request_id="))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing fixture request_id"))?;
+    let payload = lines
+        .next()
+        .and_then(|line| line.strip_prefix("payload="))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing fixture payload"))?;
+    if lines.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "extra fixture response fields",
+        ));
+    }
+    if format!("request_id={request_id}\npayload={payload}\n").as_bytes() != contents {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixture response is not canonically encoded",
+        ));
+    }
+    Ok((request_id.into(), payload.into()))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::thread;
-
     use super::*;
 
     #[test]
-    fn echo_server_returns_input_and_can_intentionally_corrupt_payload() {
-        for corrupt in [false, true] {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap().to_string();
-            thread::spawn(move || serve_listener(listener, corrupt).unwrap());
-            let response = request(&address, "request-1", "opaque").unwrap();
-            assert_eq!(response.0, "request-1");
-            if corrupt {
-                assert_ne!(response.1, "opaque");
-            } else {
-                assert_eq!(response.1, "opaque");
-            }
-        }
+    fn canonical_fixture_response_is_strictly_parsed() {
+        assert_eq!(
+            parse_fixture_response(b"request_id=request-1\npayload=opaque\n").unwrap(),
+            ("request-1".into(), "opaque".into())
+        );
+        assert!(parse_fixture_response(b"request_id=request-1\nwrong=opaque\n").is_err());
+        assert!(parse_fixture_response(b"request_id=request-1\r\npayload=opaque\r\n").is_err());
+        assert!(parse_fixture_response(b"request_id=request-1\npayload=opaque").is_err());
     }
 }

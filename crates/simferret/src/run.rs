@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,7 +16,10 @@ use crate::protocol::{
     Command, CommandFrame, Event, EventFrame, NormalizedEvent, PROTOCOL_VERSION, RequestPhase,
 };
 use crate::scenario::{ChoicePlan, MAX_SCENARIO_SOURCE_BYTES, Scenario};
-use crate::vm::{QemuAdapter, RecordConfig, RunningVm, VmAdapter, VmIdentity, sha256_file};
+use crate::vm::{
+    NetworkConfig, QemuAdapter, RecordConfig, RunningVm, VmAdapter, VmIdentity,
+    digest_fixture_entries, sha256_file, validate_replay_network_identity,
+};
 
 const MANIFEST_VERSION: u16 = 1;
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
@@ -114,14 +118,31 @@ pub fn replay(options: &ReplayOptions) -> io::Result<ReplayResult> {
 }
 
 pub fn record_with_adapter(options: &RunOptions, adapter: &dyn VmAdapter) -> io::Result<RunResult> {
+    let assets = GuestImageAssets::load()?;
+    record_with_adapter_and_assets(options, adapter, &assets)
+}
+
+fn record_with_adapter_and_assets(
+    options: &RunOptions,
+    adapter: &dyn VmAdapter,
+    assets: &GuestImageAssets,
+) -> io::Result<RunResult> {
     let (scenario, scenario_source) = Scenario::read(&options.scenario)?;
     let choices = scenario.choices(options.seed);
-    let image = build_guest_image(&options.executable, &options.runs_directory)?;
+    let image =
+        build_guest_image_with_assets(&options.executable, &options.runs_directory, assets)?;
     let run_id = new_run_id(options.seed)?;
     let mut staging = StagingDirectory::create(&options.runs_directory, &run_id)?;
     fs::create_dir(staging.path.join("logs"))?;
     fs::write(staging.path.join("scenario.toml"), scenario_source)?;
     write_json(staging.path.join("choices.json"), &choices)?;
+    let fixture_directory = staging.path.join("fixture");
+    let fixture_entries = fixture_entries(&choices, scenario.corrupt_responses);
+    materialize_fixture(&fixture_directory, &fixture_entries)?;
+    let network = NetworkConfig::restricted_tftp_record_with_tool_digest(
+        fixture_directory,
+        sha256_bytes(&assets.busybox),
+    )?;
 
     let qmp = QmpDirectory::create(&run_id)?;
     let config = RecordConfig {
@@ -131,7 +152,7 @@ pub fn record_with_adapter(options: &RunOptions, adapter: &dyn VmAdapter) -> io:
         qmp_socket: qmp.path.join("qmp.sock"),
         serial_log: staging.path.join("logs/serial.log"),
         qemu_log: staging.path.join("logs/qemu.log"),
-        network: None,
+        network: Some(network),
     };
     let execution = (|| {
         let mut vm = adapter.launch_record(&config)?;
@@ -190,6 +211,15 @@ pub fn record_with_adapter(options: &RunOptions, adapter: &dyn VmAdapter) -> io:
 pub fn replay_with_adapter(
     options: &ReplayOptions,
     adapter: &dyn VmAdapter,
+) -> io::Result<ReplayResult> {
+    let assets = GuestImageAssets::load()?;
+    replay_with_adapter_and_assets(options, adapter, &assets)
+}
+
+fn replay_with_adapter_and_assets(
+    options: &ReplayOptions,
+    adapter: &dyn VmAdapter,
+    assets: &GuestImageAssets,
 ) -> io::Result<ReplayResult> {
     let directory = fs::canonicalize(&options.directory)?;
     let manifest: Manifest = read_json(&directory.join("manifest.json"), MAX_MANIFEST_BYTES)?;
@@ -281,7 +311,7 @@ pub fn replay_with_adapter(
     let runs_directory = directory
         .parent()
         .ok_or_else(|| invalid_data("run directory has no parent"))?;
-    let image = build_guest_image(&options.executable, runs_directory)?;
+    let image = build_guest_image_with_assets(&options.executable, runs_directory, assets)?;
     if image.executable_sha256 != manifest.simferret_sha256 {
         return Err(invalid_data(format!(
             "SimFerret executable digest differs from recording: expected {}, found {}",
@@ -309,6 +339,15 @@ pub fn replay_with_adapter(
             "replay log changed while preparing replay: expected {expected_replay_digest}, found {copied_replay_digest}"
         )));
     }
+    if manifest.vm.network.is_none() {
+        return Err(invalid_data("recording has no network identity"));
+    }
+    let actual_fixture_digest =
+        digest_fixture_entries(&fixture_entries(&choices, scenario.corrupt_responses));
+    let actual_busybox_digest = sha256_bytes(&assets.busybox);
+    let network =
+        NetworkConfig::restricted_tftp_replay(actual_fixture_digest, actual_busybox_digest);
+    validate_replay_network_identity(&manifest.vm, Some(&network.identity))?;
     let config = RecordConfig {
         kernel: fs::canonicalize(&options.kernel)?,
         initramfs: image.path,
@@ -316,7 +355,7 @@ pub fn replay_with_adapter(
         qmp_socket: runtime.path.join("qmp.sock"),
         serial_log: runtime.path.join("logs/serial.log"),
         qemu_log: runtime.path.join("logs/qemu.log"),
-        network: None,
+        network: Some(network),
     };
     let execution = (|| {
         let mut vm = adapter.launch_replay(&config, &manifest.vm)?;
@@ -393,34 +432,34 @@ fn drive_scenario_inner(
     expected_events: Option<&[NormalizedEvent]>,
 ) -> io::Result<(Vec<NormalizedEvent>, AssertionReport)> {
     let mut controller = Controller::new(vm, send_commands, expected_events);
-    controller.issue(Command::StartServer {
-        address: scenario.server_address.clone(),
-        corrupt_responses: scenario.corrupt_responses,
+    controller.issue(Command::ConfigureNetwork {
+        interface: "eth0".into(),
+        guest_cidr: "10.0.2.15/24".into(),
+        gateway: scenario.fixture_peer.clone(),
     })?;
     for (index, request) in choices.requests.iter().enumerate() {
-        if index == choices.fault_request_index {
-            controller.issue(Command::StopServer {})?;
-            controller.issue(Command::Request {
-                request_id: request.request_id.clone(),
-                payload: request.payload.clone(),
-                phase: RequestPhase::Stopped,
-            })?;
-            controller.issue(Command::StartServer {
-                address: scenario.server_address.clone(),
-                corrupt_responses: false,
-            })?;
-        } else {
-            let phase = if index < choices.fault_request_index {
-                RequestPhase::Running
-            } else {
-                RequestPhase::Restarted
-            };
-            controller.issue(Command::Request {
-                request_id: request.request_id.clone(),
-                payload: request.payload.clone(),
-                phase,
+        if index == choices.outage_activation_request_index {
+            controller.issue(Command::ActivateOutage {
+                peer_cidr: format!("{}/32", scenario.fixture_peer),
             })?;
         }
+        if index == choices.restoration_request_index {
+            controller.issue(Command::RestoreNetwork {
+                peer_cidr: format!("{}/32", scenario.fixture_peer),
+            })?;
+        }
+        let phase = if index < choices.outage_activation_request_index {
+            RequestPhase::PreOutage
+        } else if index < choices.restoration_request_index {
+            RequestPhase::Outage
+        } else {
+            RequestPhase::Recovery
+        };
+        controller.issue(Command::Request {
+            request_id: request.request_id.clone(),
+            payload: request.payload.clone(),
+            phase,
+        })?;
     }
     let host_assertions = evaluate(
         &controller.raw_events,
@@ -556,17 +595,26 @@ impl<'a> Controller<'a> {
 fn validate_response(command: &Command, event_index: usize, frame: &EventFrame) -> io::Result<()> {
     let valid = match (command, event_index) {
         (
-            Command::StartServer {
-                address,
-                corrupt_responses,
+            Command::ConfigureNetwork {
+                interface,
+                guest_cidr,
+                gateway,
             },
             0,
         ) => matches!(
             &frame.event,
-            Event::ServerStarted { address: actual_address, corrupt_responses: actual_corruption }
-                if socket_addresses_equal(actual_address, address) && actual_corruption == corrupt_responses
+            Event::NetworkConfigured { interface: actual_interface, guest_cidr: actual_cidr, gateway: actual_gateway }
+                if actual_interface == interface && actual_cidr == guest_cidr && actual_gateway == gateway
         ),
-        (Command::StopServer {}, 0) => matches!(frame.event, Event::ServerStopped {}),
+        (Command::ActivateOutage { peer_cidr }, 0) => matches!(
+            &frame.event,
+            Event::OutageActivated { peer_cidr: actual, rule }
+                if actual == peer_cidr && rule == &format!("prohibit {peer_cidr}")
+        ),
+        (Command::RestoreNetwork { peer_cidr }, 0) => matches!(
+            &frame.event,
+            Event::NetworkRestored { peer_cidr: actual } if actual == peer_cidr
+        ),
         (
             Command::Request {
                 request_id,
@@ -589,7 +637,7 @@ fn validate_response(command: &Command, event_index: usize, frame: &EventFrame) 
             Event::RequestSucceeded { request_id: actual_id, request_payload, phase: actual_phase, .. }
                 if actual_id == request_id && request_payload == payload && actual_phase == phase)
                 || matches!(&frame.event,
-            Event::RequestUnavailable { request_id: actual_id, phase: actual_phase }
+            Event::RequestUnavailable { request_id: actual_id, phase: actual_phase, .. }
                 if actual_id == request_id && actual_phase == phase)
         }
         (Command::Check { .. }, 0) => {
@@ -611,25 +659,16 @@ fn validate_response(command: &Command, event_index: usize, frame: &EventFrame) 
     }
 }
 
-fn socket_addresses_equal(left: &str, right: &str) -> bool {
-    match (
-        left.parse::<std::net::SocketAddr>(),
-        right.parse::<std::net::SocketAddr>(),
-    ) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
-    }
-}
-
 fn valid_report(report: &AssertionReport) -> bool {
     use crate::assertions::AssertionName;
 
-    let mut seen = [false; 3];
+    let mut seen = [false; 4];
     for assertion in &report.assertions {
         let index = match assertion.name {
             AssertionName::Safety => 0,
             AssertionName::ControlledOutage => 1,
-            AssertionName::BoundedLiveness => 2,
+            AssertionName::Restoration => 2,
+            AssertionName::BoundedRecovery => 3,
         };
         if seen[index] {
             return false;
@@ -702,7 +741,32 @@ struct GuestImage {
     executable_sha256: String,
 }
 
-fn build_guest_image(executable: &Path, runs_directory: &Path) -> io::Result<GuestImage> {
+struct GuestImageAssets {
+    busybox: Vec<u8>,
+    mii: Vec<u8>,
+    rtl8139cp: Vec<u8>,
+}
+
+impl GuestImageAssets {
+    fn load() -> io::Result<Self> {
+        let busybox = required_environment_path("SIMFERRET_BUSYBOX")?;
+        let kernel_modules = required_environment_path("SIMFERRET_KERNEL_MODULES")?;
+        Ok(Self {
+            busybox: fs::read(busybox)?,
+            mii: decompress_kernel_module(&find_kernel_module(&kernel_modules, "mii.ko.xz")?)?,
+            rtl8139cp: decompress_kernel_module(&find_kernel_module(
+                &kernel_modules,
+                "8139cp.ko.xz",
+            )?)?,
+        })
+    }
+}
+
+fn build_guest_image_with_assets(
+    executable: &Path,
+    runs_directory: &Path,
+    assets: &GuestImageAssets,
+) -> io::Result<GuestImage> {
     let executable_bytes = fs::read(executable)?;
     let executable_sha256 = sha256_bytes(&executable_bytes);
     if elf_has_interpreter(&executable_bytes)? {
@@ -713,9 +777,20 @@ fn build_guest_image(executable: &Path, runs_directory: &Path) -> io::Result<Gue
     }
     let mut archive = Vec::new();
     append_cpio(&mut archive, ".", 0o040755, &[])?;
+    append_cpio(&mut archive, "bin", 0o040755, &[])?;
     append_cpio(&mut archive, "dev", 0o040755, &[])?;
+    append_cpio(&mut archive, "modules", 0o040755, &[])?;
     append_cpio(&mut archive, "proc", 0o040755, &[])?;
     append_cpio(&mut archive, "sys", 0o040755, &[])?;
+    append_cpio(&mut archive, "tmp", 0o040755, &[])?;
+    append_cpio(&mut archive, "bin/busybox", 0o100755, &assets.busybox)?;
+    append_cpio(&mut archive, "modules/mii.ko", 0o100644, &assets.mii)?;
+    append_cpio(
+        &mut archive,
+        "modules/8139cp.ko",
+        0o100644,
+        &assets.rtl8139cp,
+    )?;
     append_cpio(&mut archive, "init", 0o100755, &executable_bytes)?;
     append_cpio(&mut archive, "TRAILER!!!", 0, &[])?;
 
@@ -783,6 +858,91 @@ fn build_guest_image(executable: &Path, runs_directory: &Path) -> io::Result<Gue
         path: fs::canonicalize(image)?,
         executable_sha256,
     })
+}
+
+fn required_environment_path(name: &str) -> io::Result<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{name} is not set")))
+}
+
+fn find_kernel_module(root: &Path, filename: &str) -> io::Result<PathBuf> {
+    fn visit(directory: &Path, filename: &str, matches: &mut Vec<PathBuf>) -> io::Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                visit(&entry.path(), filename, matches)?;
+            } else if file_type.is_file() && entry.file_name() == filename {
+                matches.push(entry.path());
+            }
+        }
+        Ok(())
+    }
+    let modules = root.join("lib/modules");
+    let mut matches = Vec::new();
+    visit(&modules, filename, &mut matches)?;
+    if matches.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "expected exactly one {filename} under {}",
+                modules.display()
+            ),
+        ));
+    }
+    Ok(matches.pop().unwrap())
+}
+
+fn decompress_kernel_module(path: &Path) -> io::Result<Vec<u8>> {
+    let output = ProcessCommand::new("xz")
+        .args(["--decompress", "--stdout"])
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "could not decompress kernel module {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    if output.stdout.is_empty() || output.stdout.len() > 16 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "decompressed kernel module has an invalid size: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn fixture_entries(choices: &ChoicePlan, corrupt_responses: bool) -> Vec<(String, Vec<u8>)> {
+    choices
+        .requests
+        .iter()
+        .enumerate()
+        .map(|(index, request)| {
+            let payload = if corrupt_responses && index == 0 {
+                format!("{}-corrupted", request.payload)
+            } else {
+                request.payload.clone()
+            };
+            (
+                request.request_id.clone(),
+                format!("request_id={}\npayload={payload}\n", request.request_id).into_bytes(),
+            )
+        })
+        .collect()
+}
+
+fn materialize_fixture(directory: &Path, entries: &[(String, Vec<u8>)]) -> io::Result<()> {
+    fs::create_dir(directory)?;
+    for (name, contents) in entries {
+        fs::write(directory.join(name), contents)?;
+    }
+    Ok(())
 }
 
 fn elf_has_interpreter(bytes: &[u8]) -> io::Result<bool> {
@@ -1217,10 +1377,34 @@ mod tests {
         forged_assertions: bool,
         extra_after_shutdown: bool,
         malformed_after_shutdown: bool,
+        corrupt: bool,
         recorded_events: Arc<Mutex<Vec<EventFrame>>>,
     }
 
     struct FailingAdapter;
+
+    fn synthetic_assets() -> GuestImageAssets {
+        GuestImageAssets {
+            busybox: b"synthetic busybox".to_vec(),
+            mii: b"synthetic mii module".to_vec(),
+            rtl8139cp: b"synthetic rtl8139cp module".to_vec(),
+        }
+    }
+
+    fn record_with_adapter(options: &RunOptions, adapter: &dyn VmAdapter) -> io::Result<RunResult> {
+        record_with_adapter_and_assets(options, adapter, &synthetic_assets())
+    }
+
+    fn replay_with_adapter(
+        options: &ReplayOptions,
+        adapter: &dyn VmAdapter,
+    ) -> io::Result<ReplayResult> {
+        replay_with_adapter_and_assets(options, adapter, &synthetic_assets())
+    }
+
+    fn build_guest_image(executable: &Path, runs_directory: &Path) -> io::Result<GuestImage> {
+        build_guest_image_with_assets(executable, runs_directory, &synthetic_assets())
+    }
 
     impl FakeAdapter {
         fn vm(&self, config: &RecordConfig, playback: bool) -> io::Result<FakeVm> {
@@ -1229,12 +1413,16 @@ mod tests {
             let mut identity = self.identity.lock().unwrap().clone();
             identity.initramfs_sha256 = sha256_file(&config.initramfs)?;
             identity.kernel.sha256 = sha256_file(&config.kernel)?;
+            identity.network = config
+                .network
+                .as_ref()
+                .map(|network| network.identity.clone());
             Ok(FakeVm {
                 identity,
                 queued: VecDeque::new(),
                 history: Vec::new(),
                 next_event_id: 1,
-                corrupt: false,
+                corrupt: self.corrupt,
                 running: false,
                 mismatch_request: self.mismatch_request,
                 force_unavailable: self.force_unavailable,
@@ -1291,7 +1479,12 @@ mod tests {
                     } => (request_id.clone(), *phase),
                     event => panic!("unexpected fake event for divergence: {event:?}"),
                 };
-                events[2].event = Event::RequestUnavailable { request_id, phase };
+                events[2].event = Event::RequestUnavailable {
+                    request_id,
+                    phase,
+                    error: crate::protocol::RequestError::Transport,
+                    errno: None,
+                };
                 let report = evaluate(&events, 1, 2);
                 let assertion = events
                     .iter_mut()
@@ -1337,23 +1530,39 @@ mod tests {
                 return Err(io::Error::other("replay wrote a live command"));
             }
             match &frame.command {
-                Command::StartServer {
-                    address,
-                    corrupt_responses,
+                Command::ConfigureNetwork {
+                    interface,
+                    guest_cidr,
+                    gateway,
                 } => {
                     self.running = true;
-                    self.corrupt = *corrupt_responses;
                     self.event(
                         frame.command_id,
-                        Event::ServerStarted {
-                            address: address.clone(),
-                            corrupt_responses: *corrupt_responses,
+                        Event::NetworkConfigured {
+                            interface: interface.clone(),
+                            guest_cidr: guest_cidr.clone(),
+                            gateway: gateway.clone(),
                         },
                     );
                 }
-                Command::StopServer {} => {
+                Command::ActivateOutage { peer_cidr } => {
                     self.running = false;
-                    self.event(frame.command_id, Event::ServerStopped {});
+                    self.event(
+                        frame.command_id,
+                        Event::OutageActivated {
+                            peer_cidr: peer_cidr.clone(),
+                            rule: format!("prohibit {peer_cidr}"),
+                        },
+                    );
+                }
+                Command::RestoreNetwork { peer_cidr } => {
+                    self.running = true;
+                    self.event(
+                        frame.command_id,
+                        Event::NetworkRestored {
+                            peer_cidr: peer_cidr.clone(),
+                        },
+                    );
                 }
                 Command::Request {
                     request_id,
@@ -1388,6 +1597,8 @@ mod tests {
                         Event::RequestUnavailable {
                             request_id: request_id.clone(),
                             phase: *phase,
+                            error: crate::protocol::RequestError::AdministrativeProhibited,
+                            errno: Some(libc::EACCES),
                         }
                     };
                     self.event(frame.command_id, result);
@@ -1447,13 +1658,21 @@ mod tests {
     }
 
     #[test]
+    fn poc_formats_remain_version_one() {
+        assert_eq!(MANIFEST_VERSION, 1);
+        assert_eq!(crate::protocol::PROTOCOL_VERSION, 1);
+        assert_eq!(crate::scenario::SCENARIO_VERSION, 1);
+        assert_eq!(crate::scenario::CHOICE_PLAN_VERSION, 1);
+    }
+
+    #[test]
     fn controller_stops_at_materialized_choice_and_checks_results() {
         let scenario = Scenario {
-            version: 1,
+            version: crate::scenario::SCENARIO_VERSION,
             name: "test".into(),
             request_count: 4,
             payload_bytes: 2,
-            server_address: "127.0.0.1:4000".into(),
+            fixture_peer: "10.0.2.2".into(),
             outage_event_bound: 1,
             liveness_event_bound: 2,
             corrupt_responses: false,
@@ -1479,7 +1698,7 @@ mod tests {
         assert!(events.iter().any(|frame| matches!(
             frame.event,
             Event::RequestUnavailable {
-                phase: RequestPhase::Stopped,
+                phase: RequestPhase::Outage,
                 ..
             }
         )));
@@ -1499,7 +1718,7 @@ mod tests {
         let scenario_path = root.join("scenario.toml");
         fs::write(
             &scenario_path,
-            "version = 1\nname = \"test\"\nrequest_count = 4\npayload_bytes = 2\nserver_address = \"127.0.0.1:4000\"\noutage_event_bound = 1\nliveness_event_bound = 2\ncorrupt_responses = false\n",
+            "version = 1\nname = \"test\"\nrequest_count = 4\npayload_bytes = 2\nfixture_peer = \"10.0.2.2\"\noutage_event_bound = 1\nliveness_event_bound = 2\ncorrupt_responses = false\n",
         )
         .unwrap();
         let kernel = root.join("kernel");
@@ -1520,6 +1739,7 @@ mod tests {
             forged_assertions: false,
             extra_after_shutdown: false,
             malformed_after_shutdown: false,
+            corrupt: false,
             recorded_events: Arc::new(Mutex::new(Vec::new())),
         };
         let result = record_with_adapter(
@@ -1720,7 +1940,7 @@ mod tests {
         let command = Command::Request {
             request_id: "request".into(),
             payload: "actual".into(),
-            phase: RequestPhase::Running,
+            phase: RequestPhase::PreOutage,
         };
         let actual = EventFrame {
             protocol_version: PROTOCOL_VERSION,
@@ -1729,7 +1949,7 @@ mod tests {
             event: Event::RequestAttempted {
                 request_id: "request".into(),
                 payload: "actual".into(),
-                phase: RequestPhase::Running,
+                phase: RequestPhase::PreOutage,
             },
             diagnostics: DiagnosticFields::default(),
         };
@@ -1923,6 +2143,41 @@ mod tests {
     }
 
     #[test]
+    fn replay_rejects_manifest_only_network_digest_tampering_before_launch() {
+        let root = temporary_root("network-digest-tampering");
+        let options = test_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        let manifest_path = recorded.directory.join("manifest.json");
+        let original = fs::read(&manifest_path).unwrap();
+
+        for field in ["fixture", "tool"] {
+            let mut manifest: Manifest = serde_json::from_slice(&original).unwrap();
+            let network = manifest.vm.network.as_mut().unwrap();
+            if field == "fixture" {
+                network.fixture.content_sha256 = "a".repeat(64);
+            } else {
+                network.fault.tool.sha256 = "b".repeat(64);
+            }
+            write_json(manifest_path.clone(), &manifest).unwrap();
+            let error = replay_with_adapter(
+                &ReplayOptions {
+                    directory: recorded.directory.clone(),
+                    kernel: options.kernel.clone(),
+                    executable: options.executable.clone(),
+                },
+                &FailingAdapter,
+            )
+            .unwrap_err();
+            assert!(
+                !error.to_string().contains("replay adapter failed"),
+                "{field} digest reached VM launch: {error}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn record_rejects_mismatched_and_trailing_protocol_events() {
         let scenario = test_scenario(false);
         let choices = scenario.choices(42);
@@ -1945,7 +2200,9 @@ mod tests {
     fn assertion_failure_is_published_and_produces_nonzero_status() {
         let root = temporary_root("assertion-failure");
         let options = test_options(&root, true);
-        let result = record_with_adapter(&options, &fake_adapter(None)).unwrap();
+        let mut adapter = fake_adapter(None);
+        adapter.corrupt = true;
+        let result = record_with_adapter(&options, &adapter).unwrap();
         assert!(!result.assertions.passed);
         assert_eq!(result.exit_code(), 1);
         assert!(result.directory.join("manifest.json").is_file());
@@ -1958,6 +2215,7 @@ mod tests {
         let root = temporary_root("forged-assertions");
         let options = test_options(&root, true);
         let mut adapter = fake_adapter(None);
+        adapter.corrupt = true;
         adapter.forged_assertions = true;
         let error = record_with_adapter(&options, &adapter).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -2021,16 +2279,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_addresses_match_but_different_endpoints_do_not() {
-        assert!(socket_addresses_equal(
-            "[0:0:0:0:0:0:0:1]:4000",
-            "[::1]:4000"
-        ));
-        assert!(!socket_addresses_equal("[::1]:4000", "[::1]:4001"));
-        assert!(!socket_addresses_equal("invalid", "invalid"));
-    }
-
-    #[test]
     fn invalid_assertion_report_shapes_are_rejected() {
         use crate::assertions::{AssertionName, AssertionResult};
 
@@ -2044,7 +2292,8 @@ mod tests {
             assertions: vec![
                 assertion(AssertionName::Safety, true),
                 assertion(AssertionName::Safety, true),
-                assertion(AssertionName::BoundedLiveness, true),
+                assertion(AssertionName::Restoration, true),
+                assertion(AssertionName::BoundedRecovery, true),
             ],
         };
         assert!(!valid_report(&duplicate));
@@ -2053,7 +2302,8 @@ mod tests {
             assertions: vec![
                 assertion(AssertionName::Safety, false),
                 assertion(AssertionName::ControlledOutage, true),
-                assertion(AssertionName::BoundedLiveness, true),
+                assertion(AssertionName::Restoration, true),
+                assertion(AssertionName::BoundedRecovery, true),
             ],
         };
         assert!(!valid_report(&inconsistent));
@@ -2117,7 +2367,7 @@ mod tests {
         fs::write(
             &scenario,
             format!(
-                "version = 1\nname = \"test\"\nrequest_count = 4\npayload_bytes = 2\nserver_address = \"127.0.0.1:4000\"\noutage_event_bound = 1\nliveness_event_bound = 2\ncorrupt_responses = {corrupt}\n"
+                "version = 1\nname = \"test\"\nrequest_count = 4\npayload_bytes = 2\nfixture_peer = \"10.0.2.2\"\noutage_event_bound = 1\nliveness_event_bound = 2\ncorrupt_responses = {corrupt}\n"
             ),
         )
         .unwrap();
@@ -2147,17 +2397,18 @@ mod tests {
             forged_assertions: false,
             extra_after_shutdown: false,
             malformed_after_shutdown: false,
+            corrupt: false,
             recorded_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn test_scenario(corrupt: bool) -> Scenario {
         Scenario {
-            version: 1,
+            version: crate::scenario::SCENARIO_VERSION,
             name: "test".into(),
             request_count: 4,
             payload_bytes: 2,
-            server_address: "127.0.0.1:4000".into(),
+            fixture_peer: "10.0.2.2".into(),
             outage_event_bound: 1,
             liveness_event_bound: 2,
             corrupt_responses: corrupt,

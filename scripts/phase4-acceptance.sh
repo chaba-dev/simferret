@@ -76,11 +76,13 @@ recorded_run="$(artifact_directory "$output_dir/record-seed-42.stdout")"
 test -d "$recorded_run"
 
 jq -s -e '
-  ([.[] | select(.event.type == "request_attempted" and .event.phase == "stopped")][0]) as $attempt |
+  ([.[] | select(.event.type == "request_attempted" and .event.phase == "outage")][0]) as $attempt |
   $attempt != null and
   any(.[];
     .event.type == "request_unavailable" and
-    .event.phase == "stopped" and
+    .event.phase == "outage" and
+    .event.error == "administrative_prohibited" and
+    .event.errno == 13 and
     .event.request_id == $attempt.event.request_id and
     .event_id > $attempt.event_id and
     .event_id - $attempt.event_id <= 1)
@@ -144,7 +146,8 @@ corrupt_duration="$RUN_DURATION_NS"
 corrupt_run="$(artifact_directory "$output_dir/record-corrupt-seed-43.stdout")"
 test -d "$corrupt_run"
 if ! jq -s -e '
-  .[0].fault_request_index != .[1].fault_request_index or
+  .[0].outage_activation_request_index != .[1].outage_activation_request_index or
+  .[0].restoration_request_index != .[1].restoration_request_index or
   .[0].requests != .[1].requests
 ' "$recorded_run/choices.json" "$corrupt_run/choices.json" >/dev/null; then
   echo "different seeds did not change requests or the fault choice" >&2

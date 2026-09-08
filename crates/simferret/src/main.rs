@@ -1,8 +1,7 @@
 use std::env;
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::thread;
 
 fn main() -> ExitCode {
     match run() {
@@ -33,39 +32,6 @@ fn run() -> io::Result<u8> {
                 &executable,
             )?;
             Ok(status as u8)
-        }
-        Some(command) if command == "fixture-server" => {
-            let address = arguments
-                .next()
-                .and_then(|value| value.into_string().ok())
-                .ok_or_else(usage)?;
-            let mode = arguments
-                .next()
-                .and_then(|value| value.into_string().ok())
-                .ok_or_else(usage)?;
-            if arguments.next().is_some() || !matches!(mode.as_str(), "echo" | "corrupt") {
-                return Err(usage());
-            }
-            let listener = simferret::fixture::bind(&address)?;
-            thread::Builder::new()
-                .name("agent-watchdog".into())
-                .spawn(|| {
-                    let mut input = io::stdin().lock();
-                    let mut byte = [0_u8; 1];
-                    loop {
-                        match input.read(&mut byte) {
-                            Ok(0) => std::process::exit(2),
-                            Ok(_) => {}
-                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                            Err(_) => std::process::exit(2),
-                        }
-                    }
-                })
-                .map_err(io::Error::other)?;
-            io::stdout().write_all(simferret::fixture::SERVER_READY)?;
-            io::stdout().flush()?;
-            simferret::fixture::serve_listener(listener, mode == "corrupt")?;
-            Ok(0)
         }
         Some(command) if command == "run" => {
             let mut scenario = None;
@@ -161,7 +127,7 @@ fn shell_quote(path: &std::path::Path) -> io::Result<String> {
 fn usage() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: simferret run --scenario PATH --seed N [--runs-dir PATH] | simferret replay RUN_DIRECTORY | simferret guest-agent | simferret fixture-server ADDRESS echo|corrupt",
+        "usage: simferret run --scenario PATH --seed N [--runs-dir PATH] | simferret replay RUN_DIRECTORY | simferret guest-agent",
     )
 }
 

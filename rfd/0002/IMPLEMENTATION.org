@@ -58,20 +58,20 @@ device and replay filter while preserving RFD 1's exact passive replay contract.
 
 * Phase 2 — Fault protocol and properties
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
-- [ ] Extend the scenario and stable choice plan with outage activation and
+- [X] Extend the scenario and stable choice plan with outage activation and
   restoration points.
-- [ ] Add versioned guest commands and events for applying, confirming, and
+- [X] Add versioned guest commands and events for applying, confirming, and
   removing one outbound peer-specific prohibit route.
-- [ ] Ensure fault transitions are event-driven and no host sleep or task wake
+- [X] Ensure fault transitions are event-driven and no host sleep or task wake
   order controls scenario semantics.
-- [ ] Route fixture workload traffic through the emulated NIC rather than guest
+- [X] Route fixture workload traffic through the emulated NIC rather than guest
   loopback.
-- [ ] Evaluate typed pre-outage safety, bounded outage, restoration, and bounded
+- [X] Evaluate typed pre-outage safety, bounded outage, restoration, and bounded
   recovery properties from structured events.
-- [ ] Preserve intentional response corruption as a safety-property failure
+- [X] Preserve intentional response corruption as a safety-property failure
   across the network boundary.
 
 * Phase 3 — Record and passive replay integration

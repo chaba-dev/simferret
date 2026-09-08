@@ -20,7 +20,7 @@ pub struct Scenario {
     pub name: String,
     pub request_count: usize,
     pub payload_bytes: usize,
-    pub server_address: String,
+    pub fixture_peer: String,
     pub outage_event_bound: u64,
     pub liveness_event_bound: u64,
     #[serde(default)]
@@ -32,7 +32,8 @@ pub struct Scenario {
 pub struct ChoicePlan {
     pub version: u16,
     pub seed: u64,
-    pub fault_request_index: usize,
+    pub outage_activation_request_index: usize,
+    pub restoration_request_index: usize,
     pub requests: Vec<PlannedRequest>,
 }
 
@@ -103,13 +104,13 @@ impl Scenario {
                 "outage_event_bound must be positive and liveness_event_bound must be at least 2",
             ));
         }
-        let address: std::net::SocketAddr = self
-            .server_address
+        let peer: std::net::IpAddr = self
+            .fixture_peer
             .parse()
-            .map_err(|error| invalid(format!("invalid server_address: {error}")))?;
-        if address.port() == 0 || !address.ip().is_loopback() {
+            .map_err(|error| invalid(format!("invalid fixture_peer: {error}")))?;
+        if peer != std::net::Ipv4Addr::new(10, 0, 2, 2) {
             return Err(invalid(
-                "server_address must be numeric loopback with a nonzero port",
+                "fixture_peer must be the fixed private peer 10.0.2.2",
             ));
         }
         Ok(())
@@ -117,7 +118,10 @@ impl Scenario {
 
     pub fn choices(&self, seed: u64) -> ChoicePlan {
         let mut random = SplitMix64(seed);
-        let fault_request_index = 1 + random.next() as usize % (self.request_count - 2);
+        let outage_activation_request_index = 1 + random.next() as usize % (self.request_count - 2);
+        let restoration_request_index = outage_activation_request_index
+            + 1
+            + random.next() as usize % (self.request_count - outage_activation_request_index - 1);
         let requests = (0..self.request_count)
             .map(|index| {
                 let nonce = random.next();
@@ -130,7 +134,8 @@ impl Scenario {
         ChoicePlan {
             version: CHOICE_PLAN_VERSION,
             seed,
-            fault_request_index,
+            outage_activation_request_index,
+            restoration_request_index,
             requests,
         }
     }
@@ -174,10 +179,10 @@ mod tests {
     fn scenario() -> Scenario {
         Scenario {
             version: SCENARIO_VERSION,
-            name: "echo-process-restart".into(),
+            name: "network-outage".into(),
             request_count: 6,
             payload_bytes: 8,
-            server_address: "127.0.0.1:4000".into(),
+            fixture_peer: "10.0.2.2".into(),
             outage_event_bound: 1,
             liveness_event_bound: 2,
             corrupt_responses: false,
@@ -190,29 +195,11 @@ mod tests {
         let first = scenario.choices(42);
         assert_eq!(first, scenario.choices(42));
         assert_ne!(first, scenario.choices(43));
-        assert!((1..scenario.request_count - 1).contains(&first.fault_request_index));
-        assert_eq!(
-            first,
-            ChoicePlan {
-                version: 1,
-                seed: 42,
-                fault_request_index: 2,
-                requests: [
-                    ("request-0000-28efe333b266f103", "529f0f1357675247"),
-                    ("request-0001-581ce1ff0e4ae394", "f22348245a58bc09"),
-                    ("request-0002-de4431fa3c80db06", "5d6d37451c67e937"),
-                    ("request-0003-ccf635ee9e9e2fa4", "d57d3d0b77b80557"),
-                    ("request-0004-9e54d738297f77ae", "bf195b774a727434"),
-                    ("request-0005-7e348a0e451650be", "e6463e7f89ed6d83"),
-                ]
-                .into_iter()
-                .map(|(request_id, payload)| PlannedRequest {
-                    request_id: request_id.into(),
-                    payload: payload.into(),
-                })
-                .collect(),
-            }
-        );
+        assert!((1..scenario.request_count - 1).contains(&first.outage_activation_request_index));
+        assert!(first.restoration_request_index > first.outage_activation_request_index);
+        assert!(first.restoration_request_index < scenario.request_count);
+        assert_eq!(first.version, CHOICE_PLAN_VERSION);
+        assert_eq!(first.requests.len(), scenario.request_count);
     }
 
     #[test]
