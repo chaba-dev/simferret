@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::assertions::AssertionReport;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_LENGTH: usize = 1024 * 1024;
 pub const MAX_REQUEST_DATA_LENGTH: usize = 64 * 1024;
 pub const SERIAL_ACK: u8 = 0;
@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn version_two_network_command_round_trips() {
+    fn version_one_network_command_round_trips() {
         let command = command();
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &command).unwrap();

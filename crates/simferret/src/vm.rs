@@ -2102,7 +2102,7 @@ stream.write(b'{{"QMP":{{}}}}\n')
 for _ in range(2):
     request = json.loads(stream.readline())
     stream.write(json.dumps({{"return": {{}}, "id": request["id"]}}).encode() + b"\n")
-print('{{"protocol_version":2,"event_id":0,"command_id":0,"event":{{"type":"agent_ready"}}}}', flush=True)
+print('{{"protocol_version":{PROTOCOL_VERSION},"event_id":0,"command_id":0,"event":{{"type":"agent_ready"}}}}', flush=True)
 time.sleep(30)
 "#
         );

@@ -126,7 +126,8 @@ through 1000 for bounded traffic-scaling experiments.
 
 ## RFD 2 Phase 2 network scenario
 
-The production scenario protocol is version 2. Its seeded choice plan records
+The proof-of-concept scenario, choice-plan, and guest protocols remain at
+version 1. The seeded choice plan records
 separate request indexes for outage activation and restoration. The controller
 materializes one canonical TFTP file per request, and the guest fetches those
 bytes through the RTL8139 NIC from the restricted QEMU backend. Guest commands

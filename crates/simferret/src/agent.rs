@@ -252,7 +252,7 @@ fn require_network_values(interface: &str, guest_cidr: &str, gateway: &str) -> i
         Ok(())
     } else {
         Err(invalid(
-            "network configuration differs from the version-2 profile",
+            "network configuration differs from the version-1 profile",
         ))
     }
 }
@@ -261,7 +261,7 @@ fn require_peer(peer_cidr: &str) -> io::Result<()> {
     if peer_cidr == PEER_CIDR {
         Ok(())
     } else {
-        Err(invalid("fault peer differs from the version-2 profile"))
+        Err(invalid("fault peer differs from the version-1 profile"))
     }
 }
 

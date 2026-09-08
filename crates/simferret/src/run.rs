@@ -1658,9 +1658,17 @@ mod tests {
     }
 
     #[test]
+    fn poc_formats_remain_version_one() {
+        assert_eq!(MANIFEST_VERSION, 1);
+        assert_eq!(crate::protocol::PROTOCOL_VERSION, 1);
+        assert_eq!(crate::scenario::SCENARIO_VERSION, 1);
+        assert_eq!(crate::scenario::CHOICE_PLAN_VERSION, 1);
+    }
+
+    #[test]
     fn controller_stops_at_materialized_choice_and_checks_results() {
         let scenario = Scenario {
-            version: 2,
+            version: crate::scenario::SCENARIO_VERSION,
             name: "test".into(),
             request_count: 4,
             payload_bytes: 2,
@@ -1710,7 +1718,7 @@ mod tests {
         let scenario_path = root.join("scenario.toml");
         fs::write(
             &scenario_path,
-            "version = 2\nname = \"test\"\nrequest_count = 4\npayload_bytes = 2\nfixture_peer = \"10.0.2.2\"\noutage_event_bound = 1\nliveness_event_bound = 2\ncorrupt_responses = false\n",
+            "version = 1\nname = \"test\"\nrequest_count = 4\npayload_bytes = 2\nfixture_peer = \"10.0.2.2\"\noutage_event_bound = 1\nliveness_event_bound = 2\ncorrupt_responses = false\n",
         )
         .unwrap();
         let kernel = root.join("kernel");
@@ -2359,7 +2367,7 @@ mod tests {
         fs::write(
             &scenario,
             format!(
-                "version = 2\nname = \"test\"\nrequest_count = 4\npayload_bytes = 2\nfixture_peer = \"10.0.2.2\"\noutage_event_bound = 1\nliveness_event_bound = 2\ncorrupt_responses = {corrupt}\n"
+                "version = 1\nname = \"test\"\nrequest_count = 4\npayload_bytes = 2\nfixture_peer = \"10.0.2.2\"\noutage_event_bound = 1\nliveness_event_bound = 2\ncorrupt_responses = {corrupt}\n"
             ),
         )
         .unwrap();
@@ -2396,7 +2404,7 @@ mod tests {
 
     fn test_scenario(corrupt: bool) -> Scenario {
         Scenario {
-            version: 2,
+            version: crate::scenario::SCENARIO_VERSION,
             name: "test".into(),
             request_count: 4,
             payload_bytes: 2,

@@ -1,4 +1,4 @@
-version = 2
+version = 1
 name = "network-outage"
 request_count = 6
 payload_bytes = 16

@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::MAX_REQUEST_DATA_LENGTH;
 
-pub const SCENARIO_VERSION: u16 = 2;
-pub const CHOICE_PLAN_VERSION: u16 = 2;
+pub const SCENARIO_VERSION: u16 = 1;
+pub const CHOICE_PLAN_VERSION: u16 = 1;
 pub const MAX_SCENARIO_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_SCENARIO_NAME_BYTES: usize = 256;
 pub const MAX_REQUEST_COUNT: usize = 256;
