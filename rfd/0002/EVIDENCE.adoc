@@ -271,3 +271,35 @@ substitution, source mutation, preservation of an existing recording after
 preflight failure, absolute runtime paths, passive replay emptiness, and fixture
 ownership through VM launch and drop. The pre-existing no-network profile and
 manifest schema remain compatible with RFD 1.
+
+== Phase 3 — Record and passive replay integration
+
+On September 9, 2026, the x86-64 Linux Amp runner executed
+`./scripts/phase4-acceptance.sh` through the pinned development environment.
+The command recorded the six-request network scenario and replayed it twice
+through QEMU 11.1.0 with an empty replay fixture. Record completed in 58.47
+seconds and the passive replays completed in 67.30 and 66.77 seconds. Both
+replays produced the same 3,861-byte normalized event artifact, 598-byte
+assertion artifact, and semantic outcome digest
+`be5ec6342d82234bc8d28ad538cf1dca34d38e42106fd9e12aec3e918fc0c927`.
+The 22,696,092-byte replay log had SHA-256 digest
+`c79c26e825eecd9ae646fe1b3eeb2b99bb59c59c246433c60aed1006e732e069`.
+
+The same run rejected event-artifact tampering before launch and rejected a
+self-consistent VM identity change before QEMU execution. Unit regressions also
+reject a missing replay filter, a fault plan whose restoration does not follow
+activation, every digested network artifact change, and the first normalized
+network-event divergence.
+
+Dependency, preflight, launch, execution, publication, and replay-validation
+failures now atomically retain a separate bounded bundle under the run root's
+`failures/` directory. The JSON report identifies the failure stage, sanitized
+validated local network configuration when available, record or passive replay
+backend mode, fixture mode, observed fault transitions, and semantic
+request-result counts. It reports packet counters as unavailable because the
+selected QEMU user backend and replay filter expose no counter API rather than
+inventing packet evidence. Error text and sanitized QEMU and guest log tails
+are each limited to 64 KiB. Report-only dependency and runtime-creation bundles
+do not inspect unvalidated recording logs. Real artifact- and VM-identity
+preflight rejections each produced and retained a bundle during the acceptance
+run.
