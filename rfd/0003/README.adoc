@@ -588,7 +588,8 @@ multiple guests move earlier only when packaged workload evidence requires them.
 == Implementation
 
 Delivery phases are tracked in
-link:IMPLEMENTATION.org[RFD 3 implementation checklist].
+link:IMPLEMENTATION.org[RFD 3 implementation checklist]. Captured measurements
+and validation results are retained in link:EVIDENCE.adoc[RFD 3 evidence].
 
 == References
 

@@ -1,0 +1,100 @@
+= RFD 3 Evidence
+
+== Entry gate
+
+The entry gate selects `poc/rfd3-workload/main.c` as the acceptance workload.
+It is a bounded C program with no SimFerret library dependency. Its line protocol
+can echo asymmetric input, create and detect invocation state under `/tmp`,
+double-fork a session-leader descendant that ignores `SIGTERM` and retains
+standard output, and fetch one bounded TFTP response from the existing
+`10.0.2.2` RFD 2 peer. It recognizes `EACCES` from the peer-specific prohibited
+route separately from malformed or unavailable responses. The `fetch` command
+accepts the scenario's independently generated expected payload rather than
+deriving it from the request identifier. These behaviors cover the process,
+fresh-root, live-output, and network assertions required by the RFD without
+putting application interpretation in the guest agent.
+
+This selection does not claim that RFD 3 process supervision exists. Booting and
+supervising the external executable remains the first Phase 0 task.
+
+=== Representative artifact capture
+
+The checked-in capture command is:
+
+[source,shell]
+----
+.agents/dev ./scripts/rfd3-entry-gate.sh
+----
+
+It compiles the fixture as a static little-endian x86-64 Linux ELF and emits two
+uncommitted inputs below one unique `.poc/rfd3-entry-gate/capture.*` directory:
+the executable itself and a local OCI image layout containing that executable in
+one uncompressed layer. Unique directories make concurrent captures independent
+instead of replacing a shared `current` path. The OCI config selects
+`/bin/simferret-workload-fixture`, an exact environment, `/` as working
+directory, and `65534:65534`. The layout contains `oci-layout`, `index.json`, and
+selected config, manifest, and layer blobs. The script uses canonical JSON,
+USTAR metadata with zero timestamps, and a fixed entry order; it neither pulls
+an image nor invokes a container daemon.
+
+The capture ran with `x86_64-unknown-linux-musl-gcc (GCC) 15.3.0` and Python
+3.14.7 from the pinned development environment. Repeating the command into a
+second output directory and recursively comparing the results produced no
+difference. The executable reported a 64-bit little-endian AMD x86-64 ELF with
+no interpreter program header. A host-side protocol smoke produced:
+
+[source,text]
+----
+ready version=1
+echo value=asymmetric_42
+state value=fresh
+state value=stale
+stopped status=0
+----
+
+The focused regression command is:
+
+[source,shell]
+----
+.agents/dev ./scripts/rfd3-entry-gate-test.sh
+----
+
+It serves the actual RFD 2 response shape with an independently supplied
+32-hex-character payload, confirms the fixture accepts an exact response and
+rejects a corrupted payload, proves a second descendant-spawn command exits with
+status 2 without creating another process, and runs two captures concurrently
+into distinct byte-identical directories. The test compiles only its network
+peer address and ephemeral UDP port as test constants; the captured fixture
+retains the fixed `10.0.2.2:69` peer.
+
+The captured measurements and identities are:
+
+[cols="2,1,3",options="header"]
+|===
+| Object | Bytes | SHA-256
+
+| Fixture source
+| 8,049
+| `c7958b06f3ddbd292f8abd9b0466afa04e3afef13e5e5f7f219d1da37d1c2305`
+
+| Standalone executable
+| 70,760
+| `d54d4b2a92ace28707ce282a9734fbcdfec0cf30cf1bf0c4c7102bf7d95b6e5c`
+
+| OCI config
+| 276
+| `63234a974712b148203f72a3336392013f55ab3505d032eaba829567ca229692`
+
+| OCI manifest
+| 399
+| `a143552c9fc2c01504eeb7c531d5661c4ab139fc488ca2175746e024787ee429`
+
+| OCI layer and DiffID
+| 81,920
+| `f18056523d5c0125fffaf16b26766c7160fa01ef38a047a9cda41ae5a92dcbab`
+|===
+
+The complete five-file OCI layout is 82,932 bytes. These observations establish
+representative lower bounds only. They deliberately precede and do not choose
+descriptor-count, path, file, compressed-byte, expanded-byte, or cache limits;
+Phase 0 captures broader representative images before those limits are fixed.

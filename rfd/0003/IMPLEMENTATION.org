@@ -10,14 +10,14 @@ content-addressed guest workload, and preserve exact passive replay.
 
 * Entry gate
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
 - [X] Complete RFD 2 and review its replay fidelity, runtime, failure bundles,
   network constraints, and next-increment recommendation.
-- [ ] Select one auditable static workload fixture that can exercise process
+- [X] Select one auditable static workload fixture that can exercise process
   supervision and traffic through the existing network boundary.
-- [ ] Capture representative standalone and minimal OCI artifacts before fixing
+- [X] Capture representative standalone and minimal OCI artifacts before fixing
   parser, expansion, and cache limits.
 
 * Phase 0 — Workload and OCI spikes
