@@ -13,6 +13,9 @@ authoritative merely because it exists; its `state` says how it should be read.
 
 | link:0002/README.adoc[2: Deterministic network fault model]
 | Record and replay a bounded network outage through an explicit QEMU network boundary
+
+| link:0003/README.adoc[3: Reproducible workload packaging]
+| Normalize standalone binaries and local OCI images into one deterministic guest workload
 |===
 
 == Source format
