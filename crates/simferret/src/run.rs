@@ -266,7 +266,7 @@ fn record_with_adapter_and_assets(
         let fixture_entries = fixture_entries(&choices, scenario.corrupt_responses);
         materialize_fixture(&fixture_directory, &fixture_entries)?;
         let network = NetworkConfig::restricted_tftp_record_with_tool_digest(
-            fixture_directory,
+            fixture_directory.clone(),
             sha256_bytes(&assets.busybox),
         )?;
         diagnostics.set_network(&network.identity);
@@ -291,6 +291,7 @@ fn record_with_adapter_and_assets(
             return Err(io::Error::other(format!("QEMU exited with {status}")));
         }
         diagnostics.stage = "publication".into();
+        fs::remove_dir_all(fixture_directory)?;
         let event_bytes = encode_events(&events)?;
         fs::write(staging.path.join("events.jsonl"), &event_bytes)?;
         let assertion_bytes = json_bytes(&assertions)?;
@@ -2158,6 +2159,7 @@ mod tests {
                 .unwrap();
         assert_eq!(manifest.simferret_sha256, captured_executable_digest);
         assert_ne!(manifest.simferret_sha256, sha256_file(&executable).unwrap());
+        assert!(!result.directory.join("fixture").exists());
         assert_eq!(manifest.artifacts.len(), 7);
         for (name, expected_digest) in manifest.artifacts {
             assert_eq!(
