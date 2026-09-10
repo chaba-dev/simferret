@@ -6,3 +6,4 @@ pub mod protocol;
 pub mod run;
 pub mod scenario;
 pub mod vm;
+pub mod workload;
