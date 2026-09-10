@@ -151,6 +151,39 @@ choice plan before launch, uses an empty adapter-owned TFTP directory for
 passive replay, and verifies normalized events, assertion bytes, and the
 semantic outcome digest on every replay.
 
+## RFD 3 workload packaging spike
+
+The RFD 3 Phase 0 spike packages an external executable instead of the built-in
+fixture. It compiles one static and one dynamically linked workload, builds
+local OCI image layouts that carry them, applies representative base and upper
+layers twice into one stable canonical filesystem digest, normalizes every
+source into a content-addressed store, deletes each live source before QEMU
+starts, and records and passively replays each workload through one guest
+supervisor. The dynamic workload runs from the loader and shared library inside
+its own image; no registry, container daemon, or host mount is used.
+
+On x86-64 Linux:
+
+```shell
+.agents/dev ./scripts/rfd3-phase0-spike.sh
+```
+
+Each invocation writes a fresh run directory under `.poc/rfd3-phase0-spike/`
+with the stores, guest images, serial logs, replay logs, and an `evidence.txt`
+summary. This spike validates the packaging boundary only; the typed workload
+specification, canonical Rust assembler, and guest process protocol are Phase 1
+and Phase 2 work.
+
+The focused regression command is:
+
+```shell
+.agents/dev ./scripts/rfd3-phase0-spike-test.sh
+```
+
+The suite also runs the guest supervisor's cleanup path as PID 1 of a private PID
+namespace, which needs unprivileged user namespaces or passwordless `sudo`; the
+test reports which one it used and fails if neither is available.
+
 ## Development
 
 The Nix flake provides the pinned Rust toolchain and Jujutsu. On an x86-64 Linux
