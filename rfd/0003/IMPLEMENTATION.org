@@ -1,0 +1,178 @@
+#+TITLE: RFD 0003 implementation checklist
+#+STARTUP: showall
+
+Implements [[file:README.adoc][RFD 3: Reproducible workload packaging]].
+
+* Objective
+
+Accept one standalone binary or local OCI image layout, normalize it into one
+content-addressed guest workload, and preserve exact passive replay.
+
+* Entry gate
+:PROPERTIES:
+:STATUS: DONE
+:END:
+
+- [X] Complete RFD 2 and review its replay fidelity, runtime, failure bundles,
+  network constraints, and next-increment recommendation.
+- [X] Select one auditable static workload fixture that can exercise process
+  supervision and traffic through the existing network boundary.
+- [X] Capture representative standalone and minimal OCI artifacts before fixing
+  parser, expansion, and cache limits.
+
+* Phase 0 — Workload and OCI spikes
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Boot and supervise an external static x86-64 Linux executable that is not
+  the SimFerret agent.
+- [ ] Build a minimal local OCI image layout containing the same executable and
+  launch it without a registry or container daemon.
+- [ ] Build a second minimal OCI layout whose executable is dynamically linked
+  and whose interpreter and shared-library closure exist only in the image.
+- [ ] Select existing Rust parsing, archive, compression, and safe-filesystem
+  primitives before writing custom format handling.
+- [ ] Apply representative base and upper layers twice and verify a stable
+  normalized filesystem digest, including metadata, replacement, whiteout, and
+  opaque-directory cases.
+- [ ] Prove that record mode can remove all live workload sources before QEMU
+  starts and that replay needs only the retained raw and derived
+  content-addressed closure.
+- [ ] Record source sizes, expanded sizes, assembly duration, initramfs growth,
+  unsupported OCI constructs, and all observed nondeterminism.
+
+* Phase 1 — Typed specification and canonical assembler
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Add a strict versioned workload specification with tagged binary and OCI
+  source variants, explicit non-root credentials, and a shared launch identity.
+- [ ] Validate static ELF architecture and derive binary content identity from
+  opened bytes rather than caller claims.
+- [ ] Read binary and OCI source objects as bounded regular files beneath an
+  opened source root, reject links and special files, and use immutable copied
+  bytes for verification and assembly.
+- [ ] Select only the requested direct ~linux/amd64~ descriptor, require absent
+  variant and OS extensions, ignore unrelated entries, and validate its manifest,
+  config, ordered stored layers, and uncompressed DiffIDs independently.
+- [ ] Normalize OCI launch fields exactly, including Entrypoint/Cmd composition,
+  environment, working directory, non-root numeric credentials, and rejected
+  volume, stop-signal, group, and privileged semantics.
+- [ ] Implement bounded, beneath-root layer application with per-layer duplicate
+  detection, legal lower-layer replacement, order-independent whiteout and
+  opaque-directory semantics, and rejection of every hard link and unsupported
+  file type.
+- [ ] Produce a canonical filesystem identity covering every guest-visible path,
+  type, byte, link target, mode, owner, group, and timestamp decision.
+- [ ] Retain the canonical specification and complete binary or OCI selection
+  evidence, manifest, config, stored layers, and DiffID relationships as a raw
+  content-addressed replay closure.
+- [ ] Build and verify derived canonical-tree and guest-template cache entries
+  that name the complete raw closure through atomic private staging.
+- [ ] Reject concurrent publication conflicts, corrupted cache entries, source
+  mutation, missing raw evidence, path traversal, unsafe links, expansion
+  limits, and partial output.
+
+* Phase 2 — Guest process runtime
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Assemble binary and OCI workloads below the same reserved initramfs root
+  while keeping the PID-1 agent and tools outside it.
+- [ ] Materialize a fresh writable root from an immutable template for every
+  invocation, synthesize deterministic ~/tmp~, ~/dev/null~, and ~/dev/zero~
+  metadata, and reject overlay collisions.
+- [ ] In the child only, connect standard pipes, close inherited descriptors,
+  chroot and change directory, clear groups, set ~no_new_privs~, drop to the
+  normalized nonzero GID and UID, and exec without a shell.
+- [ ] Add generic versioned start, stdin-write, stdin-EOF, and fixed-SIGKILL
+  termination commands with stable invocation identifiers and contiguous input
+  offsets.
+- [ ] Emit bounded live stdout and stderr frames with invocation, stream offset,
+  cross-stream sequence, exact bytes, and independently checked final totals and
+  digests; make overflow or transport failure explicit and fatal.
+- [ ] Treat every non-agent guest process as invocation membership, kill and
+  reap through a process-table-and-pipe-EOF cleanup barrier, and refuse restart
+  before cleanup completes.
+- [ ] Prove an escaped double-fork descendant retaining an output descriptor and
+  first-invocation root mutations cannot satisfy later recovery.
+- [ ] Keep application protocol interpretation and assertions in the host
+  scenario checker; limit the guest agent to generic process and byte facts.
+- [ ] Separate owner-only replay closure and optional bounded output bytes from
+  default shareable failure metadata, which contains no environment values or
+  stream bytes.
+
+* Phase 3 — Scenario and passive replay integration
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Run the same acceptance fixture from standalone binary and OCI sources
+  through the shared guest runtime.
+- [ ] Run the focused dynamically linked OCI fixture from its in-image loader and
+  library closure and passively replay it.
+- [ ] Materialize a process termination and restart in the seeded choice plan and
+  evaluate ordered process safety, cleanup, fresh-root, and recovery properties.
+- [ ] Drive the live workload exclusively through recorded input commands and
+  derive response-integrity assertions from ordered output frames in the host
+  checker before process exit.
+- [ ] Make workload-originated application traffic traverse the RFD 2 NIC and
+  observe the bounded peer-specific outage and restoration.
+- [ ] Record each source form and passively replay it twice without live source,
+  registry, daemon, host mount, or fixture interaction.
+- [ ] Compare normalized events, assertions, workload-output identities, and
+  semantic outcome digests on every replay.
+- [ ] Reject independently changed workload, launch, cache, scenario, and
+  network identities before QEMU starts.
+- [ ] Require raw source evidence on replay even when a valid derived cache entry
+  exists, and recheck selection and stored-layer-to-DiffID relationships before
+  reusing that entry.
+- [ ] Preserve intentional output corruption as a failing safety assertion and
+  nonzero CLI result for both source forms.
+
+* Phase 4 — Acceptance and evidence
+:PROPERTIES:
+:STATUS: TODO
+:END:
+
+- [ ] Automate both record-and-two-replay demonstrations on GitHub-hosted x86-64
+  Linux without elevated privileges or a container daemon.
+- [ ] Cover every workload identity class with compatibility or tampering tests.
+- [ ] Cover adversarial descriptor, layer-archive, whiteout, path, link, file
+  type, per-layer duplicate, expansion, immutable-read, and raw/derived cache
+  cases before VM launch.
+- [ ] Verify canonical modes, owners, modification times, links, replacements,
+  whiteouts, and opacity survive CPIO encoding and are visible in the guest.
+- [ ] Verify no ambient host environment, mutable source, or unrelated host file
+  enters the assembled workload.
+- [ ] Verify shareable successful-run metadata and failure bundles exclude raw
+  config, lock values, environment values, and workload bytes, while private
+  artifacts are owner-only and explicitly classified.
+- [ ] Document supported OCI and binary profiles, self-hosted requirements, and
+  exact invocations.
+- [ ] Record assembly cost, initramfs and replay-log growth, record and replay
+  duration, workload traffic and output volume, and all observed divergence in
+  ~EVIDENCE.adoc~.
+- [ ] Decide whether checkpoint branching, OCI-profile expansion, or serial
+  control optimization is the next evidence-driven RFD.
+
+* Exit criteria
+
+- [ ] Every acceptance criterion in the RFD has linked automated or captured
+  evidence.
+- [ ] Binary and OCI inputs converge before the guest runtime boundary.
+- [ ] Replay reconstructs workload identity independently and uses no live or
+  ambient workload input after QEMU starts; derived cache alone is insufficient.
+- [ ] The packaged workload demonstrably owns the process and network behavior
+  used by acceptance assertions.
+- [ ] The agent exposes only an unprivileged child chroot and generic protocol;
+  the dedicated VM remains the host security boundary.
+- [ ] The implementation preserves RFD 1 and RFD 2's VM adapter, replay,
+  artifact, and normalization ownership boundaries and documents the intentional
+  host-only refinement for workload-specific assertions.
+- [ ] No registry runtime, container daemon, host mount, second workload,
+  persistent disk, richer fault model, or exploration engine exists without new
+  evidence and an RFD.

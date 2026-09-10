@@ -1,0 +1,602 @@
+:authors: Darwin Wu <tough.pasta0068@wunli88.com>
+:state: discussion
+:discussion: https://github.com/chaba-dev/simferret/pull/13
+:labels: applications, binaries, determinism, oci, packaging, replay
+
+= RFD 3 Reproducible workload packaging
+
+== Goal
+
+Run one user-supplied Linux workload inside SimFerret without making users build
+a guest image or link against a SimFerret API. Accept either a standalone static
+executable or a local OCI image layout, normalize both into one content-addressed
+guest workload model, and preserve RFD 1 and RFD 2's exact replay contract.
+
+The increment should prove that packaging is an input to deterministic execution,
+not a second runtime boundary. All workload bytes and launch semantics are fixed
+before QEMU starts. Replay must reject changed workload content or configuration
+before guest execution and must not contact a registry, read a live host
+filesystem, or depend on a container daemon.
+
+== Motivation
+
+RFD 1 established exact whole-system record and replay. RFD 2 added an explicit
+replay-filtered network and a deterministic outage. Both acceptance scenarios
+still run repository-built fixture behavior from SimFerret's own initramfs. This
+proves the execution and network boundaries but not that a user can bring an
+application.
+
+OCI is useful here as a content-addressed distribution format. Existing build
+pipelines already produce image manifests, configs, and layers with digests, and
+those identities fit SimFerret's replay validation. SimFerret does not need OCI
+namespaces, registry behavior, a daemon, or orchestration to consume those
+artifacts.
+
+OCI alone would impose unnecessary work on users with a single static service or
+test binary. A standalone executable is also the smallest way to prove that the
+guest agent can supervise code other than itself. Supporting both inputs through
+one normalized model avoids making either source format part of the execution
+engine.
+
+The RFD 2 evidence recommends packaging before checkpoint exploration. A real
+workload gives later snapshot, branching, and search measurements a more
+representative filesystem and process than the built-in fixture.
+
+== Proposal
+
+Add a versioned workload specification selected by `simferret run`. Its source
+is one of two tagged forms:
+
+* `binary`: one statically linked, little-endian x86-64 Linux ELF executable;
+* `oci`: one manifest selected by digest from a local OCI image-layout directory.
+
+Both sources produce a canonical workload containing:
+
+* an ordered filesystem tree rooted below a reserved guest path;
+* an executable path and exact argument vector;
+* an exact environment without host inheritance;
+* an absolute working directory inside the workload root;
+* numeric user and group identifiers; and
+* source and normalized-content identities.
+
+The canonical workload is assembled into the existing deterministic initramfs.
+The SimFerret agent remains PID 1 outside the workload root and supervises one
+workload process. The process receives no host bind mounts or ambient host
+environment. OCI and binary inputs share the same guest launch and supervision
+path after normalization.
+
+The intended boundary is:
+
+[source,text]
+----
+local binary or OCI image layout
+  -> bounded parser and independent digest validation
+  -> canonical workload filesystem and launch identity
+  -> deterministic initramfs assembler
+  -> SimFerret guest agent as PID 1
+  -> one workload process in a private filesystem root
+  -> existing deterministic process and network boundaries
+----
+
+== Workload specification
+
+The exact CLI and field names may change during implementation. The initial
+shape is approximately:
+
+[source,toml]
+----
+version = 1
+kind = "binary"
+path = "bin/example-server"
+args = ["--listen", "0.0.0.0:8080"]
+env = ["MODE=acceptance"]
+working_directory = "/"
+user = "1000:1000"
+----
+
+or:
+
+[source,toml]
+----
+version = 1
+kind = "oci"
+layout = "images/example"
+manifest_digest = "sha256:<digest>"
+----
+
+Source paths are resolved relative to the workload specification and are
+operational locators, not semantic identity. SimFerret computes identities from
+opened bytes and never accepts a caller-provided content digest as proof of
+those bytes. The OCI manifest digest selects content but is still independently
+verified.
+
+Binary specifications provide launch values explicitly. They require a static
+ELF so no undeclared host or guest library closure can affect execution. The
+executable is installed at one fixed canonical path with normalized ownership,
+executable mode, and zero timestamp. The initial binary profile has no auxiliary
+file tree; users that need libraries or application data use OCI.
+
+OCI specifications use the selected image config for `Entrypoint`, `Cmd`, `Env`,
+`WorkingDir`, and `User`. The initial profile does not allow per-run overrides.
+Shell expansion, host environment interpolation, named user lookup, and
+supplementary groups are excluded.
+
+Launch normalization uses these rules:
+
+[cols="1,3",options="header"]
+|===
+| OCI field | Initial SimFerret rule
+
+| `Entrypoint`, `Cmd`
+| Treat null as absent. Use nonempty `Entrypoint` followed by `Cmd`, or nonempty
+  `Cmd` alone. Require the resulting first argument to be an absolute in-root
+  executable path; reject an empty result and do not search `PATH`.
+
+| `Env`
+| Treat null or absence as empty. Require bounded `NAME=VALUE` UTF-8 entries,
+  reject NUL and duplicate names, preserve order, and inherit nothing from the
+  host or agent.
+
+| `WorkingDir`
+| Treat null, absence, or an empty string as `/`. Otherwise require an absolute
+  path that resolves to a directory inside the final workload root without
+  traversing a symbolic link.
+
+| `User`
+| Treat null, absence, or an empty string as the SimFerret default
+  `65534:65534`. Otherwise require an explicit nonzero decimal `uid:gid` pair.
+  Reject names, UID-only values, root credentials, and supplementary groups.
+
+| `Volumes`, `StopSignal`, `ArgsEscaped`
+| Reject nonempty volumes, a configured stop signal, and `ArgsEscaped = true`.
+  The process-fault signal is fixed by the scenario contract.
+
+| `ExposedPorts`, `Labels`, `History`
+| Treat as non-execution metadata. Their raw config bytes remain source identity,
+  but they do not change the normalized launch.
+|===
+
+Binary specifications use the same normalized launch rules and require an
+explicit nonzero `uid:gid`. Every selected default and rejection policy is
+versioned and included in workload identity.
+
+== OCI input profile
+
+The first OCI implementation accepts a local image-layout directory containing
+`oci-layout`, `index.json`, and local blobs. It first finds exactly one direct
+image-manifest descriptor with the requested digest. That selected descriptor
+must declare `linux/amd64`; `variant`, `os.version`, and `os.features` must be
+absent, and the selected config must agree. Duplicate selected descriptors,
+platform-less selected descriptors, nested selection, or a selected descriptor
+with remote or missing content is rejected. Unselected descriptors and blobs do
+not enter the execution closure and are ignored even when they use unsupported
+media types or refer to unavailable content.
+
+Before parsing or decompressing referenced content, SimFerret checks each
+descriptor's media type, size, and SHA-256 digest against the opened bytes. It
+then checks that the config uses `rootfs.type = "layers"`, that layer and DiffID
+counts agree, and that each uncompressed layer stream matches its ordered DiffID.
+Layers are applied from base to top into an empty private staging root.
+
+The supported layer profile includes bounded plain or gzip-compressed tar,
+directories, regular files, safe relative symbolic links, and OCI whiteout and
+opaque-directory semantics. Paths are normalized once. Absolute paths, NUL,
+escape through `..`, traversal through an existing symbolic link, and duplicate
+normalized archive paths within one layer are rejected. A later layer may
+legally replace an earlier path: directory-over-directory updates attributes,
+while other type or content replacements remove and recreate the path.
+Whiteouts and opaque markers affect only the lower-layer view regardless of tar
+member order; same-layer additions survive, and markers never enter the final
+root.
+
+Device nodes, sockets, FIFOs, setuid and setgid modes, all hard links, sparse
+files, ACLs, unsupported extended attributes, unknown layer
+encodings, descriptor URLs, and embedded descriptor data are rejected in the
+initial profile. Accepted whole-second OCI modification times are preserved and
+included in canonical identity; unsupported extended timestamp encodings are
+rejected. The implementation must not delegate extraction to an unrestricted
+`tar` process. Limits cover descriptor count, nesting, compressed and expanded
+bytes, file count, path length, and individual file size. A limit failure occurs
+before QEMU starts and produces bounded diagnostics.
+
+All source access uses bounded regular-file reads beneath an already opened real
+layout directory. `oci-layout`, `index.json`, digest directories, and selected
+blob files may not be symlinks, FIFOs, devices, or other special files. Digest
+components map to one validated canonical blob path. SimFerret copies bytes into
+private immutable staging, then verifies, parses, decompresses, and extracts
+those same bytes; it never verifies one path and later reopens mutable source
+content. The binary source and existing cache follow the same
+verification-to-use rule.
+
+Unknown OCI JSON fields and unrelated layout files are ignored where the OCI
+specification requires forward compatibility. Unsupported selected media types
+or execution semantics are rejected explicitly rather than interpreted
+approximately.
+
+== Canonical filesystem and identity
+
+The normalized filesystem identity is a domain-separated digest over sorted
+entries. Each entry encodes its canonical absolute workload path, type, mode,
+numeric owner, numeric group, timestamp policy, and either file bytes or symbolic
+link target. Directory entries are explicit. Serialization uses bounded lengths
+and unambiguous type tags; it does not depend on host directory enumeration,
+inode numbers, tar header order where OCI semantics do not make order
+significant, locale, or host umask.
+
+The workload replay identity includes at least:
+
+* workload-specification version and source kind;
+* the canonical workload specification and exact source-selection evidence;
+* source executable digest, or selected OCI manifest, config, stored-layer, and
+  uncompressed DiffID identities in order;
+* canonical normalized-filesystem digest and assembler format version;
+* executable path, ordered arguments, ordered environment, working directory,
+  numeric credentials, and all defaulting decisions;
+* supported OCI media types, extraction-policy version, and runtime-overlay
+  version; and
+* the resulting initial-state digest already owned by the VM identity.
+
+The source identity preserves useful provenance while the canonical identity
+defines guest-visible content. Two source forms are not required to have the
+same identity even when they contain the same executable. They are required to
+enter the same runtime path and obey the same process contract.
+
+Host source paths, staging paths, cache paths, process identifiers, and archive
+inode metadata are diagnostic only. Any source metadata visible to the guest is
+canonicalized or included in identity.
+
+== Content cache and replay
+
+Large workload content is not copied into every run directory. The content store
+contains both raw evidence and derived content. For a binary, raw evidence is the
+opened executable and canonical workload specification. For OCI, it is
+`oci-layout`, `index.json`, the selected index descriptor, and the exact selected
+manifest, config, and stored layer blobs. Every object is addressed by digest;
+the selected descriptor order and relationships form one raw replay closure.
+Operational source locators are not part of it.
+
+Derived entries contain the canonical filesystem tree and encoded immutable
+guest template. Each derived entry names its complete raw closure, normalized
+launch digest, policy versions, and canonical filesystem digest. Assembly writes
+raw and derived entries through private staging, verifies complete bytes and
+relationships, and publishes atomically. Concurrent builders must either
+produce the same bytes or fail without replacing a verified entry.
+
+The run manifest records only workload, launch, and resulting guest-image
+identities. A canonical workload lock is a digested private run artifact and
+names the entire raw and derived closure. Replay verifies every required raw
+object against its digest, reparses the specification and selected OCI graph,
+rechecks stored-layer-to-DiffID relationships, and then either rebuilds the
+canonical tree or verifies a derived entry against those independently computed
+identities. A derived tree alone is insufficient. Missing raw or derived content
+produces an actionable preflight error rather than falling back to a live source.
+
+Once QEMU starts, replay behaves exactly as in RFD 2. It provides no live
+workload files, registry interaction, or host mounts. QEMU replays recorded guest
+inputs and network packets, while SimFerret compares normalized events,
+assertions, and the semantic outcome digest.
+
+== Guest runtime
+
+The initramfs keeps PID 1, the agent, and its tools outside an immutable workload
+template. For every start, including restart within one boot, the agent creates a
+new writable RAM root from that template. It reproduces canonical bytes and
+metadata, then applies a versioned runtime overlay: `/tmp` is an empty root-owned
+mode-`01777` directory; `/dev` is root-owned mode `0755`; and `/dev/null` and
+`/dev/zero` are mode-`0666` character devices with fixed owners and device
+numbers. Package entries at `/tmp` and `/dev` must be directories and have their
+metadata replaced by the overlay; entries below those paths collide and are
+rejected except for an empty directory tree. No `/proc`, `/sys`, entropy device,
+or other guest interface is exposed. Overlay paths, metadata, collision rules,
+copy algorithm, and timestamp handling are workload identity.
+
+The agent itself never changes root. It forks a workload child, connects only
+fresh standard-input/output/error pipes, closes every other inherited descriptor,
+changes the child root and then its in-root working directory, clears
+supplementary groups, sets `no_new_privs`, applies the nonzero GID and UID, and
+executes the exact argument vector without a shell. A setup failure exits the
+child without executing workload code and emits a typed launch failure. The
+immutable template and previous invocation roots are never reachable from the
+child.
+
+The versioned process protocol accepts only these semantic commands:
+
+* `start(invocation, workload_identity)`;
+* `stdin-write(invocation, offset, bytes)` with bounded frames and strictly
+  contiguous offsets;
+* `stdin-eof(invocation)`; and
+* `terminate(invocation)`, whose initial-profile meaning is unconditional
+  `SIGKILL`, independent of OCI `StopSignal`.
+
+The agent emits start, input-accepted, requested-termination, exit, launch-failure,
+and cleanup-complete events. While the process is live it also emits bounded
+output frames containing invocation identifier, `stdout` or `stderr`, per-stream
+byte offset, one monotonic cross-stream sequence number, and exact bytes. Final
+exit records contain independent per-stream totals and digests. Fixed per-frame,
+queued-output, and per-invocation limits are identified by the scenario. The
+agent drains both streams while the child runs; a limit, offset, pipe, or control
+transport failure kills the invocation and is an infrastructure failure. Output
+is never silently truncated and host read chunking is not exposed as a semantic
+event.
+
+The initial single-workload profile defines every guest process other than PID 1
+as a member of the active invocation. On termination or primary-process exit,
+the agent repeatedly enumerates the guest process table, sends `SIGKILL` to every
+remaining member, and reaps until only PID 1 remains and all workload output
+pipes reach EOF. It emits `cleanup-complete` only after that barrier and refuses
+another start before it. This deliberately includes double-forked, reparented,
+or process-group-escaped descendants.
+
+The agent reports process and byte facts but does not parse fixture protocols or
+evaluate application properties. The host scenario checker incrementally parses
+recorded output frames, correlates them with commands and network events, and
+owns workload assertions. This is an explicit refinement of the earlier
+guest/host assertion mirror: the guest still enforces and reports generic
+protocol invariants, while application meaning exists only in the versioned host
+checker. Passive replay compares the resulting frames and assertions exactly.
+
+This boundary supplies deterministic execution, not container isolation. Source
+parsing and extraction treat inputs as hostile, and the VM protects the host,
+but an accepted workload is trusted not to exhaust the entire guest. `chroot`
+limits the non-root child namespace; it is not the host security boundary or a
+multi-tenant sandbox. Linux namespaces, cgroups, seccomp, OCI capabilities and
+hooks, terminals, and general resource controls remain separate concerns.
+
+== Acceptance scenario
+
+The acceptance fixture is built once as a static x86-64 Linux executable and
+packaged in both supported forms: directly as a binary workload and inside a
+minimal OCI image layout. It is ordinary Linux software and does not link to a
+SimFerret library. Fixture-specific output interpretation remains in the
+scenario checker rather than the guest agent.
+
+For each source form, the checked-in acceptance scenario:
+
+. assembles and boots the workload through the canonical runtime path;
+. observes a typed workload-start event;
+. sends bounded, recorded `stdin-write` commands and parses live, ordered output
+  frames whose response is derived from that input;
+. terminates the workload at a materialized process-fault choice point and
+  confirms exit and cleanup completion, including an escaped descendant that
+  retains an output descriptor;
+. restarts the same workload identity into a fresh root, proves a mutation from
+  the first invocation is absent, observes a matching response, and exercises
+  recorded `stdin-eof`;
+. performs a request through the RFD 2 RTL8139 and restricted replay-filtered
+  backend before, during, and after the existing peer-specific outage;
+. evaluates structured process, response-integrity, outage, and recovery
+  properties; and
+. shuts down normally.
+
+The workload, rather than built-in agent request code, must originate the
+acceptance application traffic. Any fixture protocol exists only to make this
+fact auditable. General adapters for arbitrary service protocols are not claimed
+by this RFD.
+
+A focused OCI conformance fixture independently covers preserved modes, numeric
+owners, whole-second modification times, safe symbolic links, legal
+cross-layer replacement, whiteouts, and opaque directories. It verifies the
+guest-visible metadata after initramfs encoding rather than only the host staging
+tree. A second minimal OCI fixture contains a dynamically linked executable,
+interpreter, and shared library and must execute and passively replay; standalone
+dynamic binaries remain unsupported.
+
+Record mode is followed by two passive replays for each source form. Replays
+must produce byte-identical normalized event and assertion artifacts and matching
+semantic outcome digests. The acceptance harness records assembly size and
+duration, initramfs growth, QEMU record and replay duration, replay-log growth,
+workload output volume, and all observed divergence.
+
+== Assertions
+
+The scenario passes only when:
+
+* the started executable and launch identity match the materialized workload;
+* bounded live workload frames preserve per-stream bytes and cross-stream order,
+  and the host checker derives the expected application response;
+* the intended invocation reaches the cleanup barrier and no escaped descendant
+  or retained output descriptor survives;
+* the restarted invocation uses the same workload identity, begins from the same
+  immutable root, and responds within its event bound;
+* application traffic demonstrably crosses the configured NIC and observes the
+  typed administrative rejection while the outage is active;
+* matching application traffic recovers after route restoration; and
+* all required process and network events occur in command-correlated order.
+
+An exec error, unsupported dynamic binary, malformed OCI object, extraction
+limit, missing output, output truncation, infrastructure deadline, or agent-made
+response cannot satisfy a workload property.
+
+== Tampering and negative tests
+
+Preflight tests change each workload identity class independently. At minimum
+they cover the specification, standalone executable, manifest, config, stored
+layer, DiffID, normalized filesystem, launch arguments, environment, working
+directory, and credentials. Changing any object while keeping the recorded lock
+fixed must fail. Self-consistently changing one subgraph, such as a manifest and
+stored layer, must still fail against the unchanged config, DiffIDs, lock, or
+derived identity. Missing raw closure content fails even when a derived
+filesystem is present.
+
+Adversarial OCI fixtures cover absolute and escaping paths, path traversal
+through symbolic links, duplicate normalized names, unsafe hard links, whiteout
+ordering, opaque directories, decompression expansion, oversized content,
+unsupported file types, missing blobs, digest and size mismatch, wrong platform,
+ambiguous selection, and unsupported media types. Every failure must occur before
+QEMU launch and leave no partially published cache entry.
+
+Binary tests reject dynamically linked, wrong-architecture, malformed, mutable,
+oversized, and non-regular inputs. Runtime tests reject privileged credentials,
+forbidden inherited descriptors and interfaces, stale writable roots, malformed
+input offsets, output overflow, and an escaped descendant retaining a pipe.
+Replay tests reject missing or altered raw and derived content and prove that
+unrelated host files and environment variables do not enter the workload.
+
+Content digests provide corruption detection and replay identity, not publisher
+authentication. A change to one object, relationship, lock, or derived artifact
+against the rest of a recorded closure must fail. An attacker able to replace
+the complete closure and all expected identities can instead create a different
+self-consistent recording; detecting that requires signatures, transparency, or
+an external trusted digest, all excluded from this increment.
+
+== CLI and diagnostics
+
+The intended command is approximately:
+
+[source,shell]
+----
+simferret run \
+  --workload workloads/example-binary.toml \
+  --scenario scenarios/workload-network-outage.toml \
+  --seed 42
+----
+
+Success output retains the RFD 2 run identifier, assertion summary, artifact
+directory, and replay command. The manifest and bounded failure bundle add the
+workload source kind, canonical identity, launch identity, assembly/cache mode,
+and first incompatible field without printing field values that may be secret.
+
+Replay closure, workload lock, raw OCI config, and exact workload streams are
+private local artifacts: they may contain user-supplied environment values or
+application data, use owner-only permissions, and are never uploaded by default.
+The default shareable failure bundle contains bounded protocol metadata, counts,
+digests, typed errors, and sanitized source labels, but excludes raw source
+objects, lock contents, environment values, and output bytes. An explicit local
+opt-in may collect bounded private stream bytes for debugging; SimFerret does not
+claim it can infer or redact secrets from arbitrary workload output.
+
+== GitHub Actions and supported hosts
+
+The complete binary and OCI acceptance demonstration runs on a GitHub-hosted
+x86-64 Linux runner without root, KVM, TAP, a container daemon, or network
+access beyond dependency acquisition already owned by the pinned development
+environment. Test workload artifacts are built or materialized reproducibly in
+the repository environment rather than pulled from a registry during the test.
+
+Assembly may run on another host architecture when it is byte-reproducible, but
+execution remains x86-64 Linux QEMU TCG. Cross-host assembly identity is evidence
+to collect, not an initial acceptance claim.
+
+== Acceptance criteria
+
+This increment is complete when:
+
+* one versioned workload schema represents binary and OCI sources as a tagged
+  union and both normalize into one runtime model;
+* a standalone static x86-64 Linux binary records and passively replays twice;
+* a local `linux/amd64` OCI image layout records and passively replays twice;
+* a focused dynamically linked OCI workload and its complete in-image dependency
+  closure execute and passively replay;
+* both source forms use the same guest process supervision and event protocol;
+* workload-originated traffic passes through the RFD 2 NIC and replay filter and
+  observes bounded outage and recovery;
+* a materialized process fault terminates and restarts the packaged workload
+  through a whole-guest cleanup barrier and a fresh writable root, without a
+  stale process or mutation satisfying recovery;
+* live input commands and ordered output frames let the host checker evaluate
+  application properties before exit without fixture logic in the agent;
+* normalized event and assertion artifacts are byte-identical across each pair
+  of replays and semantic outcome digests match;
+* all workload and launch identity changes are rejected before replay;
+* adversarial descriptor, layer-archive, link, whiteout, limit, and cache tests
+  fail before QEMU starts without escaping staging or publishing partial content;
+* OCI metadata and layer semantics survive guest-image encoding and are observed
+  correctly inside the workload root;
+* replay requires and independently verifies the complete raw source closure as
+  well as any reused derived cache entry;
+* no registry, daemon, host bind mount, ambient environment, or live workload
+  source is consulted after QEMU starts;
+* intentional workload-output corruption fails safety with a nonzero CLI result;
+* default shareable diagnostics contain no raw environment values or workload
+  stream bytes, while private artifacts are explicitly identified;
+* the complete demonstration passes in unprivileged GitHub-hosted x86-64 Linux;
+  and
+* evidence records supported formats, assembly and execution cost, artifact
+  growth, operational limits, and every observed divergence.
+
+== Excluded from this increment
+
+This proposal does not include:
+
+* registry clients, mutable tags, signature policy, transparency logs, or image
+  provenance verification beyond content digests;
+* Docker archive compatibility, Docker or containerd daemons, BuildKit, or
+  building Dockerfiles;
+* dynamically linked standalone binaries or automatic host library discovery;
+* arbitrary host directory trees, bind mounts, persistent volumes, block
+  devices, or mutable root filesystems retained across runs;
+* multiple workloads, sidecars, Docker Compose, Kubernetes, service discovery,
+  or general topology configuration;
+* full OCI Runtime Specification behavior, namespaces, cgroups, capabilities,
+  seccomp, hooks, terminal handling, or resource controls;
+* named user and group resolution, shell command interpretation, or host
+  environment inheritance;
+* non-Linux, non-amd64, privileged, setuid, or device-dependent workloads;
+* general protocol adapters or automatic property inference for arbitrary
+  applications;
+* richer network faults, a second guest, persistent storage faults, checkpoint
+  branching, or exploration workers; or
+* performance or security claims beyond the bounded accepted profile.
+
+== Alternatives considered
+
+OCI-only support maximizes compatibility with container build pipelines but
+forces users with a single static artifact to construct layers and image
+metadata. The binary source adds little runtime complexity once both normalize
+to the same model and provides the smallest end-to-end acceptance case.
+
+Binary-only support avoids layer extraction but cannot represent dynamically
+linked applications and their filesystem dependencies without inventing another
+bundle format. OCI already provides a content-addressed answer for that case.
+
+A custom SimFerret archive could encode exactly the supported semantics, but it
+would create a new build ecosystem before OCI demonstrates a concrete mismatch.
+The canonical internal model remains available if such a format is justified
+later.
+
+Mounting a host directory into the guest would be operationally simple but adds
+live filesystem input outside QEMU replay and makes host metadata semantic by
+accident. Copying and canonicalizing content before launch is required.
+
+Running Docker, containerd, or a complete OCI runtime inside the guest adds a
+daemon, mutable state, namespaces, and additional nondeterministic behavior that
+does not help answer the packaging question. SimFerret needs deterministic
+process launch, not a nested container platform.
+
+Using Nix closures directly would provide strong identities for Nix users but
+would not accept the dominant OCI artifact format and would couple the workload
+contract to SimFerret's development environment.
+
+Attaching a writable disk image would support larger images and persistent state
+but introduces block-device replay, filesystem initialization, and storage-fault
+questions. The initial bounded workload remains in the deterministic initramfs;
+disk-backed workloads require a later RFD.
+
+== Follow-up decision
+
+Completion provides the first representative user workload for measuring
+checkpoint size, restore cost, and branching throughput. If assembly and replay
+remain reliable, checkpoint-tree branching and deterministic exploration should
+be the next RFD.
+
+If OCI compatibility failures dominate because the bounded layer profile is too
+narrow, expand only the observed filesystem semantics before exploration. If
+acceptance runtime rather than workload size dominates, optimize the recorded
+serial control protocol as a separate focused change. Richer packet faults or
+multiple guests move earlier only when packaged workload evidence requires them.
+
+== Implementation
+
+Delivery phases are tracked in
+link:IMPLEMENTATION.org[RFD 3 implementation checklist]. Captured measurements
+and validation results are retained in link:EVIDENCE.adoc[RFD 3 evidence].
+
+== References
+
+* https://github.com/opencontainers/image-spec/blob/main/image-layout.md[OCI image layout]
+* https://github.com/opencontainers/image-spec/blob/main/descriptor.md[OCI descriptors]
+* https://github.com/opencontainers/image-spec/blob/main/manifest.md[OCI image manifest]
+* https://github.com/opencontainers/image-spec/blob/main/config.md[OCI image configuration]
+* https://github.com/opencontainers/image-spec/blob/main/layer.md[OCI image layers]
+* link:../0001/README.adoc[RFD 1: Deterministic execution proof of concept]
+* link:../0002/README.adoc[RFD 2: Deterministic network fault model]
