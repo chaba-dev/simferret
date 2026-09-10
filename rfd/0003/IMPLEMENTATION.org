@@ -44,34 +44,34 @@ content-addressed guest workload, and preserve exact passive replay.
 
 * Phase 1 — Typed specification and canonical assembler
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
-- [ ] Add a strict versioned workload specification with tagged binary and OCI
+- [X] Add a strict versioned workload specification with tagged binary and OCI
   source variants, explicit non-root credentials, and a shared launch identity.
-- [ ] Validate static ELF architecture and derive binary content identity from
+- [X] Validate static ELF architecture and derive binary content identity from
   opened bytes rather than caller claims.
-- [ ] Read binary and OCI source objects as bounded regular files beneath an
+- [X] Read binary and OCI source objects as bounded regular files beneath an
   opened source root, reject links and special files, and use immutable copied
   bytes for verification and assembly.
-- [ ] Select only the requested direct ~linux/amd64~ descriptor, require absent
+- [X] Select only the requested direct ~linux/amd64~ descriptor, require absent
   variant and OS extensions, ignore unrelated entries, and validate its manifest,
   config, ordered stored layers, and uncompressed DiffIDs independently.
-- [ ] Normalize OCI launch fields exactly, including Entrypoint/Cmd composition,
+- [X] Normalize OCI launch fields exactly, including Entrypoint/Cmd composition,
   environment, working directory, non-root numeric credentials, and rejected
   volume, stop-signal, group, and privileged semantics.
-- [ ] Implement bounded, beneath-root layer application with per-layer duplicate
+- [X] Implement bounded, beneath-root layer application with per-layer duplicate
   detection, legal lower-layer replacement, order-independent whiteout and
   opaque-directory semantics, and rejection of every hard link and unsupported
   file type.
-- [ ] Produce a canonical filesystem identity covering every guest-visible path,
+- [X] Produce a canonical filesystem identity covering every guest-visible path,
   type, byte, link target, mode, owner, group, and timestamp decision.
-- [ ] Retain the canonical specification and complete binary or OCI selection
+- [X] Retain the canonical specification and complete binary or OCI selection
   evidence, manifest, config, stored layers, and DiffID relationships as a raw
   content-addressed replay closure.
-- [ ] Build and verify derived canonical-tree and guest-template cache entries
+- [X] Build and verify derived canonical-tree and guest-template cache entries
   that name the complete raw closure through atomic private staging.
-- [ ] Reject concurrent publication conflicts, corrupted cache entries, source
+- [X] Reject concurrent publication conflicts, corrupted cache entries, source
   mutation, missing raw evidence, path traversal, unsafe links, expansion
   limits, and partial output.
 

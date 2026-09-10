@@ -554,3 +554,141 @@ cached tree all fail materialization; a symbolic-link source is rejected; a
 whiteout whose parent the same layer replaces with a symbolic link is accepted
 while a marker inside a lower-layer symbolic link is refused; and every
 unsupported construct is refused without partial output.
+
+== Phase 1 typed specification and canonical assembler
+
+Phase 1 replaces the Python prototype with `crates/simferret/src/workload/`: a
+strict TOML specification, a bounded beneath-root reader, an OCI image-layout
+normalizer, a canonical tree and identity, and a raw closure plus derived cache
+store. It selects the Rust primitives the Phase 0 spike recommended: `serde` and
+`serde_json` for JSON, `sha2` for digests, `flate2` with `rust_backend` for
+gzip, `tar` 0.4 for layer records, and `rustix` 1.1 for `openat`-style access
+with `O_NOFOLLOW`, `O_NONBLOCK`, and directory descriptors. The prototype is no
+longer on any execution path.
+
+=== Resolved Phase 0 deviations
+
+* GNU `longname` and `longlink` records, PAX `x` and `g` records, hard links,
+  devices, FIFOs, sockets, sparse files, setuid and setgid modes, and unknown
+  tar type bytes are each rejected by inspecting the physical record type with
+  raw iteration. The prototype accepted GNU long names because Python's
+  `tarfile` resolved them transparently.
+* Selected descriptors that declare `urls` or embedded `data` are rejected
+  before the referenced content is opened. Unselected descriptors are still
+  ignored whatever they contain, so forward compatibility is preserved.
+* The derived entry names its complete raw closure. `derived/<canonical>/lock.json`
+  records the closure digest, the canonical digest, and the tree and template
+  digests, and verification refuses a derived entry that does not name the
+  closure being replayed. The Phase 0 record-direction question is resolved in
+  favor of the RFD's "each derived entry names its complete raw closure".
+
+=== Bounded profile
+
+The Phase 0 prototype's limits are adopted as fixed constants: 1 MiB
+specification, layout, manifest, and config; 4 MiB index; 64 MiB stored layer;
+256 MiB expanded layer and canonical expanded bytes; 16 MiB file; 4,096 entries
+per layer; 16 layers; 1,024-byte path; 4,096-byte link target; 40 link
+expansions; 64 raw closure objects; 32,768 canonical entries; 4 MiB cache
+metadata; 256 arguments and environment entries; 4 KiB per argument and
+environment entry; and 64 KiB total environment. Every bound is recorded in the
+raw closure, so changing one changes the workload identity and a recording made
+under other limits fails verification rather than being reinterpreted.
+
+Two further profile decisions are recorded here. Modification times are limited
+to the unsigned 32-bit whole-second range because the guest template is a `newc`
+CPIO archive, and a timestamp the template cannot encode is rejected rather than
+truncated. A standalone binary installs at the one fixed canonical path
+`/bin/simferret-workload`; binary specifications therefore carry no install path
+and no auxiliary file tree.
+
+The Phase 1 store holds exactly one workload closure and refuses to replace it
+with a different one, so the derived entry can name its closure unambiguously.
+Reusing a shared store across different workloads is deferred to the Phase 3 run
+integration, which will name closures by digest.
+
+=== Checked-in evidence command
+
+[source,shell]
+----
+.agents/dev ./scripts/rfd3-phase1-evidence.sh
+----
+
+It compiles `poc/rfd3-workload/main.c` with the pinned static compiler, builds a
+converging local OCI image layout, assembles the same fixture as a binary source
+and as an OCI source, verifies both stores, and requires one canonical identity,
+one template identity, and a reproduced closure. A representative run produced:
+
+[cols="2,3",options="header"]
+|===
+| Measurement | Value
+
+| Fixture source SHA-256
+| `c7958b06...37d1c2305`
+
+| Static executable
+| 70,760 bytes, `d54d4b2a...f7d95b6e5c`
+
+| OCI layout
+| 82,854 bytes, selected manifest `sha256:69aa8d92...4773d34186f`
+
+| Binary canonical / tree / template
+| `2fce0cfb...0a3c8faead` / `8b2c67a9...7c47d07f` / `10885d3e...da153c83`
+
+| OCI canonical / tree / template
+| identical to the binary source
+
+| Binary closure
+| `5c9368fe...00a4336635` (2 raw objects)
+
+| OCI closure
+| `52bf3413...6d98b8bc` (5 raw objects)
+
+| Canonical entries / expanded bytes
+| 3 / 70,760 for both sources
+
+| Assembly duration (both sources)
+| 24.4 ms warm, 979 ms cold; durations move with host scheduling
+
+| Store bytes (binary / OCI)
+| 144,106 / 156,685
+
+| Re-assembly
+| byte-identical summary and closure
+|===
+
+The static executable digest and the fixture source digest are unchanged from
+the entry gate, so Phase 1 consumes the same representative artifact. The two
+source closures differ, as the RFD requires, while the canonical and template
+identities converge before the runtime boundary.
+
+=== Phase 1 regression tests
+
+[source,shell]
+----
+.agents/dev cargo test --locked --workspace --all-targets --all-features
+----
+
+`tests/rfd3_phase1.rs` builds standalone binary and local OCI image-layout
+sources and covers, before any output is published: static-ELF, architecture,
+endianness, malformed, symlinked, escaping, and oversized binary inputs; absolute
+and escaping layer paths, hard links, devices, setuid modes, per-layer duplicate
+paths, PAX and GNU extension records, symlink traversal, unsupported layer media
+types, wrong or ambiguous or platform-less or remote selection, DiffID mismatch,
+unsupported rootfs type, corrupt and missing selected blobs, nonempty whiteout
+markers, markers that traverse a lower symlink, chained symlink escapes,
+non-basename markers, volumes, stop signals, `ArgsEscaped`, root and named
+credentials, duplicate environment names, relative and missing executables,
+non-executable modes, relative and missing working directories, config platform
+extensions, and empty layer lists. It verifies that binary and OCI sources
+converge, that layer semantics are order independent and legally replace lower
+entries, that root opacity keeps only same-layer additions, that the template
+reproduces canonical metadata, and that every launch identity class changes the
+closure. It tampers each raw and derived identity class independently, proves a
+self-consistent manifest and stored-layer change still fails, proves a derived
+entry alone is insufficient when raw content is missing, proves a special file
+in the store is refused, proves a second closure cannot replace a verified store
+entry, and runs four concurrent assemblies that publish one verified entry.
+
+Unit tests cover canonical identity order independence and field coverage, the
+encoded template, bounded symlink resolution, layer-path normalization, and the
+whiteout, opaque, replacement, duplicate, and marker-traversal rules directly.
