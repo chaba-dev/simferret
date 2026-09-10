@@ -84,6 +84,59 @@ fn run() -> io::Result<u8> {
             );
             Ok(result.exit_code() as u8)
         }
+        Some(command) if command == "workload" => {
+            let subcommand = arguments
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(usage)?;
+            match subcommand.as_str() {
+                "assemble" => {
+                    let mut specification = None;
+                    let mut store = None;
+                    while let Some(option) = arguments.next() {
+                        let value = arguments.next().ok_or_else(usage)?;
+                        match option.to_str() {
+                            Some("--specification") if specification.is_none() => {
+                                specification = Some(PathBuf::from(value));
+                            }
+                            Some("--store") if store.is_none() => {
+                                store = Some(PathBuf::from(value));
+                            }
+                            _ => return Err(usage()),
+                        }
+                    }
+                    let result = simferret::workload::assemble(
+                        &specification.ok_or_else(usage)?,
+                        &store.ok_or_else(usage)?,
+                    )?;
+                    println!("source: {}", result.source_kind.name());
+                    println!("canonical: {}", result.canonical_digest);
+                    println!("closure: {}", result.closure_sha256);
+                    println!("tree: {}", result.tree_sha256);
+                    println!("template: {}", result.template_sha256);
+                    println!("executable: {}", result.launch.executable);
+                    println!("entries: {}", result.entries);
+                    println!("expanded bytes: {}", result.expanded_bytes);
+                    println!("raw objects: {}", result.raw_objects);
+                    Ok(0)
+                }
+                "verify" => {
+                    let store = arguments.next().ok_or_else(usage)?;
+                    if arguments.next().is_some() {
+                        return Err(usage());
+                    }
+                    let result = simferret::workload::load(&PathBuf::from(store))?;
+                    println!("source: {}", result.source_kind.name());
+                    println!("canonical: {}", result.canonical_digest);
+                    println!("closure: {}", result.closure_sha256);
+                    println!("executable: {}", result.launch.executable);
+                    println!("entries: {}", result.tree.len());
+                    println!("template bytes: {}", result.template.len());
+                    Ok(0)
+                }
+                _ => Err(usage()),
+            }
+        }
         Some(command) if command == "replay" => {
             let directory = arguments.next().ok_or_else(usage)?;
             if arguments.next().is_some() {
@@ -127,7 +180,7 @@ fn shell_quote(path: &std::path::Path) -> io::Result<String> {
 fn usage() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: simferret run --scenario PATH --seed N [--runs-dir PATH] | simferret replay RUN_DIRECTORY | simferret guest-agent",
+        "usage: simferret run --scenario PATH --seed N [--runs-dir PATH] | simferret replay RUN_DIRECTORY | simferret workload assemble --specification PATH --store PATH | simferret workload verify STORE | simferret guest-agent",
     )
 }
 
