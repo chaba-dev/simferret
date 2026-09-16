@@ -1,0 +1,435 @@
+:authors: Darwin Wu <tough.pasta0068@wunli88.com>
+:state: discussion
+:discussion: https://github.com/chaba-dev/simferret/pull/16
+:labels: determinism, qemu, replay, time, virtual-clock
+
+= RFD 4 Deterministic guest time model
+
+== Goal
+
+Remove host-dependent clock scaling and idle pacing from guest execution, so
+that the passage of time inside the guest is a reproducible function of the
+fixed VM configuration and the work the guest performs.
+
+The increment is deliberately narrow. It pins the QEMU time model, adds that
+model to versioned VM identity, and states precisely what the earlier increments
+did and did not establish about fresh executions. It does not add time or
+entropy interfaces to the guest, it does not add fault injection, and it does
+not by itself make a fresh execution fully deterministic, because the arrival
+timing of live host input remains outside this model.
+
+== Motivation
+
+RFD 1 established bounded record and replay. RFD 2 added a deterministic network
+boundary. RFD 3 packages a user-supplied workload. Their guests share one vCPU,
+`nokaslr`, and `-rtc clock=vm`; RFD 1 and RFD 2 additionally mount `devtmpfs`,
+`proc`, and `sysfs` inside the guest, while RFD 3's proposed workload root
+deliberately exposes none of them. All of them record and replay through
+`-icount`.
+
+That construction controls the guest's input boundary and makes a recording
+reproducible. It does not control the mapping from executed instructions to
+virtual time. QEMU documents the mechanism directly: with `-icount shift=N` "the
+virtual cpu will execute one instruction every 2^N ns of virtual time", while
+`shift=auto` means "the virtual cpu speed will be automatically adjusted to keep
+virtual time within a few seconds of real time". The same reference notes that
+with `clock=vm`, which icount mode recommends, "the speed of the virtual clock
+is variable and can in general differ from the host clock". QEMU's own record
+and replay examples use `shift=auto`, so the current configuration follows
+upstream convention.
+
+A probe that boots a fixed guest, takes four time measurements plus a control,
+and repeats (`poc/time-model/probe.c`, driven by `scripts/time-model-probe.sh`)
+produced these results. Five runs per configuration, except `shift=4,sleep=off`
+which used three.
+
+[cols="2,1,1,1,1",options="header"]
+|===
+| `-icount` options | Reproducible | Fixed work (2,000,000 iterations) | Replay log | Run wall time
+
+| `shift=auto` (current)
+| no, 4/4 metrics vary
+| 42.65–126.05 ms (3.0x)
+| 4,653,579–10,094,763 B, all distinct
+| 6.77–6.80 s
+
+| `shift=auto,sleep=off` (unsupported combination)
+| no, 4/4 metrics vary
+| 10.21–88.19 ms (8.6x)
+| 199,665–234,497 B, all distinct
+| 5.66–6.16 s
+
+| `shift=7`
+| no, 3/4 metrics vary
+| 2253.86–2262.97 ms (0.4%)
+| 4,677,667–5,249,009 B, all distinct
+| 13.81–14.45 s
+
+| `shift=7,sleep=off`
+| yes, 0/4 metrics vary
+| 2262.14 ms exact
+| 3,303,901 B exact
+| 13.36–13.95 s
+
+| `shift=4,sleep=off`
+| yes, 0/4 metrics vary
+| 182.04 ms exact
+| 330,255 B exact
+| 6.51–6.64 s
+|===
+
+Three further observations from the same runs:
+
+* Under the current default, 100 consecutive one-millisecond sleeps took
+  119.37–147.92 ms instead of about 100 ms, a 24% spread.
+* With `shift=auto,sleep=off` the fixed computation measured against a fixed
+  20 ms deadline answered `within_deadline=yes` on one run and `no` on the
+  others. A timeout, retry, backoff, TTL, deadline, or rate limit can therefore
+  take a different branch between two runs of the same binary with the same
+  inputs, which would present as flakiness in the workload rather than as a
+  platform defect.
+* The control checksum, derived only from the fixed computation, matched in
+  every configuration and every run. This establishes that the *fixed
+  computation produced the same result* while its measured virtual duration
+  varied. It does not establish that the guest executed an identical
+  instruction stream: the spin-loop chunk counts differ between runs, which
+  shows that it did not.
+
+=== What this does and does not say about RFD 1, RFD 2, and RFD 3
+
+This increment does not invalidate their results, and it does not repair a
+promise they made.
+
+RFD 2's evidence already records that semantic artifacts and the outcome digest
+are stable across *passive replays* while replay-log size and wall-clock
+duration vary across recordings and hosts, and that those are measurements
+rather than replay identity. That scoping is correct and this increment leaves
+it intact.
+
+Replay is also not unconditional. A successful replay requires valid recorded
+artifacts and digests, a matching scenario and materialized choice plan, a
+matching SimFerret executable and rebuilt initial state, the specific verified
+replay log, normal QEMU termination, and matching normalized events,
+assertions, and semantic outcome digest. Matching VM identity is a necessary
+condition among these, not a sufficient one. Replay reproduces the timing the
+guest observed because the log records it, which is why variable clock scaling
+never broke replay.
+
+What is narrower than it may have appeared is *fresh execution*: a new
+recording of the same workload with the same inputs. That is the property this
+increment strengthens, and it was never claimed.
+
+== Determinism needs
+
+The platform's determinism rests on separable needs. Only the first is in scope
+here, and naming the others prevents this increment from being read as a general
+promise.
+
+[cols="1,2,2",options="header"]
+|===
+| Need | Meaning | Status
+
+| Determinism
+| Two runs of the same workload with the same inputs behave the same.
+| Partially controlled. The input boundary and the replay contract are
+  established; clock scaling and idle pacing are this increment. The arrival
+  timing of live host input remains uncontrolled.
+
+| Compatibility
+| The workload can run at all.
+| Narrow by choice. Adding interfaces is surface-area work, not determinism
+  work, and each added interface must establish its own determinism boundary
+  rather than inheriting one.
+
+| Controllability
+| Time, entropy, or ordering can be *deliberately perturbed* to test a
+  hypothesis.
+| Not implemented and not implied by this increment. It requires an explicit
+  fault surface and is a separate proposal.
+|===
+
+Inputs whose value comes from the *host* — the host clock, host entropy,
+unfiltered network, host filesystem — cannot be made deterministic from inside
+the guest and stay excluded. That does not mean every interface implemented
+inside the guest is automatically deterministic: a guest interface can still
+expose state influenced by input delivery, device events, or entropy. In
+particular, excluding entropy device nodes does not exclude the `getrandom`
+system call, which needs no filesystem path.
+
+== Proposal
+
+Pin the QEMU time model for both record and replay:
+
+* `-icount shift=N` with a fixed `N` instead of `auto`; and
+* `sleep=off`, so the guest is not paced against host real time.
+
+Both options were required among the tested configurations, and QEMU documents
+a constraint on their use:
+`sleep=off` "cannot be used together with either `shift=auto` or `align=on`".
+Pinning the scale is therefore not merely preferable, it is what makes the
+option QEMU describes as deterministic usable in a documented supported
+configuration. Pinning the scale while
+leaving host-paced idle advancement enabled left a residual spread of 0.4% in
+fixed work and 3.6% in the single 20 ms sleep.
+
+The reproducible configuration need not cost wall-clock time: in this
+measurement `shift=4,sleep=off` completed no slower than `shift=auto` while
+producing a replay log ten times smaller than `shift=7,sleep=off`.
+
+The pinned model becomes part of versioned VM identity, and the product's record
+and replay launch paths must pass that model rather than configuring it
+separately. A run whose manifest records a different time model is rejected
+before QEMU starts, using the existing first-incompatible-field reporting rather
+than a new mechanism.
+
+=== Choosing the scale
+
+The scale is a semantic choice, not only a bootability choice. At `shift=4` the
+model advances 16 nanoseconds per counted instruction and at `shift=7` it
+advances 128, an eight-fold difference in the conversion factor, and the same
+fixed computation measured 182 ms and 2262 ms of virtual time under the two
+models. The chosen value defines an artificial performance model, and
+timeout-sensitive results are conclusions about that model rather than
+predictions of production timing.
+
+The selection rule is therefore: a fixed value that boots and completes every
+validation run within the configured deadline on every host in the supported
+matrix, justified against its neighbors and recorded with the reason. The
+measured failure mode at the coarse end is not graceful — `shift=10` produced no
+guest output within a 180-second deadline while writing a 117 MB replay log, in
+a run that used the RFD 3 fixture rather than this probe and default `sleep`
+behavior, so the cause is undetermined and the observation is limited to the
+absence of guest output before the deadline.
+
+The value must be validated at boot on every supported host and re-validated
+whenever the pinned QEMU or guest kernel changes. It is never derived per host,
+because a host-derived value reintroduces exactly the host dependence this
+increment removes. Where the pinned model cannot complete on a host, the run
+must fail as an unsupported execution rather than silently falling back to
+another model.
+
+The supported matrix for this increment is the reference x86-64 Linux
+development host and GitHub-hosted `ubuntu-latest` x86-64 Linux. Additional
+hosts may be validated later without changing the model.
+
+== What the pinned model actually is
+
+With a fixed shift and `sleep=off`, virtual time is not solely a function of
+executed instructions. While the guest executes, time advances per counted
+instruction; while the guest is idle, it jumps to the next timer deadline and
+does not advance at all if no timer is enabled. The model is therefore
+instruction-derived progress plus deterministic timer-driven advancement, which
+QEMU describes as giving "deterministic execution times from the guest point of
+view".
+
+That has consequences worth documenting rather than assuming:
+
+* a long virtual wait need not consume equivalent host wall time, which is a
+  service advantage and also means wall-clock duration is not a property of the
+  model;
+* a busy-wait and an idle sleep have very different execution costs;
+* periodic kernel and device timers still consume processing during a long wait;
+* the relative ordering of guest timers and live host input can change, which is
+  the unresolved gap below; and
+* stable timer behavior under this model is not necessarily representative of
+  physical hardware timing.
+
+Observed sleep overshoot is part of the model and is documented rather than
+minimized. In this probe a 20 ms sleep overshot by 0.082–0.102 ms under `auto`,
+0.948 ms at `shift=7,sleep=off`, and 1.951 ms at `shift=4,sleep=off`. Pinning therefore
+trades a smaller but variable overshoot, measured here on one workload, for a
+repeatable one. That is the right trade for reproducibility, and the repeatable
+value is a property of this model and workload rather than a latency that can be
+assumed for every workload.
+
+== Unresolved: input arrival timing
+
+This increment removes host-dependent clock scaling and idle pacing. It does not
+make the arrival of live host input deterministic.
+
+Record-mode commands cross the guest serial port as framed messages paced by a
+guest acknowledgement for every byte. That pacing constrains ordering and
+prevents deferred replay events from overrunning the UART, but it does not give
+an input byte a deterministic guest instruction position or virtual timestamp:
+the guest continues executing between bytes, and how far it gets depends on host
+scheduling. A workload that starts a timer after one command and races that
+timer against the next command can therefore still take different branches in
+two fresh recordings with identical command contents and choice plans.
+`sleep=off` can accentuate this, because idle virtual time can advance quickly
+while the host prepares the next byte.
+
+Recording the arrival positions makes a particular execution replayable; it does
+not make the positions identical in a fresh recording. Closing this gap needs
+deterministic input delivery — explicit barriers, a preloaded guest-side choice
+plan, or scheduled injection — and is separate work. This RFD neither implements
+it nor claims it.
+
+== Identity and versioning
+
+The `-icount` options change the replay log, so the time model is already
+implicitly part of what a run reproduces; this increment makes it explicit and
+validated. Three consequences follow.
+
+Runs recorded under different time models are not comparable and must not be
+silently mixed, including in a seed sweep or an exploration tree. Changing the
+pinned scale is a versioned change, and previous runs stay valid only under the
+model they recorded.
+
+An existing manifest must not silently acquire the new model through a default.
+A run recorded before the pinned model existed either requires the environment
+it recorded, consistent with the existing executable and initial-state checks,
+or is supported through an explicitly named legacy profile. Retaining an old
+replay log does not by itself guarantee that a new executable can consume it.
+
+Wall-clock observations — how long a run took on the host — remain diagnostic
+and stay out of identity, because they are a property of the host rather than of
+the run.
+
+== What this does not guarantee
+
+* Workloads that require interfaces the workload root does not provide remain
+  unsupported. That is the compatibility need, not this one.
+* Virtual time is instruction-derived progress plus idle advancement, not a
+  function of wall-clock time, and the model's resolution is not physical
+  hardware resolution.
+* A fresh execution can still differ because live host input arrives at a
+  different point in virtual time.
+* A workload can still be nondeterministic for reasons outside the time model,
+  including entropy derived from the deterministic boot and any interface added
+  later without its own determinism treatment.
+* Nothing here makes time, entropy, or ordering perturbable on purpose.
+
+== Acceptance criteria
+
+This increment is complete when:
+
+* the probe reports zero varying time measurements across at least five complete
+  runs on each host in the supported matrix;
+* the probe's guest measurements are equal across the supported hosts for
+  identical artifacts and the same model, not merely stable within each host;
+* every validation run completes within the configured deadline on each
+  supported host, and the chosen scale is justified against its neighbors and
+  recorded with the reason;
+* the product's record and replay launch paths pass the pinned model, and the
+  options actually launched match the recorded identity;
+* a run recorded under the pinned model replays twice with matching normalized
+  events, assertions, and semantic outcome digest;
+* a run whose manifest records a different time model is rejected before QEMU
+  starts, naming the first incompatible field;
+* the probe runs as a continuous-integration gate on x86-64 Linux;
+* the pinned model, its idle-advancement semantics, its wakeup behavior, its
+  meaning as an artificial performance model, and the unresolved input-arrival
+  gap are documented in the project README and the run manifest; and
+* re-validating the scale when the pinned QEMU or guest kernel changes is a
+  documented requirement.
+
+== Excluded from this increment
+
+This proposal does not include:
+
+* deterministic input arrival, command barriers, or a guest-side choice plan;
+* time, entropy, ordering, or scheduling fault injection, or any interface that
+  lets a scenario choose when a timer fires;
+* dynamic linking, `/proc`, `/sys`, sockets, threads, or any other compatibility
+  surface for real services;
+* deterministic entropy beyond what a deterministic boot already provides;
+* multiple vCPUs, SMP timing models, or device-timer interaction under load;
+* absolute or wall-clock time semantics, or any promise that virtual time tracks
+  real time;
+* checkpointing, branching, or exploration; or
+* performance claims beyond the wall-clock cost of the pinned scale.
+
+== Alternatives considered
+
+Keeping `shift=auto` needs no validation and was not the slowest configuration
+measured, but it leaves the mapping host- and run-dependent: fixed work varied by
+3.0x and short sleeps by 24% across runs. A deadline decision that flips between
+runs was observed in the unsupported `sleep=off` combination rather than under
+this default, and under the default every run answered the same way; the risk is
+that a deadline falling inside the measured duration range would not. Rejected.
+
+Adding `sleep=off` alone is not a supported configuration, because QEMU
+documents it as incompatible with `shift=auto`. It was measured anyway, because
+the pinned QEMU accepts it in a fresh process, but the measurement does not
+establish which behavior that option changed. The relative spread in fixed work
+was 8.6x rather than 3.0x and the deadline decision varied between runs, although
+the absolute duration range was slightly smaller. Rejected as unsupported, and
+not reproducible in this sample even where it is accepted.
+
+Pinning the shift while leaving host-time synchronization enabled reduced the
+spread to 0.4% in fixed work but left 3.6% in the single 20 ms sleep and about
+2.3% across the 100 one-millisecond sleeps, and any residual means a workload
+whose deadline sits near the boundary can still flip. Rejected as insufficient
+rather than wrong.
+
+Dropping `icount` entirely would remove the mechanism, but QEMU's record and
+replay require it, so this forfeits replay. Rejected.
+
+Enabling `align=on` aligns the virtual clock with the real clock, which is the
+opposite of the goal because it increases host coupling. Rejected.
+
+Declaring time-dependent behavior out of scope for supported workloads would
+avoid the problem by shrinking the workload class. Timeouts and retries are
+precisely the behavior worth testing, so this trades the increment for a smaller
+product. Rejected.
+
+Replacing the base model with a logical clock or an event scheduler is the most
+complete long-term answer, and it would not presuppose a fixed `icount` scale. It
+is a substantially larger design that would have to reproduce the whole-machine
+behavior the current model already provides, so it is deferred rather than
+rejected, and this increment's pinned model is a prerequisite for measuring
+whether it is needed.
+
+Virtualizing time behind a syscall or paravirtual boundary with a
+scenario-controllable clock is the right shape for the controllability need. It
+presupposes a pinned base model to perturb, so scheduling it first would mean
+designing a fault surface on top of a nondeterministic scale. Deferred.
+
+== Follow-up decision
+
+This increment removes a host-dependent variable rather than adding a
+capability. The recommended order below is the lowest-risk sequencing for this
+project, not a dependency inherent in every possible design.
+
+Pinning the clock first is worthwhile because variable clock scaling is an
+uncontrolled experimental variable in any timing-sensitive comparison.
+Exploration and seed sweeps benefit directly, although existing record and replay
+can already support sweeps whose individual failures retain their logs, and
+checkpoint mechanics can be investigated independently.
+
+Two capabilities remain candidates. Widening the compatibility surface decides
+whether real services can be tested at all, and it is the larger product
+question; each added interface must establish its own determinism boundary.
+Time and ordering fault injection decides whether timing hypotheses can be
+tested deliberately rather than merely reproduced, and it should be built on the
+model this increment pins. Deterministic input arrival is a third, potentially
+larger increment that this RFD identifies but does not resolve.
+
+RFD 3 is a reasonable product-evidence gate for deciding which of these matters
+most, because a representative workload is what makes any of them measurable. It
+is not a technical prerequisite for investigating them; this increment's own
+probe is evidence that useful measurement can precede a representative service.
+
+== Implementation
+
+Delivery phases are tracked in link:IMPLEMENTATION.org[RFD 4 implementation checklist].
+The pre-RFD measurement, its aggregate results, its caveats, and the commands
+that reproduce it are retained beside the probe in
+link:../../poc/time-model/EVIDENCE.adoc[the time-model evidence]; the raw
+per-run serial and replay artifacts stay in the untracked `.poc/` output
+directory. Validation results produced while implementing this proposal will be
+retained in `rfd/0004/EVIDENCE.adoc`.
+
+The probe and the evidence document are introduced by the companion change that
+adds `scripts/time-model-probe.sh` and `poc/time-model/EVIDENCE.adoc`; they are
+not part of this document's own change. This RFD's evidence therefore depends on
+that change, and the two must land together rather than this document first.
+
+== References
+
+* https://www.qemu.org/docs/master/system/replay.html[QEMU record/replay]
+* https://www.qemu.org/docs/master/system/invocation.html[QEMU invocation and `-icount`]
+* link:../../poc/time-model/EVIDENCE.adoc[Guest time-model measurements]
+* link:../0001/README.adoc[RFD 1: Deterministic execution proof of concept]
+* link:../0002/README.adoc[RFD 2: Deterministic network fault model]
+* link:../0003/README.adoc[RFD 3: Reproducible workload packaging]

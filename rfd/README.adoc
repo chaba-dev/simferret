@@ -16,6 +16,9 @@ authoritative merely because it exists; its `state` says how it should be read.
 
 | link:0003/README.adoc[3: Reproducible workload packaging]
 | Normalize standalone binaries and local OCI images into one deterministic guest workload
+
+| link:0004/README.adoc[4: Deterministic guest time model]
+| Remove host-dependent clock scaling and idle pacing from guest execution
 |===
 
 == Source format
