@@ -22,24 +22,24 @@ content-addressed guest workload, and preserve exact passive replay.
 
 * Phase 0 — Workload and OCI spikes
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
-- [ ] Boot and supervise an external static x86-64 Linux executable that is not
+- [X] Boot and supervise an external static x86-64 Linux executable that is not
   the SimFerret agent.
-- [ ] Build a minimal local OCI image layout containing the same executable and
+- [X] Build a minimal local OCI image layout containing the same executable and
   launch it without a registry or container daemon.
-- [ ] Build a second minimal OCI layout whose executable is dynamically linked
+- [X] Build a second minimal OCI layout whose executable is dynamically linked
   and whose interpreter and shared-library closure exist only in the image.
-- [ ] Select existing Rust parsing, archive, compression, and safe-filesystem
+- [X] Select existing Rust parsing, archive, compression, and safe-filesystem
   primitives before writing custom format handling.
-- [ ] Apply representative base and upper layers twice and verify a stable
+- [X] Apply representative base and upper layers twice and verify a stable
   normalized filesystem digest, including metadata, replacement, whiteout, and
   opaque-directory cases.
-- [ ] Prove that record mode can remove all live workload sources before QEMU
+- [X] Prove that record mode can remove all live workload sources before QEMU
   starts and that replay needs only the retained raw and derived
   content-addressed closure.
-- [ ] Record source sizes, expanded sizes, assembly duration, initramfs growth,
+- [X] Record source sizes, expanded sizes, assembly duration, initramfs growth,
   unsupported OCI constructs, and all observed nondeterminism.
 
 * Phase 1 — Typed specification and canonical assembler

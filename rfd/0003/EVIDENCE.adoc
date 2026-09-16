@@ -98,3 +98,459 @@ The complete five-file OCI layout is 82,932 bytes. These observations establish
 representative lower bounds only. They deliberately precede and do not choose
 descriptor-count, path, file, compressed-byte, expanded-byte, or cache limits;
 Phase 0 captures broader representative images before those limits are fixed.
+
+== Phase 0 workload and OCI spike
+
+The Phase 0 spike answers the packaging questions before any typed
+specification or assembler exists. It is throwaway prototype code under
+`poc/rfd3-phase0/` driven by `scripts/rfd3-phase0-spike.sh`; the Phase 1 Rust
+assembler replaces the prototype. The prototype deliberately reuses
+standard-library primitives (`json`, `tarfile`, `gzip`, `hashlib`) rather than
+hand-rolling container parsing, and it never extracts a layer with the host
+`tar` program.
+
+The checked-in command is:
+
+[source,shell]
+----
+.agents/dev ./scripts/rfd3-phase0-spike.sh
+----
+
+It compiles one external static executable and one dynamically linked
+executable from `poc/rfd3-workload/main.c`, builds four local OCI image
+layouts, applies representative layers twice, normalizes every source into a
+content-addressed store, removes the entire generated source tree, and only
+then records and passively replays each workload through one guest supervisor.
+The guest supervisor is a spike, not the Phase 2 agent: it launches the packaged
+program in a private `chroot`, feeds it a fixed command file, drains its output
+while it runs, and then kills and reaps every remaining guest process. It
+exposes no command protocol, makes no application-protocol assertions, and does
+not yet apply a normalized launch configuration.
+
+Every workload printed the same bounded exchange, and both replays of each
+source were byte-identical to its record:
+
+[source,text]
+----
+ready version=1
+echo value=asymmetric_42
+state value=fresh
+descendant state=escaped
+stopped status=0
+supervisor source=<source>
+supervisor workload_status=0
+supervisor cleanup_reaped=1
+supervisor output_bytes=101
+SIMFERRET_PHASE0_SUPERVISOR_OK version=1
+----
+
+`cleanup_reaped=1` is the escaped double-forked session leader the fixture
+creates: it survives the primary process, retains the workload output
+descriptor, and is killed and reaped only through the supervisor's
+whole-guest barrier. The output stream reached end of file only after that
+barrier, so no workload descriptor survived it.
+
+=== Representative sources
+
+The static fixture is built by the pinned musl static compiler and the dynamic
+fixture by the pinned glibc compiler with an explicit canonical interpreter
+path. Both are little-endian x86-64 Linux ELF executables.
+
+[cols="2,1,1,3",options="header"]
+|===
+| Source object | Bytes | Interpreter | SHA-256
+
+| Static executable
+| 70,760
+| none
+| `d54d4b2a92ace28707ce282a9734fbcdfec0cf30cf1bf0c4c7102bf7d95b6e5c`
+
+| Dynamic executable
+| 17,464
+| `/lib64/ld-linux-x86-64.so.2`
+| `564436ee235a187b6cd77c30331a66a4d65b243d5ab8aa23a3cabc0e27f9c227`
+
+| In-image loader
+| 263,056
+| ---
+| `0e470f96e41ddd98ac964b3b729df0becfa7562c8ba78ab3cab1822fa5498d23`
+
+| In-image `libc.so.6`
+| 2,404,904
+| ---
+| `8334bf4b6c5ab4939cab40f9c9594d0756d10dc6df3e5603593d223f7c538b02`
+|===
+
+The dynamic layout places the executable, the interpreter, and the shared
+library in the image only. The guest has no other filesystem, so the focused
+dynamic workload executed from its in-image loader and library closure.
+
+[cols="2,1,2",options="header"]
+|===
+| Layout | Bytes | Selected manifest digest
+
+| Static, one uncompressed layer
+| 82,862
+| `sha256:a143552c9fc2c01504eeb7c531d5661c4ab139fc488ca2175746e024787ee429`
+
+| Dynamic, gzip base layer plus uncompressed upper layer
+| 1,161,232
+| `sha256:a4247157fc885f8240537a0438859f66bf87035c299ba3c68ed688fc4d533440`
+
+| Layer-semantics, two uncompressed layers
+| 113,807
+| `sha256:2b5049c261612fe971e11d4fcde29ebea2290fa84006d6045e634c8cd56602a0`
+
+| Root-opacity, two uncompressed layers
+| ---
+| `sha256:52ca65520ee15a147a6f837765114fcf3b4829d9e4dbe679f1b6141a874333ff`
+|===
+
+The static layout reproduces the entry gate's config and manifest digests
+exactly (`63234a97...` and `a143552c...`), which confirms the canonical JSON and
+layer encoding are reproducible across independent generators. The entry gate's
+index annotation changes only `index.json` and therefore neither digest.
+
+=== Layer semantics and canonical identity
+
+The layer-semantics layout applies a base layer and an upper layer that
+exercise directory metadata updates, content and metadata replacement, a
+whiteout that removes a lower entry with no same-layer addition, a whiteout
+whose same-layer addition must survive, an opaque directory, a lower file
+replaced by an opaque directory, new nested directories, a relative symbolic
+link that escapes upward but stays inside the root, and a whiteout for a path
+that does not exist. The `opt` opaque marker and the root-opacity marker both
+appear *after* the additions they coexist with, so an implementation that
+applied markers in archive order would delete same-layer additions and change
+the result. The `etc/swap` marker deliberately precedes its addition, because
+it also covers a lower file replaced by an opaque directory.
+
+Applying it twice, in separate processes with different `PYTHONHASHSEED`
+values, produced one canonical digest over 19 entries and byte-identical
+materialized trees:
+
+[source,text]
+----
+semantics_canonical_digest=38782e7c828a0eec4ac79dc20ab30bf6ab3c0b10c3048b15265db4b0d74e27f0
+semantics_entries=19
+semantics_expanded_bytes=70808
+semantics_duration_ns=141189175
+semantics_reapply_equal=true
+----
+
+The observed final tree confirms each rule: `etc/` moved from mode `0755` to
+`0750`; `etc/config` was replaced by upper content with new metadata;
+`etc/remove-me` is the upper addition at mode `0600`, so the whiteout removed
+only the lower-layer entry; `etc/pure-delete` is absent, so a whiteout with no
+same-layer addition removes its lower entry; `etc/swap` is a directory
+containing `new`, so a lower file can be replaced by an opaque directory;
+`opt/keep`, `opt/drop`, and `opt/nested` are gone while `opt/new` survives the
+opaque marker that appears after it; `srv/opaque/lower` is untouched by an
+unrelated opaque marker; and both symbolic links kept their exact targets.
+
+The canonical digest also covers numeric ownership, which the host staging tree
+cannot reproduce because the spike runs unprivileged. The fixture sets `etc/` to
+canonical `2000:2000`; the materialized tree shows the host owner instead. That
+distinction is why the regression test asserts mode and modification time and
+not ownership, and it is why guest-visible nonzero ownership remains a Phase 2
+assembler and Phase 4 verification concern. Symlink modes are normalized to
+`0777` in the canonical model, because a Linux symbolic link has no settable
+mode, so the identity never claims a mode the guest cannot have.
+
+=== Root-level opacity
+
+A separate two-layer layout covers the root directory, because a root-level
+opaque marker in the main fixture would erase the executable. The base layer
+holds `bin/simferret-workload-fixture`, `keep/lower`, `drop`, and `dir/child`;
+the upper layer re-adds `bin`, `keep/upper`, and finally a root
+`.wh..wh..opq`. The resulting tree is exactly the upper layer's own additions:
+
+[source,text]
+----
+opacity_tree=./bin ./bin/simferret-workload-fixture ./keep ./keep/upper
+----
+
+That proves root opacity removes lower-layer descendants rather than nothing,
+and that it leaves same-layer additions alone even though the marker is last.
+
+=== Content-addressed closure and live-source removal
+
+Each source produces one raw closure and one derived entry. Raw evidence is the
+opened executable plus the canonical specification for a binary, and
+`oci-layout`, `index.json`, the selected manifest, the config, and each stored
+layer for OCI. The prototype re-derives the canonical tree from the raw objects
+on every replay and refuses to proceed when a raw object is missing, corrupt, or
+inconsistent with its recorded size and digest.
+
+Replay also verifies more than the tree. The binary specification is re-parsed
+from its verified raw object rather than read back from the closure record, so
+editing the record cannot change the launch the store reproduces; the
+re-derived launch, layer evidence, policy versions, and limits are each compared
+against the closure; and the closure record is pinned by a digested lock, so
+editing it is detected even when the edit is internally consistent. The lock
+belongs in the run manifest in the Phase 1 assembler; the store-sidecar lock is
+the prototype equivalent. It is a corruption detector, not an authentication
+mechanism: replacing the raw objects, the closure, the sidecar, and the derived
+lock consistently would produce another self-consistent recording, which is the
+same limitation RFD 3 records for content digests generally.
+
+[cols="1,1,1,1,1",options="header"]
+|===
+| Source | Raw bytes | Expanded bytes | Canonical digest | Assembly
+
+| Binary
+| 70,932
+| 70,760
+| `a94f6f18...fe8da3c1`
+| 68.1 ms
+
+| Static OCI
+| 82,862
+| 70,760
+| `a94f6f18...fe8da3c1`
+| 69.0 ms
+
+| Dynamic OCI
+| 1,161,232
+| 2,685,424
+| `37967c0d...5ff32a273`
+| 92.6 ms
+|===
+
+The standalone static executable and the static OCI layout converged on the
+same canonical filesystem digest, so both sources enter the same runtime
+boundary even though their raw closures differ. Reassembling the binary source
+into a second store produced a byte-identical `closure.json`.
+
+Every source is assembled before any QEMU invocation, and then the complete
+generated source tree is deleted and its absence asserted. The regression test
+independently fails any QEMU run that starts while a `sources` directory still
+exists, so moving deletion later cannot pass unnoticed. What this demonstrates
+is workload-input closure: the assembler, supervisor, kernel, and QEMU are
+pinned environment dependencies and are still read from the repository or the
+pinned store.
+
+=== Record and passive replay
+
+Each source was recorded once and passively replayed twice with the live
+sources absent. The baseline is a workload-free image containing only the
+supervisor, so the growth column is the workload plus the launch-harness
+`/etc` files, measured against a supervisor-only image rather than against an
+empty initramfs.
+
+[cols="2,1,1,1,1,1",options="header"]
+|===
+| Source | Initramfs bytes | Growth over baseline | Workload tree bytes | Record | Replay 1 | Replay 2
+
+| Binary
+| 52,336
+| 31,397
+| 70,760
+| 6.66 s
+| 12.79 s
+| 12.75 s
+
+| Static OCI
+| 52,337
+| 31,398
+| 70,760
+| 6.27 s
+| 10.26 s
+| 10.24 s
+
+| Dynamic OCI
+| 1,172,605
+| 1,151,666
+| 2,685,424
+| 6.63 s
+| 11.82 s
+| 11.84 s
+|===
+
+The workload-free baseline is 20,939 bytes. Replay logs were 10,488,297,
+7,578,583, and 10,066,941 bytes. Record serial streams had SHA-256 digests
+`a5bce29a...a3cc6c565`, `e3ad35b9...432f06702`, and `e9ab5d7e...20b150cb`; both
+replays of each source matched their record byte for byte, and those digests are
+unchanged from the pre-fix runs, so the supervisor's concurrent draining
+preserved the guest-visible output exactly. The initramfs is smaller than the
+workload tree for the static sources because the archive is gzip-compressed.
+Repeated independent runs reproduced every canonical digest and serial digest
+exactly; only durations and replay-log sizes moved with host scheduling, so no
+divergence, retry, or nondeterminism was observed in semantic output.
+
+=== Unsupported OCI constructs
+
+Eighteen representative constructs were refused before any output was
+materialized, and each left no partial directory:
+
+[cols="1,3",options="header"]
+|===
+| Construct | Observed rejection
+
+| Absolute layer path
+| `absolute layer path '/etc/passwd'`
+
+| Escaping layer path
+| `escaping layer path '../escape'`
+
+| Hard link
+| `hard link at 'bin/second'`
+
+| Setuid mode
+| `setuid or setgid mode at 'bin/simferret-workload-fixture'`
+
+| Device node
+| `unsupported file type at 'dev/null'`
+
+| Duplicate path in one layer
+| `duplicate layer path 'bin/simferret-workload-fixture'`
+
+| Traversal through a symbolic link
+| `path 'redirect/file' traverses symlink 'redirect'`
+
+| Oversized file
+| `file 'data/oversized' exceeds 16777216 bytes`
+
+| Unsupported layer media type
+| `unsupported layer media type 'application/vnd.oci.image.layer.v1.tar+zstd'`
+
+| Wrong platform
+| `selected descriptor is not linux/amd64`
+
+| Stored-layer to DiffID mismatch
+| `layer 0 DiffID does not match uncompressed bytes`
+
+| Unsupported rootfs type
+| `config rootfs type is not layers`
+
+| Corrupt stored blob
+| `layer 0 descriptor digest does not match stored bytes`
+
+| Missing stored blob
+| `cannot open file 'blobs/sha256/f1805652...a92dcbab'`
+
+| Nonempty whiteout marker
+| `whiteout marker at '.wh.victim' is not an empty regular file`
+
+| Marker path through a symbolic link
+| `marker 'redirect/victim' traverses symlink 'redirect'`
+
+| Chained symbolic link that escapes the root
+| `escaping symbolic link target at 'b'`
+
+| Whiteout marker that is not a basename
+| `whiteout marker '.wh.a' is not a basename`
+|===
+
+The prototype also rejects FIFOs, sockets, sparse files, empty or malformed
+digests, empty manifests, numeric metadata outside its serializable range, an
+opaque marker whose parent is still a non-directory after the layer is applied,
+and invalid launch fields such as non-numeric or root credentials, duplicate
+environment names, non-absolute working directories, volumes, and stop signals.
+Its limits are prototype-local policy: 64 MiB stored layer, 256 MiB expanded
+layer, 16 MiB file, 4,096 entries, 16 layers, 1,024-byte path, 4,096-byte
+symbolic link target, 40 symbolic link expansions, 64 raw closure objects, and
+a 4 MiB bound on cache metadata files. Phase 1 replaces them with the limits the
+RFD fixes. The cache bound matters because replay reads `closure.json`,
+`tree.json`, and the derived lock through the same bounded beneath-root reader
+as raw objects, and a materialized tree containing a special file is rejected
+rather than read.
+
+Two deviations from the RFD's stated profile are deliberate and recorded for
+Phase 1. Python's `tarfile` consumes GNU `longname` and `longlink` records
+transparently, so a layer using them is accepted even though the prototype
+rejects PAX headers; detecting the physical extension records would mean
+re-implementing tar parsing, which the RFD forbids. And descriptor `urls` and
+embedded `data` are not yet rejected, because the prototype only ever opens
+local `blobs/sha256/` paths; that is a Phase 1 rejection requirement, not a
+safety gap, since nothing is fetched.
+
+The derived entry is also shaped differently from the RFD: it contains
+`tree.json`, the materialized tree, and a lock naming the closure, while the
+RFD describes a derived entry that names its complete raw closure. The
+relationship is recorded, but in the closure record rather than in the derived
+entry, so Phase 1 should decide which direction the RFD intends.
+
+=== Rust primitive selection
+
+The Phase 1 assembler should select existing primitives before writing custom
+format handling. The spike evaluated the pinned workspace dependencies and the
+candidate crates:
+
+[cols="1,1,3",options="header"]
+|===
+| Concern | Selection | Rationale
+
+| JSON
+| `serde` 1.0 and `serde_json` 1.0
+| Already pinned in the workspace; serde's default of ignoring unknown fields
+  matches the OCI forward-compatibility requirement without relaxing explicit
+  rejection of unsupported selected values.
+
+| Digests
+| `sha2` 0.10
+| Already pinned; supplies descriptor, DiffID, and canonical-identity SHA-256
+  without a C dependency.
+
+| Gzip
+| `flate2` 1.1 with `rust_backend`
+| Already pinned with the pure-Rust backend, so layer decompression is
+  reproducible and does not link a system zlib. Decompression still needs an
+  explicit expanded-byte bound because the reader can expand past a limit.
+
+| Tar
+| `tar` 0.4
+| Streams USTAR/PAX entries without extracting them and exposes entry type,
+  mode, ownership, link target, and size so the assembler can reject hard
+  links, devices, sparse files, and setuid modes itself. The prototype's GNU
+  longname experience is the reason to inspect physical extension records
+  deliberately rather than rely on a library's convenience behavior.
+
+| Safe filesystem access
+| `rustix` 1.1
+| Exposes `openat`-style calls with `O_NOFOLLOW`, `O_NONBLOCK`, and directory
+  file descriptors so every source read and staging write stays beneath one
+  opened root. `O_NONBLOCK` is required: a blocking open on a FIFO waits for a
+  writer instead of rejecting the special file. `cap-std` 4.0 is the
+  alternative but is a larger abstraction than this increment needs.
+
+| OCI types
+| Minimal `serde` structs, with `oci-spec` 0.10 as a reference
+| The bounded profile needs strict rejection of unsupported selected values and
+  deliberate ignoring of unrelated fields, which minimal structs express
+  directly. `oci-spec` remains the reference for media-type and field naming.
+|===
+
+None of these crates is added to the workspace in Phase 0. The prototype is
+Python so that a wrong policy costs a spike edit instead of an assembler
+rewrite; Phase 1 adopts the selection above and its pinned versions.
+
+=== Phase 0 regression tests
+
+The focused command is:
+
+[source,shell]
+----
+.agents/dev ./scripts/rfd3-phase0-spike-test.sh
+----
+
+It fakes the QEMU invocation and checks that one successful run records exactly
+three QEMU invocations per source, removes the whole generated source tree, and
+writes the expected evidence keys. The fake refuses to start while a `sources`
+directory exists, so a regression that moved deletion after QEMU would fail
+rather than pass. It fails divergent, incomplete, and infrastructure-failure
+guest output, and it requires invalid duration bounds to fail before QEMU
+starts.
+
+It then exercises the prototype directly: the layer-semantics digest and tree
+are stable and include a pure-deletion whiteout, an opaque directory after its
+same-layer addition, and a file replaced by an opaque directory; root-level
+opacity produces exactly the upper layer's additions; the binary and static OCI
+sources converge; repeated layout generation is byte-stable; a missing, corrupt,
+or tampered raw object, a tampered derived entry, an edited closure record, a
+closure whose launch no longer matches its specification, a closure missing its
+specification object, an oversized closure record, and a special file inside a
+cached tree all fail materialization; a symbolic-link source is rejected; a
+whiteout whose parent the same layer replaces with a symbolic link is accepted
+while a marker inside a lower-layer symbolic link is refused; and every
+unsupported construct is refused without partial output.
