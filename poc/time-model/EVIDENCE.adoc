@@ -1,0 +1,268 @@
+= SimFerret guest time-model measurements
+
+This document records a determinism measurement that is not yet attached to an
+implemented increment. It answers one question with evidence: is guest-observable
+time a reproducible function of a fixed VM configuration?
+
+The measurement is `scripts/time-model-probe.sh`, which boots
+`poc/time-model/probe.c` as the guest init under one pinned `-icount`
+configuration and repeats it. The probe takes four time measurements and one
+control:
+
+* `sleep` — the observed duration of one 20 ms `nanosleep`;
+* `spin` — how many fixed CPU chunks complete before the first poll that finds
+  the window expired (a polling-quantized count that includes the terminating
+  batch, not throughput inside the window; see the caveats);
+* `race` — the virtual elapsed time of a fixed 2,000,000-iteration computation,
+  compared against a 20 ms deadline;
+* `sleep_loop` — the observed duration of 100 consecutive 1 ms sleeps; and
+* `checksum` — a value derived only from the fixed computation, so it is a
+  function of that computation's result.
+
+Raw per-run serial output, replay logs, and durations are written to a unique
+`.poc/time-model-probe/run.*` directory and are deliberately untracked. This
+document records the aggregate results and the commands that reproduce them.
+
+== QEMU's documented model
+
+The measurements only make sense against QEMU's documented semantics for the
+options under test. From the QEMU invocation reference:
+
+* `-icount shift=N`: "The virtual cpu will execute one instruction every 2^N ns
+  of virtual time." A larger `N` therefore makes the virtual clock run faster
+  relative to executed instructions.
+* `-icount shift=auto`: "the virtual cpu speed will be automatically adjusted to
+  keep virtual time within a few seconds of real time", so the conversion is
+  chosen against host speed.
+* `-icount sleep=off`: "the virtual time will jump to the next timer deadline
+  instantly whenever the virtual cpu goes to sleep mode and will not advance if
+  no timer is enabled. This behavior gives deterministic execution times from
+  the guest point of view." The default when icount is enabled is `sleep=on`.
+* `sleep=off` "cannot be used together with either `shift=auto` or `align=on`".
+* `-rtc clock=vm` "is recommended especially in icount mode in order to preserve
+  determinism; however, note that in icount mode the speed of the virtual clock
+  is variable and can in general differ from the host clock."
+
+Two consequences shape the reading of the results below. QEMU itself states that
+the virtual clock speed is variable under icount, which is consistent with the
+elapsed-time variation these measurements report. And because `sleep=off` is
+documented as incompatible with `shift=auto`, pinning the scale is not merely
+preferable but required in order to use the option QEMU describes as giving
+deterministic execution times.
+
+== Results
+
+Five runs per configuration, except `shift=4,sleep=off` which used three. All
+runs completed; no run was skipped.
+
+[cols="2,1,1,1,1",options="header"]
+|===
+| `-icount` options | Reproducible | Fixed work | Replay log | Run wall time
+
+| `shift=auto` (default `sleep=on`)
+| no, 4/4 metrics vary
+| 42.65–126.05 ms (3.0x)
+| 4,653,579–10,094,763 B, all distinct
+| 6.77–6.80 s
+
+| `shift=auto,sleep=off` (unsupported combination)
+| no, 4/4 metrics vary
+| 10.21–88.19 ms (8.6x)
+| 199,665–234,497 B, all distinct
+| 5.66–6.16 s
+
+| `shift=7` (default `sleep=on`)
+| no, 3/4 metrics vary
+| 2253.86–2262.97 ms (0.4%)
+| 4,677,667–5,249,009 B, all distinct
+| 13.81–14.45 s
+
+| `shift=7,sleep=off`
+| *yes*, 0/4 metrics vary
+| 2262.14 ms exact
+| 3,303,901 B exact
+| 13.36–13.95 s
+
+| `shift=4,sleep=off`
+| *yes*, 0/4 metrics vary
+| 182.04 ms exact
+| 330,255 B exact
+| 6.51–6.64 s
+|===
+
+The `shift=auto,sleep=off` row is a combination QEMU documents as unsupported.
+It was measured because the pinned QEMU accepts it in a fresh process, and it is
+reported as an empirical observation rather than as an isolated variable:
+adding `sleep=off` to `shift=auto` did not reduce the variation in this sample,
+and this measurement does not establish which behavior that option changed.
+
+The remaining measurements, with the value each configuration produced:
+
+[cols="2,1,1,1",options="header"]
+|===
+| `-icount` options | 20 ms sleep | 100 × 1 ms sleeps | Spin chunks
+
+| `shift=auto`
+| 20.082–20.102 ms
+| 119.37–147.92 ms (24% spread)
+| 64 or 128
+
+| `shift=auto,sleep=off`
+| 20.057–20.077 ms
+| 105.66–114.65 ms
+| 128, 256, or 448
+
+| `shift=7`
+| 20.907–21.669 ms (3.6% spread)
+| 203.19–207.92 ms
+| 64
+
+| `shift=7,sleep=off`
+| 20.948 ms exact
+| 207.06 ms exact
+| 64
+
+| `shift=4,sleep=off`
+| 21.951 ms exact
+| 117.78 ms exact
+| 64
+|===
+
+`shift=10` is a separate observation from an earlier exploratory run, not from
+this probe: it used the RFD 3 workload fixture rather than `poc/time-model`, and
+default `sleep` behavior. No guest output appeared within a 180-second deadline
+and the replay log reached 117 MB. Those raw artifacts were not retained. It
+therefore establishes only that no guest output was observed before the
+deadline under those conditions, and not that `shift=10` cannot boot.
+
+== What the control does and does not establish
+
+The checksum is derived only from the fixed 2,000,000-iteration computation, so
+it is uncontaminated by time-dependent work. It matched in every configuration
+and every run.
+
+That establishes a narrow and sufficient fact: **the fixed computation produced
+the same result while its measured virtual duration varied.** For example, the
+same computation measured 42.65 ms and 126.05 ms of virtual time in two runs
+under the default configuration while returning the same checksum.
+
+It does **not** establish that the guest executed an identical instruction
+stream. The `spin` chunk counts differ between runs under the default
+configuration, which demonstrates that it did not. Any claim that the guest's
+execution is already deterministic in the sense of executing the same
+instructions is unsupported by this data, and the default configuration
+falsifies it.
+
+== Interpretation
+
+What is not reproducible is the elapsed guest time measured for the same fixed
+source-level work. The probe measures elapsed time; it does not count executed
+instructions or measure the conversion coefficient directly, so the readings
+below are consistent with a variable conversion rather than a measurement of it.
+Under the default configuration, five runs of the same guest with the same inputs
+and the same initramfs produced:
+
+* a 3.0x spread in the virtual duration of a fixed computation;
+* a 24% spread across 100 one-millisecond sleeps; and
+* replay logs spanning 4.65 MB to 10.09 MB with five distinct digests.
+
+The most consequential result is the deadline decision. Under
+`shift=auto,sleep=off`, the fixed computation measured against a fixed 20 ms
+deadline answered `within_deadline=yes` on one run and `no` on the others. A
+timeout, retry, backoff, TTL, deadline, or rate limit can therefore take a
+different branch between two runs of the same binary with the same inputs. That
+is the class of behavior this platform exists to test, and it would present as
+flakiness in the workload rather than as a platform defect.
+
+Pinning the scale and disabling host-paced idle advancement removes it in this
+sample. Under `shift=4,sleep=off` and `shift=7,sleep=off`, every measurement was
+exact across runs, the serial output was byte-identical, and the replay log had
+an identical size.
+
+Pinning alone was not sufficient in this sample. `shift=7` with the default
+`sleep=on` left a 0.4% spread in fixed work and 3.6% in the single 20 ms sleep,
+which is consistent with host-paced idle advancement still coupling the run to
+real time. Both options were required among the tested configurations, which is
+consistent with QEMU documenting `sleep=off` as incompatible with `shift=auto`.
+
+Observed sleep overshoot is a property of the model in this sample. The `sleep`
+measurement spans the timer, scheduling, and execution around the sleep, so it
+records an overshoot rather than isolating wakeup latency, and overshoot alone
+establishes neither a defect nor the absence of one. A 20 ms sleep
+overshot by 0.082–0.102 ms under `auto`, 0.948 ms at `shift=7,sleep=off`, and
+1.951 ms at `shift=4,sleep=off`. In this sample pinning trades a smaller but
+variable overshoot for a repeatable one, which is the right trade for
+reproducibility and should be documented rather than minimized.
+
+== Replay logs
+
+At `shift=7,sleep=off` every run wrote exactly 3,303,901 bytes, yet all five
+digests differed. The header is byte-identical and the differences are scattered
+across the final 49,971 bytes: comparing runs 1 and 2 found 1,029 differing
+bytes, the first at one-based byte position 3,253,931 and the last at 3,301,938,
+and comparisons against runs 3 to 5 found 1,030 to 1,036 differing bytes.
+
+Equal size across five runs is therefore not evidence of equal content, and the
+raw replay log is not a suitable identity for comparing independent recordings.
+The payloads of the differing regions were not decoded, so their meaning is
+undetermined. This is consistent with RFD 2's evidence, which already records
+that replay-log size and wall-clock duration vary across recordings and hosts
+and that they are measurements rather than replay identity.
+
+== Script contract
+
+The harness reports rather than fails on variation, because variation is the
+finding it exists to detect. It fails only when the experiment itself is
+invalid:
+
+* a run that exits nonzero, times out, or does not report exactly one well-formed
+  row per measurement is recorded in `incomplete.txt` and skipped, and the
+  remaining runs still execute;
+* aggregation uses completed runs only and only those validated rows, so a
+  partial, truncated, or duplicated measurement cannot contribute to the
+  comparison;
+* fewer than two completed runs yields `verdict=inconclusive` rather than a
+  reproducibility claim;
+* a varying control checksum aborts with an explicit error, because it means the
+  runs did not produce the same fixed-work result; and
+* no completed run at all aborts with an explicit error.
+
+A future continuous-integration gate should require `verdict=reproducible`
+explicitly and require every requested run to complete, which is stricter than
+this diagnostic's current policy.
+
+== Caveats
+
+* QEMU documents that a larger `shift` assigns more virtual time per instruction,
+  which is consistent with the boot behavior observed here, but this measurement
+  does not test that model directly. In particular, the cause of the exploratory
+  `shift=10` no-output result was not established.
+* All measurements come from one x86-64 Linux host. Host load, CPU frequency,
+  and cgroup scheduling were not controlled; they cannot invalidate the negative
+  observation, because host sensitivity is exactly what a fixed VM
+  configuration must exclude, but they do limit any claim that a particular
+  option *caused* a particular variance.
+* `sleep=off` removes artificial host sleeping, so a guest waiting on a timer is
+  no longer throttled to real time. Whether long virtual waits complete
+  substantially faster than wall time is not measured here.
+* The `spin` measurement polls the clock only once per 64 chunks, and each
+  polling batch can already exceed the nominal 20 ms window at coarse scales.
+  Its counts include the terminating batch and are quantized by that polling, so
+  the differences between configurations should not be read as throughput
+  ratios.
+* Three and five runs per configuration are enough to demonstrate variation but
+  not to bound it. The exact rates are not estimates of a distribution.
+* The probe uses one workload shape. It does not cover interrupt coalescing under
+  load, multi-vCPU behavior, device-timer interaction, or the ordering of guest
+  timers against live host input.
+
+== Commands
+
+[source,shell]
+----
+.agents/dev ./scripts/time-model-probe.sh
+SIMFERRET_ICOUNT_OPTIONS=shift=4,sleep=off .agents/dev ./scripts/time-model-probe.sh
+SIMFERRET_ICOUNT_OPTIONS=shift=auto,sleep=off SIMFERRET_TIME_MODEL_RUNS=5 \
+  .agents/dev ./scripts/time-model-probe.sh
+.agents/dev ./scripts/time-model-probe-test.sh
+----
