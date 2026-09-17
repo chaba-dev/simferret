@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,12 +13,12 @@ use sha2::{Digest, Sha256};
 
 use crate::assertions::{AssertionReport, evaluate};
 use crate::checker::{
-    ESCAPED_DESCENDANT_LINE, FRESH_STATE_LINE, WorkloadTrace, echo_token, evaluate_workload,
-    expected_network_line, request_phase,
+    ESCAPED_DESCENDANT_LINE, FRESH_STATE_LINE, READY_LINE, WorkloadTrace, echo_token,
+    evaluate_workload, expected_network_line, request_phase,
 };
 use crate::protocol::{
-    Command, CommandFrame, Event, EventFrame, NormalizedEvent, PROTOCOL_VERSION, RequestPhase,
-    encode_bytes,
+    Command, CommandFrame, Event, EventFrame, MAX_FRAME_LENGTH, MAX_STDIN_FRAME_BYTES,
+    NormalizedEvent, PROTOCOL_VERSION, RequestPhase, encode_bytes,
 };
 use crate::scenario::{
     ChoicePlan, MAX_SCENARIO_SOURCE_BYTES, PlannedRequest, Scenario, WorkloadChoicePlan,
@@ -328,9 +328,23 @@ fn record_with_adapter_and_assets(
             workload,
         } = outcome;
         diagnostics.stage = "publication".into();
+        // A published run must be replayable, so the event stream is required to
+        // fit the replay artifact limit before anything is written.
         let event_bytes = encode_events(&events)?;
+        if event_bytes.len() > MAX_SEMANTIC_ARTIFACT_BYTES {
+            return Err(invalid_data(format!(
+                "the recorded event stream is {} bytes, which exceeds the {MAX_SEMANTIC_ARTIFACT_BYTES}-byte replay limit, so the run would not be replayable",
+                event_bytes.len()
+            )));
+        }
         write_private(staging.path.join("events.jsonl"), &event_bytes)?;
         let assertion_bytes = json_bytes(&assertions)?;
+        if assertion_bytes.len() > MAX_SEMANTIC_ARTIFACT_BYTES {
+            return Err(invalid_data(format!(
+                "the assertion report is {} bytes, which exceeds the {MAX_SEMANTIC_ARTIFACT_BYTES}-byte replay limit",
+                assertion_bytes.len()
+            )));
+        }
         write_private(staging.path.join("assertions.json"), &assertion_bytes)?;
         let choice_bytes = fs::read(staging.path.join("choices.json"))?;
         let scenario_bytes = fs::read(staging.path.join("scenario.toml"))?;
@@ -485,6 +499,7 @@ fn record_workload_scenario(
         template_sha256,
         launch: loaded.launch.clone(),
     };
+    validate_workload_control_frames(&loaded.launch, &choices)?;
     let image = build_guest_image_with_assets(
         &options.executable,
         &options.runs_directory,
@@ -858,6 +873,7 @@ fn replay_workload_scenario(
             "recorded choice plan does not match the scenario and seed",
         ));
     }
+    validate_workload_control_frames(&loaded.launch, &choices)?;
     let (expected_events, expected_event_bytes) = read_recorded_events(directory)?;
     let (expected_assertions, expected_assertion_bytes) = read_recorded_assertions(directory)?;
     if !valid_profile(
@@ -996,7 +1012,9 @@ fn read_recorded_events(directory: &Path) -> io::Result<(Vec<NormalizedEvent>, V
     for (index, event) in expected_events.iter().enumerate() {
         if event.protocol_version != PROTOCOL_VERSION || event.event_id != index as u64 + 1 {
             return Err(invalid_data(format!(
-                "recorded event envelope is invalid at index {index}: {event:#?}"
+                "recorded event envelope is invalid at index {index}: {} at event {}",
+                event.event.describe(),
+                event.event_id
             )));
         }
     }
@@ -1114,7 +1132,10 @@ fn drive_scenario_inner(
         event => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("expected assertion report, received {event:?}"),
+                format!(
+                    "expected an assertions-evaluated report, received {}",
+                    event.describe()
+                ),
             ));
         }
     };
@@ -1189,9 +1210,10 @@ impl<'a> Controller<'a> {
                 io::Error::new(
                     error.kind(),
                     format!(
-                        "failed receiving event {}/{} for command {command_id} ({command:?}): {error}",
+                        "failed receiving event {}/{} for the {} command: {error}",
                         event_index + 1,
-                        expected_events
+                        expected_events,
+                        command.kind()
                     ),
                 )
             })?;
@@ -1295,8 +1317,10 @@ fn validate_response(command: &Command, event_index: usize, frame: &EventFrame) 
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "event {} does not match command {command:?}: {frame:?}",
-                event_index + 1
+                "event {} ({}) does not match the {} command",
+                event_index + 1,
+                frame.event.describe(),
+                command.kind()
             ),
         ))
     }
@@ -1368,6 +1392,63 @@ fn workload_steps(choices: &WorkloadChoicePlan) -> Vec<WorkloadStep> {
     steps
 }
 
+/// Preflight the control frames a workload run serializes before QEMU starts.
+///
+/// The launch identity is the largest command the host sends, and each planned
+/// input line must fit the runtime's decoded input bound, so an identity or
+/// payload that cannot be delivered is rejected during preparation rather than
+/// after a successful launch.
+fn validate_workload_control_frames(
+    launch: &LaunchIdentity,
+    choices: &WorkloadChoicePlan,
+) -> io::Result<()> {
+    fn frame_bytes(command: Command) -> io::Result<usize> {
+        let frame = CommandFrame {
+            protocol_version: PROTOCOL_VERSION,
+            command_id: u64::MAX,
+            command,
+        };
+        Ok(serde_json::to_vec(&frame).map_err(io::Error::other)?.len())
+    }
+
+    let start = frame_bytes(Command::Start {
+        invocation: 1,
+        launch: launch.clone(),
+    })?;
+    if start > MAX_FRAME_LENGTH {
+        return Err(invalid_data(format!(
+            "the materialized launch identity needs a {start}-byte start command, which exceeds the {MAX_FRAME_LENGTH}-byte control frame limit"
+        )));
+    }
+    let mut widest = 0;
+    let mut widest_request = "";
+    for request in &choices.requests {
+        let text = format!("fetch {} {}\n", request.request_id, request.payload);
+        if text.len() > MAX_STDIN_FRAME_BYTES {
+            return Err(invalid_data(format!(
+                "the planned input for {} is {} bytes, which exceeds the {MAX_STDIN_FRAME_BYTES}-byte input limit",
+                request.request_id,
+                text.len()
+            )));
+        }
+        if text.len() > widest {
+            widest = text.len();
+            widest_request = &request.request_id;
+        }
+    }
+    let input = frame_bytes(Command::StdinWrite {
+        invocation: u64::MAX,
+        offset: u64::MAX,
+        bytes: encode_bytes(&vec![0_u8; widest]),
+    })?;
+    if input > MAX_FRAME_LENGTH {
+        return Err(invalid_data(format!(
+            "the planned input for {widest_request} needs a {input}-byte command frame, which exceeds the {MAX_FRAME_LENGTH}-byte control frame limit"
+        )));
+    }
+    Ok(())
+}
+
 /// The workload control loop. Unlike the network controller, responses to a
 /// command are interleaved with live output frames, so it reads until the
 /// expected typed event or response line appears and folds every frame into the
@@ -1383,6 +1464,11 @@ struct WorkloadController<'a> {
     events: Vec<NormalizedEvent>,
     trace: WorkloadTrace,
     consumed_lines: BTreeMap<u64, usize>,
+    /// Events that arrived ahead of the command they belong to. Passive replay
+    /// can deliver a guest's events faster than the driver issues their commands,
+    /// so a drain stops at the first event for an unissued command and keeps it
+    /// here, preserving the exact read order.
+    pending: VecDeque<EventFrame>,
 }
 
 impl<'a> WorkloadController<'a> {
@@ -1403,6 +1489,7 @@ impl<'a> WorkloadController<'a> {
             events: Vec::new(),
             trace: WorkloadTrace::default(),
             consumed_lines: BTreeMap::new(),
+            pending: VecDeque::new(),
         }
     }
 
@@ -1422,12 +1509,21 @@ impl<'a> WorkloadController<'a> {
         Ok(command_id)
     }
 
-    fn receive_one(&mut self) -> io::Result<EventFrame> {
-        let frame = self.vm.receive()?;
-        if frame.protocol_version != PROTOCOL_VERSION || frame.event_id != self.next_event_id {
+    /// Fold one received frame into the trace and the replay comparison. The
+    /// command identifier must name a command that was actually issued, and the
+    /// event identifier must continue the stream.
+    fn absorb(&mut self, frame: EventFrame) -> io::Result<EventFrame> {
+        if frame.protocol_version != PROTOCOL_VERSION
+            || frame.event_id != self.next_event_id
+            || frame.command_id == 0
+            || frame.command_id >= self.next_command_id
+        {
             return Err(invalid_data(format!(
-                "unexpected event envelope: version={}, event_id={}, command_id={}",
-                frame.protocol_version, frame.event_id, frame.command_id
+                "unexpected event envelope: version={}, event_id={}, command_id={} (last issued command {})",
+                frame.protocol_version,
+                frame.event_id,
+                frame.command_id,
+                self.next_command_id.saturating_sub(1)
             )));
         }
         self.next_event_id += 1;
@@ -1438,12 +1534,18 @@ impl<'a> WorkloadController<'a> {
                 Some(expected) if expected == &normalized => {}
                 Some(expected) => {
                     return Err(invalid_data(format!(
-                        "normalized event divergence at index {index}\nexpected: {expected:#?}\nactual: {normalized:#?}"
+                        "normalized event divergence at index {index}: expected {} at event {}, found {} at event {}",
+                        expected.event.describe(),
+                        expected.event_id,
+                        normalized.event.describe(),
+                        normalized.event_id
                     )));
                 }
                 None => {
                     return Err(invalid_data(format!(
-                        "replay produced surplus normalized event at index {index}\nactual: {normalized:#?}"
+                        "replay produced surplus normalized event at index {index}: {} at event {}",
+                        normalized.event.describe(),
+                        normalized.event_id
                     )));
                 }
             }
@@ -1455,8 +1557,38 @@ impl<'a> WorkloadController<'a> {
         Ok(frame)
     }
 
+    fn receive_one(&mut self) -> io::Result<EventFrame> {
+        let frame = match self.pending.pop_front() {
+            Some(frame) => frame,
+            None => self.vm.receive()?,
+        };
+        self.absorb(frame)
+    }
+
+    /// Fold every already-queued event that belongs to an issued command into the
+    /// trace without waiting. A closed channel is still an error: the guest ended
+    /// without its shutdown handshake.
+    fn drain(&mut self) -> io::Result<()> {
+        loop {
+            let frame = match self.pending.pop_front() {
+                Some(frame) => frame,
+                None => match self.vm.try_receive()? {
+                    Some(frame) => frame,
+                    None => return Ok(()),
+                },
+            };
+            if frame.command_id >= self.next_command_id {
+                self.pending.push_back(frame);
+                return Ok(());
+            }
+            self.absorb(frame)?;
+        }
+    }
+
     /// Read until the expected typed event for the just-issued command arrives,
-    /// folding live output frames into the trace.
+    /// folding live output frames into the trace. An output frame is
+    /// asynchronous and may still be attributed to an earlier command, but every
+    /// other event must name the command that is being awaited.
     fn expect(
         &mut self,
         command_id: u64,
@@ -1465,52 +1597,134 @@ impl<'a> WorkloadController<'a> {
     ) -> io::Result<EventFrame> {
         loop {
             let frame = self.receive_one()?;
+            if predicate(&frame.event) {
+                if frame.command_id != command_id {
+                    return Err(invalid_data(format!(
+                        "the {} response carries command {} instead of {command_id}",
+                        frame.event.kind(),
+                        frame.command_id
+                    )));
+                }
+                return Ok(frame);
+            }
             if frame.command_id > command_id {
                 return Err(invalid_data(format!(
-                    "event for a later command arrived while waiting for {description}"
+                    "an event for command {} arrived while waiting for {description}",
+                    frame.command_id
                 )));
-            }
-            if predicate(&frame.event) {
-                return Ok(frame);
             }
             if !matches!(frame.event, Event::WorkloadOutput { .. }) {
                 return Err(invalid_data(format!(
-                    "unexpected event while waiting for {description}: {:#?}",
-                    frame.event
+                    "unexpected {} while waiting for {description}",
+                    frame.event.describe()
                 )));
             }
         }
+    }
+
+    /// Read until the acknowledgement of the just-issued input command, or until
+    /// the invocation ends first. The acknowledgement must name the same
+    /// invocation, carry the exact number of bytes that were sent, and end at the
+    /// expected offset.
+    fn await_input_accepted(
+        &mut self,
+        command_id: u64,
+        invocation: u64,
+        expected_start: u64,
+        sent: u64,
+    ) -> io::Result<bool> {
+        loop {
+            let frame = self.receive_one()?;
+            match &frame.event {
+                Event::InputAccepted {
+                    invocation: actual,
+                    offset,
+                    bytes,
+                    eof,
+                } => {
+                    if frame.command_id != command_id {
+                        return Err(invalid_data(format!(
+                            "the input-accepted response carries command {} instead of {command_id}",
+                            frame.command_id
+                        )));
+                    }
+                    if *actual != invocation
+                        || *eof
+                        || *offset != expected_start + sent
+                        || *bytes != sent
+                    {
+                        return Err(invalid_data(format!(
+                            "unexpected {} while waiting for input-accepted",
+                            frame.event.describe()
+                        )));
+                    }
+                    return Ok(true);
+                }
+                Event::WorkloadExited {
+                    invocation: actual, ..
+                }
+                | Event::LaunchFailed {
+                    invocation: actual, ..
+                } if *actual == invocation => return Ok(false),
+                Event::WorkloadOutput { .. } => {}
+                event => {
+                    return Err(invalid_data(format!(
+                        "unexpected {} while waiting for input-accepted",
+                        event.describe()
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Whether the invocation is still live after folding every queued event.
+    /// A process command for a released invocation is an infrastructure error, so
+    /// the driver checks liveness before issuing one.
+    fn live(&mut self, invocation: u64) -> io::Result<bool> {
+        self.drain()?;
+        Ok(!(self.trace.exited(invocation) || self.trace.launch_failed(invocation)))
     }
 
     /// Send one bounded input line to a live invocation. Returns `false` when
     /// the invocation has already exited or failed to start, so the driver stops
     /// issuing workload commands and lets the checker report the failure.
+    ///
+    /// Queued events are folded in first, so a process that exited before this
+    /// command is observed rather than raced. The residual window is the interval
+    /// between that drain and the guest reading the command: if the invocation is
+    /// released inside it, the guest reports the exit as an unexpected
+    /// acknowledgement and the run fails as an infrastructure error.
     fn write_stdin(&mut self, invocation: u64, offset: &mut u64, text: &str) -> io::Result<bool> {
+        self.drain()?;
         if self.trace.exited(invocation) || self.trace.launch_failed(invocation) {
             return Ok(false);
         }
+        let expected = *offset;
         let command_id = self.issue(Command::StdinWrite {
             invocation,
-            offset: *offset,
+            offset: expected,
             bytes: encode_bytes(text.as_bytes()),
         })?;
-        *offset += text.len() as u64;
-        self.expect(command_id, "input-accepted", |event| {
-            matches!(event, Event::InputAccepted { .. })
-        })?;
+        if !self.await_input_accepted(command_id, invocation, expected, text.len() as u64)? {
+            return Ok(false);
+        }
+        *offset = expected + text.len() as u64;
         Ok(true)
     }
 
-    /// Read until one invocation's next response line matches `expected`.
-    /// Returns `false` when the invocation exits first.
+    /// Read until one invocation's next response line is exactly `expected`.
+    ///
+    /// The line must be the *next* complete line of that invocation, so a wrong
+    /// response fails the run through the checker instead of being skipped over
+    /// until the VM deadline. Returns `false` when the invocation exits first or
+    /// answers with a different line.
     fn wait_for_line(&mut self, invocation: u64, expected: &str) -> io::Result<bool> {
         loop {
             let consumed = self.consumed_lines.get(&invocation).copied().unwrap_or(0);
-            if let Some(index) = (consumed..self.trace.stdout_line_count(invocation))
-                .find(|index| self.trace.stdout_line(invocation, *index) == Some(expected))
-            {
-                self.consumed_lines.insert(invocation, index + 1);
-                return Ok(true);
+            if consumed < self.trace.stdout_line_count(invocation) {
+                let matched = self.trace.stdout_line(invocation, consumed) == Some(expected);
+                self.consumed_lines.insert(invocation, consumed + 1);
+                return Ok(matched);
             }
             if self.trace.exited(invocation) || self.trace.launch_failed(invocation) {
                 return Ok(false);
@@ -1540,6 +1754,7 @@ fn drive_workload_scenario(
     })?;
     let peer_cidr = format!("{}/32", scenario.fixture_peer);
     let mut offsets = BTreeMap::<u64, u64>::new();
+    let mut outage_active = false;
     let mut stopped = false;
     for step in workload_steps(choices) {
         if stopped {
@@ -1598,6 +1813,7 @@ fn drive_workload_scenario(
                 controller.expect(command, "outage-activated", |event| {
                     matches!(event, Event::OutageActivated { .. })
                 })?;
+                outage_active = true;
             }
             WorkloadStep::Restore => {
                 let command = controller.issue(Command::RestoreNetwork {
@@ -1606,6 +1822,7 @@ fn drive_workload_scenario(
                 controller.expect(command, "network-restored", |event| {
                     matches!(event, Event::NetworkRestored { .. })
                 })?;
+                outage_active = false;
             }
             WorkloadStep::Start(invocation) => {
                 let command = controller.issue(Command::Start {
@@ -1618,8 +1835,18 @@ fn drive_workload_scenario(
                         Event::WorkloadStarted { .. } | Event::LaunchFailed { .. }
                     )
                 })?;
+                // The first command is only sent once the invocation reports that
+                // it is reading input, so a workload that exits immediately after
+                // exec is observed as an ended invocation rather than raced.
+                if !controller.wait_for_line(invocation, READY_LINE)? {
+                    stopped = true;
+                }
             }
             WorkloadStep::Terminate(invocation) => {
+                if !controller.live(invocation)? {
+                    stopped = true;
+                    continue;
+                }
                 let command = controller.issue(Command::Terminate { invocation })?;
                 controller.expect(command, "termination-requested", |event| {
                     matches!(event, Event::TerminationRequested { .. })
@@ -1632,9 +1859,18 @@ fn drive_workload_scenario(
                 })?;
             }
             WorkloadStep::StdinEof(invocation) => {
+                if !controller.live(invocation)? {
+                    stopped = true;
+                    continue;
+                }
+                let expected_end = offsets.get(&invocation).copied().unwrap_or(0);
                 let command = controller.issue(Command::StdinEof { invocation })?;
-                controller.expect(command, "input-accepted", |event| {
-                    matches!(event, Event::InputAccepted { eof: true, .. })
+                controller.expect(command, "input-accepted", move |event| {
+                    matches!(
+                        event,
+                        Event::InputAccepted { invocation: actual, offset, bytes: 0, eof: true }
+                            if *actual == invocation && *offset == expected_end
+                    )
                 })?;
                 controller.expect(command, "workload-exited", |event| {
                     matches!(event, Event::WorkloadExited { .. })
@@ -1645,8 +1881,26 @@ fn drive_workload_scenario(
             }
         }
     }
+    // An early stop can leave the administrative outage in force. The agent
+    // refuses to stop while an outage is active, and leaving the fault in place
+    // would turn an application failure into an infrastructure failure, so the
+    // network is restored before the shutdown handshake. Passive replay derives
+    // the same stop point from the same recorded events and therefore issues the
+    // same command.
+    if stopped && outage_active {
+        // The stopped invocation may still be finishing its cleanup barrier, so
+        // every queued event is folded in before the next command.
+        controller.drain()?;
+        let command = controller.issue(Command::RestoreNetwork {
+            peer_cidr: peer_cidr.clone(),
+        })?;
+        controller.expect(command, "network-restored", |event| {
+            matches!(event, Event::NetworkRestored { .. })
+        })?;
+    }
     // The runtime may still be finishing a barrier when the agent stops, so
-    // drain every remaining event until the agent reports it stopped.
+    // drain every remaining workload event until the agent reports it stopped.
+    // Nothing else can arrive: every other command was acknowledged in order.
     let shutdown = controller.issue(Command::Shutdown {})?;
     loop {
         let frame = controller.receive_one()?;
@@ -1657,6 +1911,20 @@ fn drive_workload_scenario(
         }
         if matches!(frame.event, Event::AgentStopped {}) {
             break;
+        }
+        if !matches!(
+            frame.event,
+            Event::WorkloadOutput { .. }
+                | Event::InputAccepted { .. }
+                | Event::TerminationRequested { .. }
+                | Event::WorkloadExited { .. }
+                | Event::LaunchFailed { .. }
+                | Event::CleanupComplete { .. }
+        ) {
+            return Err(invalid_data(format!(
+                "unexpected {} while waiting for agent-stopped",
+                frame.event.describe()
+            )));
         }
     }
     controller.vm.finish_events()?;
@@ -1805,7 +2073,15 @@ fn build_guest_image_with_assets(
     let compressed = compressor.finish()?;
     let digest = sha256_bytes(&compressed);
     let cache = runs_directory.join(".images");
-    fs::create_dir_all(&cache)?;
+    // A workload image embeds the packaged workload template, so the cache is
+    // owner-only: the directory, the temporary file, and the published entry.
+    fs::create_dir_all(runs_directory)?;
+    match fs::DirBuilder::new().mode(0o700).create(&cache) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    require_private_cache(&cache, 0o700, true)?;
     let image = cache.join(format!("{digest}.cpio.gz"));
     if image.exists() {
         if sha256_file(&image)? != digest {
@@ -1817,6 +2093,9 @@ fn build_guest_image_with_assets(
                 ),
             ));
         }
+        // An entry published by an earlier build may still be world-readable, so
+        // a reused image is repaired rather than trusted.
+        require_private_cache(&image, 0o600, false)?;
     } else {
         let temporary = cache.join(format!(
             ".{digest}.tmp-{}-{}",
@@ -1826,6 +2105,7 @@ fn build_guest_image_with_assets(
         let mut temporary_file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&temporary)?;
         if let Err(error) = temporary_file
             .write_all(&compressed)
@@ -1844,6 +2124,7 @@ fn build_guest_image_with_assets(
                         "published guest image has the wrong digest",
                     ));
                 }
+                require_private_cache(&image, 0o600, false)?;
             }
             Err(error) if image.exists() => {
                 let _ = fs::remove_file(temporary);
@@ -1853,6 +2134,7 @@ fn build_guest_image_with_assets(
                         "concurrent guest image cache entry has the wrong digest",
                     ));
                 }
+                require_private_cache(&image, 0o600, false)?;
                 drop(error);
             }
             Err(error) => return Err(error),
@@ -1862,6 +2144,51 @@ fn build_guest_image_with_assets(
         path: fs::canonicalize(image)?,
         executable_sha256,
     })
+}
+
+/// Require one cached guest image entry to be owned by the current user with an
+/// owner-only mode, repairing the mode of an entry published by an earlier
+/// build. A world-readable workload image would expose the packaged workload.
+fn require_private_cache(path: &Path, mode: u32, directory: bool) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    let file_type = metadata.file_type();
+    let expected = if directory {
+        file_type.is_dir()
+    } else {
+        file_type.is_file()
+    };
+    if !expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "cached guest image entry has an unexpected file type: {}",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "cached guest image entry is not owned by the current user: {}",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.permissions().mode() & 0o777 != mode {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        let repaired = fs::symlink_metadata(path)?;
+        if repaired.permissions().mode() & 0o777 != mode {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cached guest image entry could not be made owner-only: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn required_environment_path(name: &str) -> io::Result<PathBuf> {
@@ -2279,17 +2606,25 @@ fn compare_events(expected: &[NormalizedEvent], actual: &[NormalizedEvent]) -> i
             (Some(expected), Some(actual)) if expected == actual => {}
             (Some(expected), Some(actual)) => {
                 return Err(invalid_data(format!(
-                    "normalized event divergence at index {index}\nexpected: {expected:#?}\nactual: {actual:#?}"
+                    "normalized event divergence at index {index}: expected {} at event {}, found {} at event {}",
+                    expected.event.describe(),
+                    expected.event_id,
+                    actual.event.describe(),
+                    actual.event_id
                 )));
             }
             (Some(expected), None) => {
                 return Err(invalid_data(format!(
-                    "replay ended before normalized event index {index}\nexpected: {expected:#?}"
+                    "replay ended before normalized event index {index}: expected {} at event {}",
+                    expected.event.describe(),
+                    expected.event_id
                 )));
             }
             (None, Some(actual)) => {
                 return Err(invalid_data(format!(
-                    "replay produced surplus normalized event at index {index}\nactual: {actual:#?}"
+                    "replay produced surplus normalized event at index {index}: {} at event {}",
+                    actual.event.describe(),
+                    actual.event_id
                 )));
             }
             (None, None) => unreachable!(),
@@ -2577,7 +2912,6 @@ fn new_run_id(seed: u64) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
@@ -2594,6 +2928,7 @@ mod tests {
         fetched: usize,
         descendant: bool,
         live: Option<u64>,
+        duplicated: bool,
         sequences: BTreeMap<u64, u64>,
         input_offsets: BTreeMap<u64, u64>,
         stdout: BTreeMap<u64, Vec<u8>>,
@@ -2616,6 +2951,20 @@ mod tests {
         recorded_events: Option<Arc<Mutex<Vec<EventFrame>>>>,
         playback: bool,
         workload: FakeWorkload,
+        /// The administrative outage is active, exactly as the guest agent tracks
+        /// it: the fake refuses to shut down while it is set, so a driver that
+        /// stops during an outage must restore the network first.
+        outage_active: bool,
+        /// Fail the live invocation on its first request while the outage is in
+        /// force, so an application failure lands inside the outage window.
+        exit_on_outage: bool,
+        /// Report a stale root witness, as a reused workload root would.
+        stale_root: bool,
+        /// Exit the invocation immediately after its startup line, before any
+        /// input is read.
+        exit_after_start: bool,
+        /// Emit one duplicated input acknowledgement for the first input command.
+        duplicate_input_accept: bool,
     }
 
     struct FakeAdapter {
@@ -2627,6 +2976,8 @@ mod tests {
         extra_after_shutdown: bool,
         malformed_after_shutdown: bool,
         corrupt: bool,
+        exit_on_outage: bool,
+        divergent_workload_launch: bool,
         recorded_events: Arc<Mutex<Vec<EventFrame>>>,
     }
 
@@ -2683,6 +3034,11 @@ mod tests {
                 recorded_events: (!playback).then(|| Arc::clone(&self.recorded_events)),
                 playback,
                 workload: FakeWorkload::default(),
+                outage_active: false,
+                exit_on_outage: self.exit_on_outage,
+                stale_root: false,
+                exit_after_start: false,
+                duplicate_input_accept: false,
             })
         }
     }
@@ -2743,6 +3099,17 @@ mod tests {
                 return Err(invalid_data("fake replay environment identity differs"));
             }
             let mut events = self.recorded_events.lock().unwrap().clone();
+            if self.divergent_workload_launch {
+                // The replayed guest reports a different launch environment than
+                // the recording, so the normalized stream diverges at the start.
+                let start = events
+                    .iter_mut()
+                    .find(|frame| matches!(frame.event, Event::WorkloadStarted { .. }))
+                    .expect("the recording starts a workload");
+                if let Event::WorkloadStarted { launch, .. } = &mut start.event {
+                    launch.environment.push("MODE=diverged".into());
+                }
+            }
             if self.force_unavailable {
                 let (request_id, phase) = match &events[2].event {
                     Event::RequestSucceeded {
@@ -2774,6 +3141,19 @@ mod tests {
     }
 
     impl FakeVm {
+        /// Refuse a process command for an invocation that is not active, exactly
+        /// as the guest runtime does: a command for a released invocation is an
+        /// infrastructure error, so the driver must check liveness first.
+        fn require_live(&self, invocation: u64) -> io::Result<()> {
+            if self.workload.live == Some(invocation) {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "fake guest: invocation {invocation} is not active"
+                )))
+            }
+        }
+
         /// Emit one live output frame with the next sequence number and the
         /// current per-stream offset, exactly as the guest runtime does.
         fn emit_output(
@@ -2861,12 +3241,12 @@ mod tests {
                     &format!("echo value={token}\n"),
                 );
             } else if line == "state" {
-                self.emit_output(
-                    command_id,
-                    invocation,
-                    OutputStream::Stdout,
-                    "state value=fresh\n",
-                );
+                let response = if self.stale_root {
+                    "state value=stale root=stale\n".to_owned()
+                } else {
+                    format!("{FRESH_STATE_LINE}\n")
+                };
+                self.emit_output(command_id, invocation, OutputStream::Stdout, &response);
             } else if line == "spawn-descendant" {
                 self.workload.descendant = true;
                 self.emit_output(
@@ -2879,7 +3259,22 @@ mod tests {
                 let mut parts = rest.split(' ');
                 let request_id = parts.next().unwrap_or_default();
                 self.workload.fetched += 1;
-                if self.corrupt && self.workload.fetched == 1 {
+                if self.exit_on_outage && !self.workload.network_up {
+                    // An application failure that happens while the outage is in
+                    // force, so the driver has to restore before it can stop.
+                    self.emit_output(
+                        command_id,
+                        invocation,
+                        OutputStream::Stderr,
+                        "fixture: injected application failure\n",
+                    );
+                    self.emit_workload_exit(
+                        command_id,
+                        invocation,
+                        ProcessExit::Exited { code: 1 },
+                        1,
+                    );
+                } else if self.corrupt && self.workload.fetched == 1 {
                     self.emit_output(
                         command_id,
                         invocation,
@@ -2959,6 +3354,7 @@ mod tests {
                 Command::ActivateOutage { peer_cidr } => {
                     self.running = false;
                     self.workload.network_up = false;
+                    self.outage_active = true;
                     self.event(
                         frame.command_id,
                         Event::OutageActivated {
@@ -2970,6 +3366,7 @@ mod tests {
                 Command::RestoreNetwork { peer_cidr } => {
                     self.running = true;
                     self.workload.network_up = true;
+                    self.outage_active = false;
                     self.event(
                         frame.command_id,
                         Event::NetworkRestored {
@@ -3034,6 +3431,11 @@ mod tests {
                     self.event(frame.command_id, Event::AssertionsEvaluated { report });
                 }
                 Command::Shutdown {} => {
+                    if self.outage_active {
+                        return Err(io::Error::other(
+                            "fake guest refuses to stop while the outage is active",
+                        ));
+                    }
                     self.event(frame.command_id, Event::AgentStopped {});
                     if self.extra_after_shutdown {
                         self.event(frame.command_id, Event::AgentStopped {});
@@ -3054,14 +3456,23 @@ mod tests {
                         frame.command_id,
                         *invocation,
                         OutputStream::Stdout,
-                        "ready version=1\n",
+                        &format!("{READY_LINE}\n"),
                     );
+                    if self.exit_after_start {
+                        self.emit_workload_exit(
+                            frame.command_id,
+                            *invocation,
+                            ProcessExit::Exited { code: 0 },
+                            1,
+                        );
+                    }
                 }
                 Command::StdinWrite {
                     invocation,
                     offset,
                     bytes,
                 } => {
+                    self.require_live(*invocation)?;
                     let data = crate::protocol::decode_bytes(
                         bytes,
                         crate::protocol::MAX_STDIN_FRAME_BYTES,
@@ -3078,9 +3489,22 @@ mod tests {
                             eof: false,
                         },
                     );
+                    if self.duplicate_input_accept && !self.workload.duplicated {
+                        self.workload.duplicated = true;
+                        self.event(
+                            frame.command_id,
+                            Event::InputAccepted {
+                                invocation: *invocation,
+                                offset: end,
+                                bytes: data.len() as u64,
+                                eof: false,
+                            },
+                        );
+                    }
                     self.respond(frame.command_id, *invocation, &data);
                 }
                 Command::StdinEof { invocation } => {
+                    self.require_live(*invocation)?;
                     let offset = self
                         .workload
                         .input_offsets
@@ -3104,6 +3528,7 @@ mod tests {
                     );
                 }
                 Command::Terminate { invocation } => {
+                    self.require_live(*invocation)?;
                     self.event(
                         frame.command_id,
                         Event::TerminationRequested {
@@ -3129,6 +3554,10 @@ mod tests {
             self.queued
                 .pop_front()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no fake event"))
+        }
+
+        fn try_receive(&mut self) -> io::Result<Option<EventFrame>> {
+            Ok(self.queued.pop_front())
         }
 
         fn finish_events(&mut self) -> io::Result<()> {
@@ -3188,6 +3617,11 @@ mod tests {
             recorded_events: None,
             playback: false,
             workload: FakeWorkload::default(),
+            outage_active: false,
+            exit_on_outage: false,
+            stale_root: false,
+            exit_after_start: false,
+            duplicate_input_accept: false,
         };
         let mut diagnostics = failure_diagnostics("record");
         let (events, report) =
@@ -3244,6 +3678,8 @@ mod tests {
             extra_after_shutdown: false,
             malformed_after_shutdown: false,
             corrupt: false,
+            exit_on_outage: false,
+            divergent_workload_launch: false,
             recorded_events: Arc::new(Mutex::new(Vec::new())),
         };
         let result = record_with_adapter(
@@ -4206,6 +4642,8 @@ mod tests {
             extra_after_shutdown: false,
             malformed_after_shutdown: false,
             corrupt: false,
+            exit_on_outage: false,
+            divergent_workload_launch: false,
             recorded_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -4409,20 +4847,37 @@ mod tests {
         );
         fs::write(&manifest_path, &original_manifest).unwrap();
 
-        // Missing raw evidence fails even though the derived entry still exists.
+        // Missing raw evidence fails even though the derived entry still exists,
+        // and the diagnostic names the missing raw closure.
         let closure_path = store.join("raw/closure.json");
         let closure = fs::read(&closure_path).unwrap();
         fs::remove_file(&closure_path).unwrap();
         assert!(store.join("derived").is_dir());
         let error = replay_with_adapter(&replay_options, &adapter).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("raw closure raw/closure.json is missing"),
+            "{error}"
+        );
         fs::write(&closure_path, &closure).unwrap();
 
-        // A changed raw object fails digest verification.
+        // A raw object that the closure still references must be present too.
         let closure: serde_json::Value = serde_json::from_slice(&closure).unwrap();
         let digest = closure["objects"][0]["digest"].as_str().unwrap();
         let object_path = store.join(format!("raw/sha256/{}", &digest["sha256:".len()..]));
         let object = fs::read(&object_path).unwrap();
+        fs::remove_file(&object_path).unwrap();
+        let error = replay_with_adapter(&replay_options, &adapter).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("raw object {digest} is missing")),
+            "{error}"
+        );
+        fs::write(&object_path, &object).unwrap();
+
+        // A changed raw object fails digest verification.
         fs::write(&object_path, b"tampered object").unwrap();
         let error = replay_with_adapter(&replay_options, &adapter).unwrap_err();
         assert!(
@@ -4506,25 +4961,26 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn private_run_artifacts_are_owner_only_and_failures_exclude_workload_data() {
-        fn bundle_bytes(root: &Path) -> Vec<u8> {
-            let mut bytes = Vec::new();
-            let mut stack = vec![root.to_path_buf()];
-            while let Some(directory) = stack.pop() {
-                for entry in fs::read_dir(&directory).unwrap() {
-                    let entry = entry.unwrap();
-                    let file_type = entry.file_type().unwrap();
-                    if file_type.is_dir() {
-                        stack.push(entry.path());
-                    } else if file_type.is_file() {
-                        bytes.extend_from_slice(&fs::read(entry.path()).unwrap());
-                    }
+    /// Every byte of every file below one directory, for leak assertions.
+    fn bundle_bytes(root: &Path) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let entry = entry.unwrap();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    stack.push(entry.path());
+                } else if file_type.is_file() {
+                    bytes.extend_from_slice(&fs::read(entry.path()).unwrap());
                 }
             }
-            bytes
         }
+        bytes
+    }
 
+    #[test]
+    fn private_run_artifacts_are_owner_only_and_failures_exclude_workload_data() {
         let root = temporary_root("workload-classification");
         let options = workload_options(&root, false);
         // A distinctive environment value that must never reach the shareable
@@ -4559,7 +5015,12 @@ mod tests {
         fs::remove_file(&closure).unwrap();
         let replay_options = replay_options(&options, recorded.directory.clone());
         let error = replay_with_adapter(&replay_options, &adapter).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("raw closure raw/closure.json is missing"),
+            "{error}"
+        );
         fs::write(&closure, saved).unwrap();
 
         let bundles = failure_bundles(&options.runs_directory);
@@ -4570,6 +5031,249 @@ mod tests {
         assert!(!retained.contains("ready version=1"), "{retained}");
         assert!(retained.contains("\"error_kind\""), "{retained}");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_workload_replay_divergence_never_leaks_the_launch_environment() {
+        let root = temporary_root("workload-divergence-privacy");
+        let options = workload_options(&root, false);
+        // The launch environment carries a marker that must never reach the
+        // error text or the shareable failure bundle.
+        let specification = options.workload.clone().unwrap();
+        let text = fs::read_to_string(&specification)
+            .unwrap()
+            .replace("MODE=acceptance", "SECRET=divergence-marker");
+        fs::write(&specification, text).unwrap();
+        let mut adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        assert!(recorded.assertions.passed, "{:#?}", recorded.assertions);
+
+        adapter.divergent_workload_launch = true;
+        let error = replay_with_adapter(
+            &replay_options(&options, recorded.directory.clone()),
+            &adapter,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("normalized event divergence"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("divergence-marker"), "{error}");
+
+        let bundles = failure_bundles(&options.runs_directory);
+        assert_eq!(bundles.len(), 1);
+        let retained = String::from_utf8_lossy(&bundle_bytes(&bundles[0])).into_owned();
+        assert!(!retained.contains("divergence-marker"), "{retained}");
+        assert!(!retained.contains("ready version=1"), "{retained}");
+        assert!(!retained.contains("acceptance"), "{retained}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_guest_image_cache_is_owner_only_and_repaired() {
+        let root = temporary_root("image-cache-privacy");
+        let runs = root.join("runs");
+        let executable = root.join("simferret");
+        let mut elf = vec![0_u8; 64];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        fs::write(&executable, elf).unwrap();
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let image = build_guest_image(&executable, &runs).unwrap();
+        let cache = runs.join(".images");
+        assert_eq!(mode(&cache), 0o700);
+        assert_eq!(mode(&image.path), 0o600);
+
+        // An entry left world-readable by an earlier build is repaired rather
+        // than trusted.
+        fs::set_permissions(&image.path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
+        let rebuilt = build_guest_image(&executable, &runs).unwrap();
+        assert_eq!(rebuilt.path, image.path);
+        assert_eq!(mode(&rebuilt.path), 0o600);
+        assert_eq!(mode(&cache), 0o700);
+
+        // A cached entry that is not a regular file is refused.
+        fs::remove_file(&rebuilt.path).unwrap();
+        fs::create_dir(&rebuilt.path).unwrap();
+        assert!(build_guest_image(&executable, &runs).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A fake guest and scenario for driving the workload control loop directly,
+    /// without a record or replay publication.
+    fn workload_scenario_fixture() -> WorkloadScenario {
+        WorkloadScenario {
+            version: crate::scenario::WORKLOAD_SCENARIO_VERSION,
+            name: "workload-network-outage".into(),
+            request_count: 4,
+            payload_bytes: 2,
+            fixture_peer: "10.0.2.2".into(),
+            outage_event_bound: 8,
+            liveness_event_bound: 8,
+            corrupt_responses: false,
+        }
+    }
+
+    fn workload_launch() -> LaunchIdentity {
+        crate::workload::LaunchIdentity {
+            executable: "/bin/simferret-workload".into(),
+            arguments: vec!["/bin/simferret-workload".into()],
+            environment: vec!["MODE=acceptance".into()],
+            working_directory: "/".into(),
+            uid: 65534,
+            gid: 65534,
+        }
+    }
+
+    fn fake_workload_vm() -> FakeVm {
+        FakeVm {
+            identity: identity(),
+            queued: VecDeque::new(),
+            history: Vec::new(),
+            next_event_id: 1,
+            corrupt: false,
+            running: false,
+            mismatch_request: false,
+            force_unavailable: false,
+            forged_assertions: false,
+            extra_after_shutdown: false,
+            malformed_after_shutdown: false,
+            recorded_events: None,
+            playback: false,
+            workload: FakeWorkload::default(),
+            outage_active: false,
+            exit_on_outage: false,
+            stale_root: false,
+            exit_after_start: false,
+            duplicate_input_accept: false,
+        }
+    }
+
+    fn drive_fake_workload(vm: &mut FakeVm) -> (Vec<NormalizedEvent>, AssertionReport) {
+        let scenario = workload_scenario_fixture();
+        let choices = scenario.choices(42);
+        let mut diagnostics = failure_diagnostics("record");
+        drive_workload_scenario(
+            &scenario,
+            &choices,
+            &workload_launch(),
+            vm,
+            true,
+            None,
+            &mut diagnostics,
+        )
+        .expect("an application failure must not become an infrastructure failure")
+    }
+
+    #[test]
+    fn an_application_failure_during_an_outage_restores_the_network_before_shutdown() {
+        // The guest refuses to stop while the outage is active, so a driver that
+        // stops early inside the outage window must restore the network first.
+        let mut vm = fake_workload_vm();
+        vm.exit_on_outage = true;
+        let (events, report) = drive_fake_workload(&mut vm);
+        assert!(!report.passed);
+        let activation = events
+            .iter()
+            .position(|frame| matches!(frame.event, Event::OutageActivated { .. }))
+            .expect("the outage was activated");
+        let restoration = events
+            .iter()
+            .rposition(|frame| matches!(frame.event, Event::NetworkRestored { .. }))
+            .expect("the driver restored the network");
+        assert!(restoration > activation);
+    }
+
+    #[test]
+    fn a_wrong_response_line_fails_the_property_instead_of_the_run() {
+        // A stale root witness must fail process safety, not block the driver
+        // until the VM deadline. The run is still published with the guest
+        // stopped, so the application failure stays an application failure.
+        let mut vm = fake_workload_vm();
+        vm.stale_root = true;
+        let (events, report) = drive_fake_workload(&mut vm);
+        assert!(!report.passed);
+        assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
+        assert!(
+            events.iter().any(|frame| match &frame.event {
+                Event::WorkloadOutput { bytes, .. } => crate::protocol::decode_bytes(bytes, 1024)
+                    .unwrap()
+                    .windows(b"root=stale".len())
+                    .any(|window| window == b"root=stale"),
+                _ => false,
+            }),
+            "the driver observed the stale response"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|frame| matches!(frame.event, Event::AgentStopped {}))
+        );
+    }
+
+    #[test]
+    fn a_workload_that_exits_before_its_first_command_stops_cleanly() {
+        // The invocation is gone before the driver sends any input; the queued
+        // exit must be observed instead of racing a command against a released
+        // invocation.
+        let mut vm = fake_workload_vm();
+        vm.exit_after_start = true;
+        let (events, report) = drive_fake_workload(&mut vm);
+        assert!(!report.passed);
+        assert!(
+            events
+                .iter()
+                .any(|frame| matches!(frame.event, Event::AgentStopped {}))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|frame| matches!(frame.event, Event::TerminationRequested { .. }))
+        );
+    }
+
+    #[test]
+    fn a_duplicated_input_acknowledgement_fails_process_safety() {
+        // A second acknowledgement for one command is a stream-structure
+        // violation, so the run fails as a property rather than as an error.
+        let mut vm = fake_workload_vm();
+        vm.duplicate_input_accept = true;
+        let (events, report) = drive_fake_workload(&mut vm);
+        assert!(!report.passed);
+        assert!(
+            report.assertions[0].detail.contains("input"),
+            "{}",
+            report.assertions[0].detail
+        );
+        assert!(
+            events
+                .iter()
+                .any(|frame| matches!(frame.event, Event::AgentStopped {}))
+        );
+    }
+
+    #[test]
+    fn the_workload_preflight_rejects_an_undeliverable_launch_or_payload() {
+        let scenario = workload_scenario_fixture();
+        let choices = scenario.choices(42);
+        validate_workload_control_frames(&workload_launch(), &choices).unwrap();
+
+        // A launch identity whose serialized start command cannot fit one control
+        // frame is rejected before QEMU starts.
+        let mut launch = workload_launch();
+        launch.environment = vec![format!("BIG={}", "x".repeat(MAX_FRAME_LENGTH))];
+        let error = validate_workload_control_frames(&launch, &choices).unwrap_err();
+        assert!(error.to_string().contains("control frame limit"), "{error}");
+
+        // A planned input that cannot fit the runtime's decoded input bound is
+        // rejected too.
+        let mut oversized = choices.clone();
+        oversized.requests[0].payload = "a".repeat(MAX_STDIN_FRAME_BYTES);
+        let error = validate_workload_control_frames(&workload_launch(), &oversized).unwrap_err();
+        assert!(error.to_string().contains("input limit"), "{error}");
     }
 
     fn fake_vm(mismatch: bool, extra: bool, malformed: bool) -> FakeVm {
@@ -4588,6 +5292,11 @@ mod tests {
             recorded_events: None,
             playback: false,
             workload: FakeWorkload::default(),
+            outage_active: false,
+            exit_on_outage: false,
+            stale_root: false,
+            exit_after_start: false,
+            duplicate_input_accept: false,
         }
     }
 

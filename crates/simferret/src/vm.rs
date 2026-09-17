@@ -6,7 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, ExitStatus, Output, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -749,6 +749,13 @@ pub trait RunningVm {
     fn identity(&self) -> &VmIdentity;
     fn send(&mut self, command: &CommandFrame) -> io::Result<()>;
     fn receive(&mut self) -> io::Result<EventFrame>;
+    /// Return the next already-queued event without waiting for one.
+    ///
+    /// The workload driver drains queued events before issuing a command, so an
+    /// invocation that has already exited stops the drive instead of racing the
+    /// command against a released invocation. A closed channel is still an
+    /// error, because it means the guest ended without its shutdown handshake.
+    fn try_receive(&mut self) -> io::Result<Option<EventFrame>>;
     fn finish_events(&mut self) -> io::Result<()>;
     fn wait(&mut self) -> io::Result<ExitStatus>;
 }
@@ -1260,6 +1267,22 @@ impl RunningVm for QemuVm {
                 "timed out waiting for guest event",
             )),
             Err(RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "guest event reader disconnected",
+            )),
+        }
+    }
+
+    fn try_receive(&mut self) -> io::Result<Option<EventFrame>> {
+        match self.events.try_recv() {
+            Ok(Ok(Some(event))) => Ok(Some(event)),
+            Ok(Ok(None)) => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "guest event channel closed",
+            )),
+            Ok(Err(error)) => Err(error),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "guest event reader disconnected",
             )),
