@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod assertions;
+pub mod checker;
 pub mod fixture;
 pub mod guest;
 pub mod protocol;
