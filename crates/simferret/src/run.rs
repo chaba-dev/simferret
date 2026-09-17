@@ -1723,13 +1723,14 @@ impl<'a> WorkloadController<'a> {
 
     /// Read until the invocation exits, or until an already-observed response
     /// failure means the run must stop instead of waiting for an exit that may
-    /// never come. Output frames are folded as they arrive, so a stderr byte or an
-    /// over-bound unfinished line ends the wait as soon as it is observed.
+    /// never come. Output frames are folded as they arrive, so a stderr byte, an
+    /// over-bound unfinished line, or a response line the driver never asked for
+    /// ends the wait as soon as it is observed.
     fn await_exit(&mut self, command_id: u64, invocation: u64) -> io::Result<bool> {
         // The acknowledgement that was awaited before this call can fold a
         // failing output frame, so an already-observed failure must end the wait
         // before the first blocking receive rather than after the next one.
-        if !self.healthy(invocation) {
+        if !self.healthy(invocation) || self.unconsumed_line(invocation) {
             return Ok(false);
         }
         loop {
@@ -1747,7 +1748,7 @@ impl<'a> WorkloadController<'a> {
                     return Ok(true);
                 }
                 Event::WorkloadOutput { .. } => {
-                    if !self.healthy(invocation) {
+                    if !self.healthy(invocation) || self.unconsumed_line(invocation) {
                         return Ok(false);
                     }
                 }
@@ -1768,6 +1769,15 @@ impl<'a> WorkloadController<'a> {
     fn live(&mut self, invocation: u64) -> io::Result<bool> {
         self.drain()?;
         Ok(!(self.trace.exited(invocation) || self.trace.launch_failed(invocation)))
+    }
+
+    /// Whether the invocation has produced a complete stdout line the driver did
+    /// not consume as an expected response. Every expected line has been consumed
+    /// by the time the driver waits for an exit, so a further complete line can
+    /// only be a response the checker must reject.
+    fn unconsumed_line(&self, invocation: u64) -> bool {
+        let consumed = self.consumed_lines.get(&invocation).copied().unwrap_or(0);
+        self.trace.stdout_line_count(invocation) > consumed
     }
 
     /// Whether the invocation is live and has not already produced a response
@@ -3099,6 +3109,8 @@ mod tests {
         OverBoundLine,
         /// An over-bound stdout line whose newline arrives in a later frame.
         OverBoundSplit,
+        /// A short, complete stdout line the driver never asked for.
+        ExtraLine,
     }
 
     struct FakeVm {
@@ -3893,6 +3905,12 @@ mod tests {
                                     "\n",
                                 );
                             }
+                            FailingTail::ExtraLine => self.emit_output(
+                                frame.command_id,
+                                *invocation,
+                                OutputStream::Stdout,
+                                "unexpected response\n",
+                            ),
                         }
                     }
                     self.event(
@@ -5977,6 +5995,7 @@ mod tests {
             FailingTail::OverBound,
             FailingTail::OverBoundLine,
             FailingTail::OverBoundSplit,
+            FailingTail::ExtraLine,
         ] {
             let mut vm = fake_workload_vm();
             vm.failing_tail_before_eof = Some(tail);
