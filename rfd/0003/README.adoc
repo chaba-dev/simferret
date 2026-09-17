@@ -47,7 +47,8 @@ representative filesystem and process than the built-in fixture.
 Add a versioned workload specification selected by `simferret run`. Its source
 is one of two tagged forms:
 
-* `binary`: one statically linked, little-endian x86-64 Linux ELF executable;
+* `binary`: one statically linked, fixed-address, little-endian x86-64 Linux ELF
+  executable;
 * `oci`: one manifest selected by digest from a local OCI image-layout directory.
 
 Both sources produce a canonical workload containing:
@@ -112,6 +113,11 @@ verified.
 
 Binary specifications provide launch values explicitly. They require a static
 ELF so no undeclared host or guest library closure can affect execution. The
+initial binary profile accepts only a fixed-address (`ET_EXEC`) image: a
+relocated image's load base, entry address, and mapping alignment are chosen by
+the guest loader at exec time, so assembly cannot establish that it would load.
+A static PIE is refused with that diagnostic and is instead linked with
+`-no-pie` or packaged as an OCI source, where the same bytes are accepted. The
 executable is installed at one fixed canonical path with normalized ownership,
 executable mode, and zero timestamp. The initial binary profile has no auxiliary
 file tree; users that need libraries or application data use OCI.
@@ -425,8 +431,9 @@ unsupported file types, missing blobs, digest and size mismatch, wrong platform,
 ambiguous selection, and unsupported media types. Every failure must occur before
 QEMU launch and leave no partially published cache entry.
 
-Binary tests reject dynamically linked, wrong-architecture, malformed, mutable,
-oversized, and non-regular inputs. Runtime tests reject privileged credentials,
+Binary tests reject dynamically linked, relocated (static PIE),
+wrong-architecture, malformed, mutable, oversized, and non-regular inputs.
+Runtime tests reject privileged credentials,
 forbidden inherited descriptors and interfaces, stale writable roots, malformed
 input offsets, output overflow, and an escaped descendant retaining a pipe.
 Replay tests reject missing or altered raw and derived content and prove that
@@ -522,7 +529,8 @@ This proposal does not include:
   provenance verification beyond content digests;
 * Docker archive compatibility, Docker or containerd daemons, BuildKit, or
   building Dockerfiles;
-* dynamically linked standalone binaries or automatic host library discovery;
+* dynamically linked or relocated (static PIE) standalone binaries, or automatic
+  host library discovery;
 * arbitrary host directory trees, bind mounts, persistent volumes, block
   devices, or mutable root filesystems retained across runs;
 * multiple workloads, sidecars, Docker Compose, Kubernetes, service discovery,
