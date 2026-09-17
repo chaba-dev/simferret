@@ -650,15 +650,30 @@ mod tests {
                 serde_json::from_value::<ProcessExit>(exit.clone()).is_err(),
                 "{exit} must not deserialize"
             );
-            let frame = json!({
-                "protocol_version": PROTOCOL_VERSION,
-                "event": {"kind": "workload_exited", "invocation": 1, "exit": exit},
-            });
-            let mut bytes = serde_json::to_vec(&frame).unwrap();
+            // A complete, otherwise valid frame whose only defect is the exit
+            // value, so the reader cannot reject it for an unrelated reason.
+            let frame = EventFrame {
+                protocol_version: PROTOCOL_VERSION,
+                event_id: 1,
+                command_id: 1,
+                event: Event::WorkloadExited {
+                    invocation: 1,
+                    exit: ProcessExit::Exited { code: 0 },
+                    stdout_bytes: 0,
+                    stdout_sha256: String::new(),
+                    stderr_bytes: 0,
+                    stderr_sha256: String::new(),
+                    frames: 0,
+                },
+                diagnostics: DiagnosticFields::default(),
+            };
+            let mut value = serde_json::to_value(&frame).unwrap();
+            value["event"]["exit"] = exit.clone();
+            let mut bytes = serde_json::to_vec(&value).unwrap();
             bytes.push(b'\n');
             assert!(
                 read_line_frame::<EventFrame>(&mut bytes.as_slice()).is_err(),
-                "{frame} must not cross the wire"
+                "{value} must not be accepted by the frame reader"
             );
         }
         // The boundary values a real wait status can produce still round trip.

@@ -1014,8 +1014,10 @@ The runtime enforces the RFD's launch and lifecycle rules:
   Overlay compatibility is a separate rule and is enforced only at the runtime
   boundary: the assembler does not yet reject a package entry that collides with
   the overlay, nor a launch path that overlay replacement invalidates. A template
-  that fails either rule is refused with a typed `launch-failed` event rather
-  than being launched, and moving those checks into assembly is listed for
+  whose package entry collides is refused when the runtime is constructed, so the
+  agent reports an infrastructure error rather than a `launch-failed` event; a
+  launch path that overlay replacement invalidates is refused per invocation as a
+  typed `launch-failed` event. Moving both checks into assembly is listed for
   Phase 3.
 * Each invocation copies the template bytes and canonical metadata into a new
   root, skipping the `/tmp` and `/dev` subtrees so the overlay replaces them
@@ -1059,8 +1061,9 @@ The runtime enforces the RFD's launch and lifecycle rules:
   a workload property. One batch offers each stream at most half of the remaining
   budget, so a continuously readable stream cannot starve the other, while a
   single ready stream still drains the whole budget across the batch. A process
-  exit record whose code or signal is outside the Linux range is refused while
-  the frame is read, so a malformed record cannot cross the wire at all.
+  exit record whose code or signal is outside the Linux range cannot be accepted
+  by a typed frame reader. The runtime's own producer uses the wait-status macros,
+  so it only ever encodes values inside the range.
 * On primary exit or termination the runtime signals every member of the active
   invocation, reaps until only the agent remains, and drains both pipes to end of
   file before emitting `cleanup-complete`. The reap and the signal are scoped to
@@ -1073,10 +1076,13 @@ The runtime enforces the RFD's launch and lifecycle rules:
   child's standard input before it signals, for the same reason, and input is
   refused once termination is requested.
 
-  Root removal is explicit and fallible: a failure to remove the invocation root
-  is reported instead of swallowed, and the single-workload slot stays occupied
-  while it fails, so a later invocation can never start on top of a root that is
-  still on disk. A new `start` is refused until that barrier completes. The agent
+  Root removal is explicit and fallible on every path that created a root,
+  including a failed start: a removal failure is reported alongside the launch
+  failure, and a root that could not be removed is remembered so the next start
+  retries its removal and is refused while the path survives. The single-workload
+  slot also stays occupied when the barrier cannot remove its root, so a later
+  invocation can never start on top of a root that is still on disk. A new
+  `start` is refused until that barrier completes. The agent
   reports process and byte facts only; application protocol interpretation
   remains in the host scenario checker.
 
@@ -1096,10 +1102,12 @@ the host. A representative run produced:
 
 [source,text]
 ----
-running 27 tests
+running 29 tests
+test a_completed_invocation_reports_a_root_that_cannot_be_removed ... ok
 test a_continuously_ready_stream_does_not_starve_the_other ... ok
 test a_descendant_retaining_the_output_pipe_is_killed_by_the_cleanup_barrier ... ok
 test a_failed_materialization_leaves_no_partial_root ... ok
+test a_failed_start_reports_a_root_that_cannot_be_removed_and_refuses_the_next_start ... ok
 test a_full_stdin_pipe_does_not_block_the_control_loop ... ok
 test a_member_that_closes_its_output_descriptors_is_still_reaped ... ok
 test a_missing_executable_is_a_typed_launch_failure ... ok
@@ -1125,7 +1133,7 @@ test the_agent_drives_the_runtime_over_the_serial_control_channel ... ok
 test the_runtime_overlay_is_visible_inside_the_workload_root ... ok
 test the_workload_starts_with_the_default_sigpipe_disposition ... ok
 
-test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
 ----
 
 The fixture is the pinned static busybox copied into the template and executed as
@@ -1196,8 +1204,12 @@ argument vector, a malformed environment entry, and a relative working directory
   ready cannot delay the other until the invocation fails;
 * per-stream offsets advancing across more than one frame, with the exit record's
   frame count matching the frames actually emitted;
-* a root that cannot be removed being reported instead of swallowed, and a
-  malformed process exit record being refused while the frame is read;
+* a root that cannot be removed being reported instead of swallowed, on both a
+  failed start and a completed invocation, with the next start refused while the
+  root is still on disk and accepted again once removal succeeds, and a malformed
+  process exit record being refused while the frame is read;
+* a batch that starts with a whole batch of standard output already waiting still
+  servicing standard error, with the batch staying inside its frame bound;
 * a guest process state record with a non-UTF-8 command name still yielding its
   flags, so a workload cannot break the barrier by naming itself with arbitrary
   bytes.
