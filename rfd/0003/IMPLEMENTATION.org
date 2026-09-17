@@ -106,36 +106,36 @@ content-addressed guest workload, and preserve exact passive replay.
 
 * Phase 3 — Scenario and passive replay integration
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
-- [ ] Run the same acceptance fixture from standalone binary and OCI sources
+- [X] Run the same acceptance fixture from standalone binary and OCI sources
   through the shared guest runtime.
-- [ ] Run the focused dynamically linked OCI fixture from its in-image loader and
+- [X] Run the focused dynamically linked OCI fixture from its in-image loader and
   library closure and passively replay it.
-- [ ] Materialize a process termination and restart in the seeded choice plan and
+- [X] Materialize a process termination and restart in the seeded choice plan and
   evaluate ordered process safety, cleanup, fresh-root, and recovery properties.
-- [ ] Drive the live workload exclusively through recorded input commands and
+- [X] Drive the live workload exclusively through recorded input commands and
   derive response-integrity assertions from ordered output frames in the host
   checker before process exit.
-- [ ] Make workload-originated application traffic traverse the RFD 2 NIC and
+- [X] Make workload-originated application traffic traverse the RFD 2 NIC and
   observe the bounded peer-specific outage and restoration.
-- [ ] Record each source form and passively replay it twice without live source,
+- [X] Record each source form and passively replay it twice without live source,
   registry, daemon, host mount, or fixture interaction.
-- [ ] Compare normalized events, assertions, workload-output identities, and
+- [X] Compare normalized events, assertions, workload-output identities, and
   semantic outcome digests on every replay.
-- [ ] Reject independently changed workload, launch, cache, scenario, and
+- [X] Reject independently changed workload, launch, cache, scenario, and
   network identities before QEMU starts.
-- [ ] Require raw source evidence on replay even when a valid derived cache entry
+- [X] Require raw source evidence on replay even when a valid derived cache entry
   exists, and recheck selection and stored-layer-to-DiffID relationships before
   reusing that entry.
-- [ ] Preserve intentional output corruption as a failing safety assertion and
+- [X] Preserve intentional output corruption as a failing safety assertion and
   nonzero CLI result for both source forms.
-- [ ] Enforce runtime overlay compatibility during assembly and replay, so a
+- [X] Enforce runtime overlay compatibility during assembly and replay, so a
   package entry that collides with the overlay, or a launch path that overlay
   replacement invalidates, is refused before a template is published instead of
   at the runtime boundary.
-- [ ] Separate owner-only replay closure and optional bounded output bytes from
+- [X] Separate owner-only replay closure and optional bounded output bytes from
   default shareable failure metadata, which contains no environment values or
   stream bytes. The Phase 1 store already publishes owner-only objects, but the
   run-level classification belongs with the run manifest, which this phase owns.

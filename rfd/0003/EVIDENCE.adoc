@@ -1229,3 +1229,191 @@ assertions, and the run manifest's workload identity remain Phase 3 work, and so
 does a recorded QEMU acceptance of this runtime: the checked-in phase 2 evidence
 is the host PID-namespace script above. The runtime reports no throughput or
 security claim beyond the accepted profile.
+
+== Phase 3 scenario and passive replay integration
+
+Phase 3 wires the assembled workload into the run pipeline. `simferret run` gains
+an optional `--workload SPECIFICATION`; when it is present the scenario is parsed
+as the versioned workload-driven acceptance scenario and the packaged workload,
+not the agent, originates every recorded request. The normalized workload
+identity is recorded in the run manifest and in a private `workload.lock`
+artifact, and replay re-derives it from the raw closure before QEMU starts.
+
+The host checker (`crates/simferret/src/checker.rs`) owns all application
+meaning. It folds the recorded events into a process and stream trace, checks
+each invocation's reconstructed stdout and stderr against the exit record's
+independently reported totals and digests, matches the ordered response lines to
+the recorded input commands, and evaluates five properties: `process_safety`,
+`response_integrity`, `controlled_outage`, `restoration`, and
+`bounded_recovery`. The guest agent still reports process and byte facts only.
+
+The acceptance fixture is the checked-in `poc/rfd3-workload/main.c`. It answers
+`echo`, reports whether its root already carried a previous invocation's marker,
+spawns an escaped `setsid` descendant that retains the output descriptor, fetches
+a named fixture file over TFTP from `10.0.2.2`, and exits on end of input. The
+same source is compiled once and packaged three ways:
+
+* a standalone fixed-address static binary workload;
+* a local `linux/amd64` OCI image layout carrying the same executable at the
+  binary profile's canonical install path, so both forms converge on one
+  canonical tree; and
+* a focused dynamically linked OCI layout whose executable, interpreter
+  (`/lib64/ld-linux-x86-64.so.2`), and `libc.so.6` closure exist only in the
+  image.
+
+The seeded workload choice plan adds a process-fault request index alongside the
+outage and restoration indices, and requires at least four requests so the fault
+is always strictly inside the sequence and distinct from both transitions.
+
+=== Checked-in evidence command
+
+[source,shell]
+----
+./scripts/rfd3-phase3-acceptance.sh
+----
+
+For each source form the script records the acceptance scenario, records the
+same scenario with a corrupted fixture response, removes the entire live source
+directory, passively replays the recording twice, and checks that a
+self-consistently changed workload lock, a changed derived cache entry, and a
+missing raw closure are each refused before QEMU starts. A representative
+unprivileged run produced:
+
+[source,text]
+----
+qemu_version=QEMU emulator version 11.1.0
+kernel=/nix/store/s40h0m3746r0l287laa9sxa9345bkykf-linux-6.18.49/bzImage
+static_fixture_sha256=d54d4b2a92ace28707ce282a9734fbcdfec0cf30cf1bf0c4c7102bf7d95b6e5c
+dynamic_fixture_sha256=564436ee235a187b6cd77c30331a66a4d65b243d5ab8aa23a3cabc0e27f9c227
+dynamic_interpreter=/lib64/ld-linux-x86-64.so.2
+static_manifest_digest=sha256:69aa8d92ec10024ddf8fd22cf64ef67db48de0b9f2c1f9685960c4773d34186f
+dynamic_manifest_digest=sha256:a4247157fc885f8240537a0438859f66bf87035c299ba3c68ed688fc4d533440
+binary_canonical=2fce0cfb5c4741d5ec51555fa1d2848abc75fa9f2731902646afdd0a3c8faead
+binary_closure=5c9368fec665b1c8d4f842d3531ee6eb2c237078e78be0c45f11cc00a4336635
+binary_record_duration_ns=13988018779
+binary_replay_1_duration_ns=22061555510
+binary_replay_2_duration_ns=22278262480
+binary_store_bytes=144106
+binary_initramfs_bytes=2176547
+binary_semantic_outcome=96651af69f5eed265934f531ef3b02002836798ebd58e99e0314c252a57ddaed
+binary_events=36
+binary_replay_log_bytes=9428509
+oci-static_canonical=2fce0cfb5c4741d5ec51555fa1d2848abc75fa9f2731902646afdd0a3c8faead
+oci-static_closure=52bf34133228d5cb42dafb30a0028ec522ed3cf282bff108362897696d98b8bc
+oci-static_record_duration_ns=19047738322
+oci-static_replay_1_duration_ns=26399053321
+oci-static_replay_2_duration_ns=26389992438
+oci-static_store_bytes=156685
+oci-static_initramfs_bytes=2176547
+oci-static_semantic_outcome=96651af69f5eed265934f531ef3b02002836798ebd58e99e0314c252a57ddaed
+oci-static_events=36
+oci-static_replay_log_bytes=8549284
+oci-dynamic_canonical=1112b7b8f52611a6b76a34885866f02e108056ca8f674e3d863db66786fb7832
+oci-dynamic_closure=0ddae3b8380960dca11e8304f64027df42eaca81fb5e546b2105c426b5346a41
+oci-dynamic_record_duration_ns=15317098605
+oci-dynamic_replay_1_duration_ns=21344324320
+oci-dynamic_replay_2_duration_ns=21383266879
+oci-dynamic_store_bytes=3850895
+oci-dynamic_initramfs_bytes=3300960
+oci-dynamic_semantic_outcome=6db37564f3d593328bda0565867d71517844b120aa528843ecc4a8a038ee8712
+oci-dynamic_events=36
+oci-dynamic_replay_log_bytes=6715020
+intentional_divergence=process_safety and response_integrity failed with CLI status 1
+workload_lock_tamper_error=simferret: the workload lock identity differs from the manifest
+derived_template_tamper_error=simferret: derived guest template does not match the raw closure
+----
+
+The standalone binary and static OCI sources converge on one canonical digest
+(`2fce0cfb...`) and one semantic outcome digest (`96651af6...`), and both replay
+twice with byte-identical normalized events and assertions. The dynamically
+linked OCI source has its own canonical tree (`1112b7b8...`), executes from the
+in-image interpreter and library closure, and replays twice with its own stable
+semantic outcome digest. Every replay begins after the form's whole source
+directory has been removed, so no live source, registry, daemon, host mount, or
+fixture interaction participates. Intentional response corruption makes
+`process_safety` and `response_integrity` fail and returns CLI status 1 for both
+source forms.
+
+=== Two integration fixes
+
+Two pre-existing behaviours only became observable once a workload was live, and
+both were fixed in this phase:
+
+* `Runtime::terminate` closed the child's standard input before signalling. A
+  workload that treats end of input as a clean exit left the process before the
+  fixed `SIGKILL` landed, so the exit record reported `exited` instead of the
+  requested termination. The signal is now delivered first and the queued input
+  is dropped in the same critical section, so the command is unconditional as
+  documented and no later poll can write to a pipe whose readers are gone.
+* The host command writer wrote one byte and waited for one acknowledgement per
+  byte. That round trip costs roughly 30ms once a workload is live under the
+  pinned TCG/icount profile, so a 250-byte workload command could not complete
+  inside the command deadline. The writer now writes bounded 16-byte chunks (the
+  guest UART FIFO depth) and waits for the same number of acknowledgements, so
+  the guest still acknowledges every byte it consumes while the round trip is
+  paid once per chunk. Record duration dropped from a timeout to about 14s and
+  replay to about 22s. A larger chunk overran the guest serial FIFO and
+  corrupted the control stream, which is why the chunk is pinned to the FIFO
+  depth.
+
+=== Assembly-time overlay compatibility and artifact classification
+
+The runtime overlay rules moved into assembly: `validate_overlay_compatibility`
+refuses a canonical tree with a non-directory entry at or below `/tmp` or
+`/dev`, and refuses a launch executable or working directory the overlay
+replacement would invalidate. Assembly and replay both apply it, so a template
+the runtime would refuse is never published and replay re-derives the same
+decision from the raw closure instead of failing at the runtime boundary.
+
+The run directory and the host-written run artifacts are owner-only (`0700` and
+`0600`): they carry the recorded launch environment, the exact workload stream
+bytes, and the private replay closure. The shareable failure bundle is a separate
+directory and carries bounded protocol metadata, counts, digests, and typed
+errors only; a regression test asserts that neither the recorded environment
+value nor a recorded workload output line appears anywhere in it.
+
+=== Phase 3 regression tests
+
+`crates/simferret/src/checker.rs` unit tests cover a complete structured run and
+each individual failure: a reused root reported as `stale`, a mismatched
+response line, a cleanup barrier that reaped nothing, a missing restoration, exit
+totals that disagree with the recorded frames, and a typed launch failure that
+cannot satisfy a workload property.
+
+`crates/simferret/src/run.rs` drives the whole pipeline against a deterministic
+fake VM that models the pinned fixture's line protocol, so the driver, checker,
+manifest, and replay preflight are exercised without QEMU. The tests cover:
+
+* a workload recording that passes every property, records the workload identity
+  in the manifest and the lock, publishes the raw and derived closure, and
+  passively replays twice from the store after the live source is deleted;
+* a self-consistently changed lock whose artifact digest is updated in the
+  manifest, an independently changed launch identity, a missing raw closure with
+  the derived entry still present, a changed raw object, a changed derived
+  template, and a changed scenario artifact, each refused before launch;
+* an intentionally corrupted fixture response that fails `process_safety` and
+  `response_integrity`, publishes a complete run, and reproduces the same failing
+  report on replay with CLI status 1;
+* owner-only run directories and artifacts, and a failure bundle that contains
+  neither the recorded environment value nor a workload output line.
+
+`crates/simferret/tests/rfd3_phase3.rs` pins the public contract: the strict
+versioned workload scenario, the seeded choice plan and its bounds, the request
+phase to expected-response mapping, and that an incomplete or structurally
+invalid run cannot satisfy any property.
+
+`crates/simferret/src/workload/mod.rs` unit tests cover overlay collisions at and
+below `/tmp` and `/dev` and the launch paths the overlay invalidates.
+
+=== Deliberate limits
+
+The host checker understands the checked-in acceptance fixture's line protocol
+only; general protocol adapters and automatic property inference remain excluded,
+as the RFD requires. The dynamically linked fixture packages the glibc
+interpreter and `libc.so.6` from the pinned development environment, which is
+what makes its closure reproducible in this repository; standalone dynamic
+binaries remain unsupported. The workload store is shared by the runs in one runs
+directory and refuses a second, different raw closure, so each source form uses
+its own runs directory. The chunked command write is a host-side transport
+change: the wire format, the guest's per-byte acknowledgement, and the versioned
+protocol are unchanged.
