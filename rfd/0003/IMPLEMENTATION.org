@@ -101,9 +101,6 @@ content-addressed guest workload, and preserve exact passive replay.
   first-invocation root mutations cannot satisfy later recovery.
 - [X] Keep application protocol interpretation and assertions in the host
   scenario checker; limit the guest agent to generic process and byte facts.
-- [X] Separate owner-only replay closure and optional bounded output bytes from
-  default shareable failure metadata, which contains no environment values or
-  stream bytes.
 
 * Phase 3 — Scenario and passive replay integration
 :PROPERTIES:
@@ -132,6 +129,10 @@ content-addressed guest workload, and preserve exact passive replay.
   reusing that entry.
 - [ ] Preserve intentional output corruption as a failing safety assertion and
   nonzero CLI result for both source forms.
+- [ ] Separate owner-only replay closure and optional bounded output bytes from
+  default shareable failure metadata, which contains no environment values or
+  stream bytes. The Phase 1 store already publishes owner-only objects, but the
+  run-level classification belongs with the run manifest, which this phase owns.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
