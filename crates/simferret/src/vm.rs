@@ -22,6 +22,9 @@ const CPU: &str = "qemu64";
 const MEMORY_MIB: u32 = 128;
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// The largest number of command bytes written before the writer waits for the
+/// corresponding acknowledgements.
+const COMMAND_WRITE_CHUNK_BYTES: usize = 16;
 const EVENT_TIMEOUT: Duration = Duration::from_secs(180);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(180);
 const QMP_MESSAGE_LIMIT: usize = 64 * 1024;
@@ -1092,23 +1095,30 @@ fn write_serial_command(
     }
     bytes.push(b'\n');
     let deadline = Instant::now() + timeout;
-    for byte in bytes {
-        output.write_all(&[byte])?;
+    // The frame is written in bounded chunks rather than one byte per
+    // acknowledgement. The guest still acknowledges every byte it consumes, so
+    // the flow-control contract is unchanged, but the round trip that used to be
+    // paid for every byte is paid once per chunk. That matters once a workload is
+    // live, where a control round trip can take tens of milliseconds.
+    for chunk in bytes.chunks(COMMAND_WRITE_CHUNK_BYTES) {
+        output.write_all(chunk)?;
         output.flush()?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match acknowledgements.recv_timeout(remaining) {
-            Ok(()) => {}
-            Err(RecvTimeoutError::Timeout) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out waiting for guest serial acknowledgement",
-                ));
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "guest serial acknowledgement channel disconnected",
-                ));
+        for _ in 0..chunk.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match acknowledgements.recv_timeout(remaining) {
+                Ok(()) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for guest serial acknowledgement",
+                    ));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "guest serial acknowledgement channel disconnected",
+                    ));
+                }
             }
         }
     }
