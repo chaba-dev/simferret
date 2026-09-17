@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,9 @@ use super::spec::{
     BinarySource, CanonicalBinarySpec, LaunchIdentity, OciSource, SourceKind, normalize_arguments,
     normalize_environment, normalize_required_user, normalize_working_directory, parse_digest,
 };
-use super::tree::{Entry, ROOT_PATH, Tree, ancestors, normalize_layer_path, sha256_bytes};
+use super::tree::{
+    Entry, ROOT_PATH, Tree, ancestors, normalize_layer_path, sha256_bytes, validate_canonical_tree,
+};
 use super::{
     BINARY_INSTALL_PATH, CANONICAL_FORMAT_VERSION, CLOSURE_VERSION, DERIVED_LOCK_VERSION,
     EXTRACTION_POLICY_VERSION, GUEST_TEMPLATE_ROOT, LAYER_APPLICATION_POLICY_VERSION,
@@ -189,6 +192,10 @@ struct BinaryInput {
 
 /// Read one workload specification, normalize its source into a canonical
 /// workload, and publish the raw closure and derived cache entry atomically.
+///
+/// Source objects are read through one directory descriptor opened at the
+/// specification's directory, so every component of a source locator is
+/// traversed without following a symbolic link.
 pub fn assemble(specification: &Path, store: &Path) -> io::Result<AssembledWorkload> {
     let spec = super::WorkloadSpec::read(specification)?;
     let directory = specification
@@ -196,9 +203,10 @@ pub fn assemble(specification: &Path, store: &Path) -> io::Result<AssembledWorkl
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let root = Root::open(&directory)?;
     let graph = match &spec.source {
-        super::WorkloadSource::Binary(source) => binary_graph(&directory, source)?,
-        super::WorkloadSource::Oci(source) => oci_graph(&directory, source)?,
+        super::WorkloadSource::Binary(source) => binary_graph(&root, source)?,
+        super::WorkloadSource::Oci(source) => oci_graph(&root, source)?,
     };
     publish(store, graph)
 }
@@ -279,8 +287,7 @@ pub fn load(store: &Path) -> io::Result<LoadedWorkload> {
     })
 }
 
-fn binary_graph(directory: &Path, source: &BinarySource) -> io::Result<WorkloadGraph> {
-    let root = Root::open(directory)?;
+fn binary_graph(root: &Root, source: &BinarySource) -> io::Result<WorkloadGraph> {
     let executable = root.read_file(&source.path, MAX_FILE_BYTES)?;
     super::validate_static_elf(&executable)?;
     let (uid, gid) = normalize_required_user(&source.user)?;
@@ -333,6 +340,19 @@ fn binary_tree_and_launch(
     if input.uid == 0 || input.gid == 0 {
         return Err(invalid("root credentials are not supported"));
     }
+    if input.uid == super::RESERVED_OWNER || input.gid == super::RESERVED_OWNER {
+        return Err(invalid(
+            "the reserved owner identifier is not a launch credential",
+        ));
+    }
+    // The binary profile installs at one fixed path. Assembly always uses it,
+    // and replay re-derives from the retained canonical specification, so the
+    // same invariant is enforced here for both directions.
+    if input.install_path != BINARY_INSTALL_PATH {
+        return Err(invalid(format!(
+            "binary install path must be {BINARY_INSTALL_PATH:?}"
+        )));
+    }
     let install = normalize_layer_path(input.install_path.as_bytes())?;
     if install == ROOT_PATH {
         return Err(invalid("binary install path must name a file"));
@@ -358,6 +378,7 @@ fn binary_tree_and_launch(
         Entry::file(executable.to_vec(), 0o755, input.uid, input.gid, 0),
     );
     let working_directory = normalize_working_directory(Some(&input.working_directory), &tree)?;
+    validate_canonical_tree(&tree, MAX_VIEW_ENTRIES, MAX_EXPANDED_LAYER_BYTES)?;
     let launch = LaunchIdentity {
         executable: executable_text,
         arguments,
@@ -369,9 +390,9 @@ fn binary_tree_and_launch(
     Ok((tree, launch))
 }
 
-fn oci_graph(directory: &Path, source: &OciSource) -> io::Result<WorkloadGraph> {
-    let root = Root::open(&directory.join(&source.layout))?;
-    let objects = oci::read_objects(&root, &source.manifest_digest)?;
+fn oci_graph(root: &Root, source: &OciSource) -> io::Result<WorkloadGraph> {
+    let layout = root.open_directory(&source.layout)?;
+    let objects = oci::read_objects(&layout, &source.manifest_digest)?;
     let graph = oci::parse_graph(&objects)?;
     Ok(WorkloadGraph {
         kind: SourceKind::Oci,
@@ -398,17 +419,8 @@ fn oci_roles(objects: &OciObjects) -> Vec<(String, Vec<u8>)> {
 }
 
 fn publish(store: &Path, graph: WorkloadGraph) -> io::Result<AssembledWorkload> {
-    if graph.tree.len() > MAX_VIEW_ENTRIES {
-        return Err(invalid(format!(
-            "canonical tree exceeds {MAX_VIEW_ENTRIES} entries"
-        )));
-    }
+    validate_canonical_tree(&graph.tree, MAX_VIEW_ENTRIES, MAX_EXPANDED_LAYER_BYTES)?;
     let expanded_bytes = graph.tree.expanded_bytes();
-    if expanded_bytes > MAX_EXPANDED_LAYER_BYTES {
-        return Err(invalid(format!(
-            "canonical tree exceeds {MAX_EXPANDED_LAYER_BYTES} expanded bytes"
-        )));
-    }
     let canonical_digest = graph.tree.canonical_digest();
     let tree_bytes = graph.tree.encode();
     if tree_bytes.len() > MAX_CACHE_METADATA_BYTES {
@@ -468,12 +480,32 @@ fn publish(store: &Path, graph: WorkloadGraph) -> io::Result<AssembledWorkload> 
     }
     let closure_sha256 = sha256_bytes(&closure_bytes);
 
-    std::fs::create_dir_all(store)?;
-    let root = Root::open(store)?;
+    // The store is created owner-only, and the raw closure is published last so
+    // a failure part-way through never leaves a committed closure without the
+    // derived entry it names. An incomplete candidate is retried idempotently.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(store)?;
+    // Every pre-existing store path is revalidated against the private-store
+    // contract instead of being reused with weaker permissions: the root here,
+    // each directory in `Root::open_or_create_beneath`, and every artifact
+    // reused below.
+    let root = Root::open_private(store)?;
+    if let Some(existing) = root.read_file_if_exists(RAW_CLOSURE_PATH, MAX_CACHE_METADATA_BYTES)?
+        && existing != closure_bytes
+    {
+        return Err(invalid(
+            "store already contains a different raw closure; use a separate store per workload",
+        ));
+    }
+    // Revalidate the raw object directory before any object is written or
+    // reused: a reused object is read without reopening its parent, so a
+    // pre-existing `raw/sha256` must already be owner-only.
+    root.open_or_create_directory("raw/sha256")?;
     for (_, data) in &graph.objects {
         write_object(&root, data)?;
     }
-    publish_closure(&root, &closure_bytes)?;
     publish_derived(
         &root,
         &canonical_digest,
@@ -483,6 +515,10 @@ fn publish(store: &Path, graph: WorkloadGraph) -> io::Result<AssembledWorkload> 
         &tree_sha256,
         &template_sha256,
     )?;
+    require_private_derived(&root, &canonical_digest)?;
+    // The derived entry must name this closure before the closure is committed.
+    // Otherwise a concurrent builder whose closure differs but whose canonical
+    // tree matches could leave the store naming a derived entry it does not own.
     verify_derived(
         &root,
         &canonical_digest,
@@ -491,6 +527,7 @@ fn publish(store: &Path, graph: WorkloadGraph) -> io::Result<AssembledWorkload> 
         &closure_sha256,
         &tree_sha256,
     )?;
+    publish_closure(&root, &closure_bytes)?;
     Ok(AssembledWorkload {
         source_kind: graph.kind,
         closure_sha256,
@@ -674,6 +711,8 @@ fn write_object(root: &Root, data: &[u8]) -> io::Result<()> {
             if existing != data {
                 return Err(invalid(format!("existing raw object {digest} is corrupt")));
             }
+            // A reused object must already be owner-only, like a published one.
+            root.require_private_file(&path)?;
             Ok(())
         }
         None => root.write_file_atomic(&path, data),
@@ -686,12 +725,27 @@ fn publish_closure(root: &Root, bytes: &[u8]) -> io::Result<()> {
     }
     let existing = root.read_file(RAW_CLOSURE_PATH, MAX_CACHE_METADATA_BYTES)?;
     if existing == bytes {
+        root.require_private_file(RAW_CLOSURE_PATH)?;
         Ok(())
     } else {
         Err(invalid(
             "store already contains a different raw closure; use a separate store per workload",
         ))
     }
+}
+
+/// Require a reused derived cache entry to be owner-only.
+///
+/// `publish_derived` accepts a derived entry that another builder already
+/// published, so the entry is revalidated here rather than assumed to have been
+/// written by this process.
+fn require_private_derived(root: &Root, canonical_digest: &str) -> io::Result<()> {
+    let base = format!("derived/{canonical_digest}");
+    root.require_private_directory(&base)?;
+    for name in ["tree.bin", "template.cpio", "lock.json"] {
+        root.require_private_file(&format!("{base}/{name}"))?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

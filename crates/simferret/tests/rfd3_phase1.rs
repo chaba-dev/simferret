@@ -8,7 +8,6 @@
 //! links, expansion and entry bounds, tampered or missing raw and derived
 //! content, and concurrent publication.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -40,33 +39,122 @@ fn sha256_hex(data: &[u8]) -> String {
     output
 }
 
-fn elf_header() -> Vec<u8> {
+#[derive(Clone, Copy)]
+struct ProgramHeader {
+    p_type: u32,
+    flags: u32,
+    offset: u64,
+    vaddr: u64,
+    filesz: u64,
+    memsz: u64,
+    align: u64,
+}
+
+const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
+
+fn payload_offset(header_count: usize) -> u64 {
+    (64 + 56 * header_count) as u64
+}
+
+/// A loadable segment whose virtual address shares a page offset with its file
+/// offset, as the guest loader requires.
+fn load_segment(header_count: usize, payload_len: usize) -> ProgramHeader {
+    ProgramHeader {
+        p_type: PT_LOAD,
+        flags: 5,
+        offset: payload_offset(header_count),
+        vaddr: 0x40_0000 + payload_offset(header_count),
+        filesz: payload_len as u64,
+        memsz: payload_len as u64,
+        align: 0x1000,
+    }
+}
+
+fn interp_segment() -> ProgramHeader {
+    ProgramHeader {
+        p_type: PT_INTERP,
+        flags: 4,
+        offset: 0,
+        vaddr: 0,
+        filesz: 0,
+        memsz: 0,
+        align: 1,
+    }
+}
+
+fn null_segment() -> ProgramHeader {
+    ProgramHeader {
+        p_type: 0,
+        flags: 0,
+        offset: 0,
+        vaddr: 0,
+        filesz: 0,
+        memsz: 0,
+        align: 0,
+    }
+}
+
+/// A loadable segment that requests no mapping at all.
+fn noop_segment(vaddr: u64) -> ProgramHeader {
+    ProgramHeader {
+        p_type: PT_LOAD,
+        flags: 0,
+        offset: 0,
+        vaddr,
+        filesz: 0,
+        memsz: 0,
+        align: 0x1000,
+    }
+}
+
+/// Build a structurally valid little-endian x86-64 ELF image.
+fn elf_with(elf_type: u16, headers: &[ProgramHeader], payload: &[u8]) -> Vec<u8> {
     let mut bytes = vec![0_u8; 64];
     bytes[..4].copy_from_slice(b"\x7fELF");
     bytes[4] = 2;
     bytes[5] = 1;
     bytes[6] = 1;
-    bytes[16..18].copy_from_slice(&2_u16.to_le_bytes());
+    bytes[16..18].copy_from_slice(&elf_type.to_le_bytes());
     bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
     bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
     bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
     bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    bytes[56..58].copy_from_slice(&(headers.len() as u16).to_le_bytes());
+    // A fixed-address executable enters at its first loadable segment.
+    let entry = headers
+        .iter()
+        .find(|header| header.p_type == PT_LOAD)
+        .map_or(0, |header| header.vaddr);
+    bytes[24..32].copy_from_slice(&entry.to_le_bytes());
+    for header in headers {
+        let mut encoded = [0_u8; 56];
+        encoded[0..4].copy_from_slice(&header.p_type.to_le_bytes());
+        encoded[4..8].copy_from_slice(&header.flags.to_le_bytes());
+        encoded[8..16].copy_from_slice(&header.offset.to_le_bytes());
+        encoded[16..24].copy_from_slice(&header.vaddr.to_le_bytes());
+        encoded[32..40].copy_from_slice(&header.filesz.to_le_bytes());
+        encoded[40..48].copy_from_slice(&header.memsz.to_le_bytes());
+        encoded[48..56].copy_from_slice(&header.align.to_le_bytes());
+        bytes.extend_from_slice(&encoded);
+    }
+    bytes.extend_from_slice(payload);
     bytes
 }
 
 fn static_elf() -> Vec<u8> {
-    let mut bytes = elf_header();
-    bytes.extend_from_slice(&[0x90; 64]);
-    bytes
+    let payload = vec![0x90_u8; 64];
+    elf_with(2, &[load_segment(1, payload.len())], &payload)
 }
 
 fn dynamic_elf() -> Vec<u8> {
-    let mut bytes = elf_header();
-    bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
-    bytes[56..58].copy_from_slice(&1_u16.to_le_bytes());
-    bytes.resize(64 + 56, 0);
-    bytes[64..68].copy_from_slice(&3_u32.to_le_bytes());
-    bytes
+    let payload = vec![0x90_u8; 64];
+    elf_with(
+        2,
+        &[interp_segment(), load_segment(2, payload.len())],
+        &payload,
+    )
 }
 
 struct TempDir {
@@ -297,6 +385,7 @@ struct Layer {
     compressed: bool,
     media_type: Option<String>,
     raw: Option<Vec<u8>>,
+    stored: Option<Vec<u8>>,
 }
 
 impl Layer {
@@ -314,6 +403,7 @@ fn plain_layer(members: Vec<Member>) -> Layer {
         compressed: false,
         media_type: None,
         raw: None,
+        stored: None,
     }
 }
 
@@ -323,6 +413,7 @@ fn gzip_layer(members: Vec<Member>) -> Layer {
         compressed: true,
         media_type: None,
         raw: None,
+        stored: None,
     }
 }
 
@@ -332,6 +423,19 @@ fn raw_layer(raw: Vec<u8>) -> Layer {
         compressed: false,
         media_type: None,
         raw: Some(raw),
+        stored: None,
+    }
+}
+
+/// A layer whose stored blob is supplied already gzip-compressed, used to prove
+/// the expansion bound is enforced before the stream is parsed.
+fn stored_gzip_layer(stored: Vec<u8>) -> Layer {
+    Layer {
+        members: Vec::new(),
+        compressed: true,
+        media_type: None,
+        raw: None,
+        stored: Some(stored),
     }
 }
 
@@ -341,13 +445,20 @@ fn layer_with_media_type(members: Vec<Member>, media_type: &str) -> Layer {
         compressed: false,
         media_type: Some(media_type.into()),
         raw: None,
+        stored: None,
     }
 }
 
 /// A physical USTAR entry the `tar` crate's builder refuses to write, used to
 /// prove that the parser rejects unsafe paths itself.
 fn raw_tar_entry(name: &[u8], data: &[u8]) -> Vec<u8> {
+    raw_tar_member(name, b'0', b"", data)
+}
+
+/// A physical USTAR entry with an explicit type byte and link name.
+fn raw_tar_member(name: &[u8], typeflag: u8, link_name: &[u8], data: &[u8]) -> Vec<u8> {
     assert!(name.len() <= 100);
+    assert!(link_name.len() <= 100);
     let mut block = [0_u8; 512];
     block[..name.len()].copy_from_slice(name);
     block[100..108].copy_from_slice(b"0000755\0");
@@ -356,7 +467,8 @@ fn raw_tar_entry(name: &[u8], data: &[u8]) -> Vec<u8> {
     block[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
     block[136..148].copy_from_slice(b"00000000000\0");
     block[148..156].copy_from_slice(b"        ");
-    block[156] = b'0';
+    block[156] = typeflag;
+    block[157..157 + link_name.len()].copy_from_slice(link_name);
     block[257..263].copy_from_slice(b"ustar\0");
     block[263..265].copy_from_slice(b"00");
     let sum: u32 = block.iter().map(|byte| u32::from(*byte)).sum();
@@ -409,12 +521,14 @@ fn write_layout(
     let mut diff_ids = Vec::new();
     for layer in layers {
         let raw = layer.bytes();
-        let stored = if layer.compressed {
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-            encoder.write_all(&raw).unwrap();
-            encoder.finish().unwrap()
-        } else {
-            raw.clone()
+        let stored = match &layer.stored {
+            Some(stored) => stored.clone(),
+            None if layer.compressed => {
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(&raw).unwrap();
+                encoder.finish().unwrap()
+            }
+            None => raw.clone(),
         };
         let media_type = layer.media_type.clone().unwrap_or_else(|| {
             if layer.compressed {
@@ -1060,6 +1174,41 @@ fn unsupported_layout(name: &str, root: &Path, binary: &[u8]) -> String {
             None,
             None,
         ),
+        "entrypoint-wrong-type" => write_layout(
+            root,
+            &[plain_layer(fixture.clone())],
+            json!({"config": {"Entrypoint": false, "Cmd": [INSTALL_PATH], "User": "1000:1000"}}),
+            None,
+            None,
+        ),
+        "cmd-wrong-type" => write_layout(
+            root,
+            &[plain_layer(fixture.clone())],
+            json!({"config": {"Entrypoint": [INSTALL_PATH], "Cmd": {}, "User": "1000:1000"}}),
+            None,
+            None,
+        ),
+        "volumes-wrong-type" => write_layout(
+            root,
+            &[plain_layer(fixture.clone())],
+            json!({"config": {"Entrypoint": [INSTALL_PATH], "User": "1000:1000", "Volumes": false}}),
+            None,
+            None,
+        ),
+        "stop-signal-wrong-type" => write_layout(
+            root,
+            &[plain_layer(fixture.clone())],
+            json!({"config": {"Entrypoint": [INSTALL_PATH], "User": "1000:1000", "StopSignal": {}}}),
+            None,
+            None,
+        ),
+        "args-escaped-wrong-type" => write_layout(
+            root,
+            &[plain_layer(fixture.clone())],
+            json!({"config": {"Entrypoint": [INSTALL_PATH], "User": "1000:1000", "ArgsEscaped": []}}),
+            None,
+            None,
+        ),
         "root-user" => write_layout(
             root,
             &[plain_layer(fixture.clone())],
@@ -1163,6 +1312,11 @@ const UNSUPPORTED: &[&str] = &[
     "volumes",
     "stop-signal",
     "args-escaped",
+    "entrypoint-wrong-type",
+    "cmd-wrong-type",
+    "volumes-wrong-type",
+    "stop-signal-wrong-type",
+    "args-escaped-wrong-type",
     "root-user",
     "named-user",
     "duplicate-environment",
@@ -1196,6 +1350,74 @@ fn unsupported_oci_constructs_are_rejected_before_publication() {
         assert!(
             !store.join("derived").exists(),
             "{name} published a derived entry"
+        );
+        assert!(
+            !store.join("raw/closure.json").exists(),
+            "{name} published a raw closure"
+        );
+    }
+}
+
+#[test]
+fn a_metadata_only_member_with_a_data_record_is_rejected() {
+    // USTAR records no data for a directory or a symbolic link, and the raw
+    // iterator advances by the declared size, so a nonzero size would silently
+    // skip physical bytes instead of failing.
+    let binary = static_elf();
+    let cases: &[(&str, u8, &[u8])] = &[
+        ("symlink", b'2', b"bin/simferret-workload"),
+        ("directory", b'5', b""),
+    ];
+    for (name, typeflag, link_name) in cases {
+        let temp = TempDir::new(name);
+        let mut layer = tar_bytes(&fixture_layer(&binary));
+        // Replace the builder's end-of-archive marker with the malformed member.
+        layer.truncate(layer.len() - 1024);
+        layer.extend_from_slice(&raw_tar_member(name.as_bytes(), *typeflag, link_name, b"x"));
+        let layout = temp.join("layout");
+        let digest = write_layout(&layout, &[raw_layer(layer)], default_config(), None, None);
+        write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+        let error = assemble(&temp.join("workload.toml"), &temp.join("store"))
+            .expect_err("a metadata-only member with a data record was accepted");
+        assert!(
+            error.to_string().contains("nonzero size"),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_layer_without_a_valid_end_of_archive_marker_is_rejected() {
+    // The raw iterator stops at the first zero block or at end of input, so a
+    // truncated archive, or one with a member hidden behind a single zero block,
+    // must be refused by the terminator check instead of being parsed as a
+    // shorter valid archive.
+    let binary = static_elf();
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("missing-terminator", {
+            let mut layer = tar_bytes(&fixture_layer(&binary));
+            layer.truncate(layer.len() - 1024);
+            layer
+        }),
+        ("single-zero-block", {
+            let mut layer = tar_bytes(&fixture_layer(&binary));
+            layer.truncate(layer.len() - 1024);
+            layer.extend_from_slice(&[0_u8; 512]);
+            layer.extend_from_slice(&raw_tar_member(b"hidden", b'5', b"", b"x"));
+            layer
+        }),
+    ];
+    for (name, layer) in cases {
+        let temp = TempDir::new(name);
+        let layout = temp.join("layout");
+        let digest = write_layout(&layout, &[raw_layer(layer)], default_config(), None, None);
+        write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+        let store = temp.join("store");
+        let error = assemble(&temp.join("workload.toml"), &store)
+            .expect_err("a layer without a valid end-of-archive marker was accepted");
+        assert!(
+            error.to_string().contains("end-of-archive marker"),
+            "{name}: {error}"
         );
         assert!(
             !store.join("raw/closure.json").exists(),
@@ -1338,19 +1560,73 @@ fn corrupt_or_missing_selected_blobs_are_rejected() {
 
 #[test]
 fn unsupported_binary_inputs_are_rejected() {
+    let payload = vec![0x90_u8; 64];
+    let mut relocatable = elf_with(1, &[load_segment(1, payload.len())], &payload);
+    relocatable[16..18].copy_from_slice(&1_u16.to_le_bytes());
+    let no_loadable = elf_with(2, &[], &payload);
+    let mut huge_table = elf_with(2, &[load_segment(1, payload.len())], &payload);
+    huge_table[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+    huge_table[56..58].copy_from_slice(&1_u16.to_le_bytes());
+    let mut segment_past_file = elf_with(2, &[load_segment(1, payload.len())], &payload);
+    let file_len = segment_past_file.len() as u64;
+    segment_past_file[64 + 8..64 + 16].copy_from_slice(&file_len.to_le_bytes());
+    segment_past_file[64 + 16..64 + 24].copy_from_slice(&(0x40_0000 + file_len).to_le_bytes());
+    segment_past_file[64 + 32..64 + 40].copy_from_slice(&1_u64.to_le_bytes());
+    segment_past_file[64 + 40..64 + 48].copy_from_slice(&1_u64.to_le_bytes());
+    let mut segment_offset_overflow = elf_with(2, &[load_segment(1, payload.len())], &payload);
+    let overflow_offset = u64::MAX - 8;
+    segment_offset_overflow[64 + 8..64 + 16].copy_from_slice(&overflow_offset.to_le_bytes());
+    segment_offset_overflow[64 + 16..64 + 24]
+        .copy_from_slice(&(0x40_0000 + overflow_offset % 4096).to_le_bytes());
+    segment_offset_overflow[64 + 32..64 + 40].copy_from_slice(&16_u64.to_le_bytes());
+    segment_offset_overflow[64 + 40..64 + 48].copy_from_slice(&16_u64.to_le_bytes());
+    let mut misaligned_segment = elf_with(2, &[load_segment(1, payload.len())], &payload);
+    misaligned_segment[64 + 16..64 + 24].copy_from_slice(&0x40_0000_u64.to_le_bytes());
+    let mut segment_outside_address_space =
+        elf_with(2, &[load_segment(1, payload.len())], &payload);
+    segment_outside_address_space[64 + 40..64 + 48]
+        .copy_from_slice(&0x8000_0000_0000_0000_u64.to_le_bytes());
+    let mut entry_outside_address_space = elf_with(2, &[load_segment(1, payload.len())], &payload);
+    entry_outside_address_space[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+    let mut below_minimum_mapping = elf_with(2, &[load_segment(1, payload.len())], &payload);
+    below_minimum_mapping[64 + 16..64 + 24].copy_from_slice(&0x78_u64.to_le_bytes());
+    below_minimum_mapping[24..32].copy_from_slice(&0x78_u64.to_le_bytes());
+    let mut tiny_header = elf_with(2, &[load_segment(1, payload.len())], &payload);
+    tiny_header[54..56].copy_from_slice(&8_u16.to_le_bytes());
+    let mut wrong_header_size = elf_with(2, &[load_segment(1, payload.len())], &payload);
+    wrong_header_size[54..56].copy_from_slice(&57_u16.to_le_bytes());
+    // 1,171 entries of 56 bytes is a 65,576-byte table, past the loader limit.
+    let mut oversized_table = vec![load_segment(1171, payload.len())];
+    oversized_table.extend((0..1170).map(|_| null_segment()));
+    let oversized_table = elf_with(2, &oversized_table, &payload);
+    let mut wrong_architecture = static_elf();
+    wrong_architecture[18..20].copy_from_slice(&40_u16.to_le_bytes());
+    let mut wrong_endianness = static_elf();
+    wrong_endianness[5] = 2;
+    let mut oversized = static_elf();
+    oversized.resize((16 << 20) + 1, 0);
+
     let cases: &[(&str, Vec<u8>)] = &[
         ("dynamic", dynamic_elf()),
         ("malformed", b"not an elf".to_vec()),
-        ("wrong-architecture", {
-            let mut bytes = static_elf();
-            bytes[18..20].copy_from_slice(&40_u16.to_le_bytes());
-            bytes
-        }),
-        ("wrong-endianness", {
-            let mut bytes = static_elf();
-            bytes[5] = 2;
-            bytes
-        }),
+        ("wrong-architecture", wrong_architecture),
+        ("wrong-endianness", wrong_endianness),
+        ("relocatable", relocatable),
+        ("no-loadable-segment", no_loadable),
+        ("program-table-past-file", huge_table),
+        ("loadable-segment-past-file", segment_past_file),
+        ("loadable-segment-offset-overflow", segment_offset_overflow),
+        ("misaligned-loadable-segment", misaligned_segment),
+        (
+            "loadable-segment-outside-address-space",
+            segment_outside_address_space,
+        ),
+        ("entry-outside-address-space", entry_outside_address_space),
+        ("fixed-segment-below-minimum-mapping", below_minimum_mapping),
+        ("tiny-program-header", tiny_header),
+        ("wrong-program-header-size", wrong_header_size),
+        ("oversized-program-table", oversized_table),
+        ("oversized", oversized),
     ];
     for (name, bytes) in cases {
         let temp = TempDir::new(name);
@@ -1390,6 +1666,136 @@ fn unsupported_binary_inputs_are_rejected() {
         assemble(&temp.join("workload.toml"), &temp.join("store")).is_err(),
         "an escaping source was accepted"
     );
+}
+
+#[test]
+fn elf_address_space_boundaries_are_enforced_exactly() {
+    // The guest accepts a segment whose exclusive end equals its user
+    // address-space limit and refuses one page more; it accepts a fixed-address
+    // mapping exactly at its minimum mapping address; and it exempts a
+    // fixed-address load that requests no mapping at all.
+    const LIMIT: u64 = 0x0000_7fff_ffff_f000;
+    const MINIMUM: u64 = 65_536;
+    let payload = vec![0x90_u8; 4096];
+
+    let segment = |vaddr: u64, filesz: u64, memsz: u64| {
+        let mut segment = load_segment(1, payload.len());
+        segment.offset = 0;
+        segment.vaddr = vaddr;
+        segment.filesz = filesz;
+        segment.memsz = memsz;
+        segment
+    };
+    let length = payload.len() as u64;
+    let accepted = [
+        (
+            "segment-end-at-limit",
+            elf_with(2, &[segment(LIMIT - length, length, length)], &payload),
+        ),
+        (
+            "segment-at-minimum-mapping-address",
+            elf_with(2, &[segment(MINIMUM, length, length)], &payload),
+        ),
+        (
+            // A segment with no memory content requests no mapping, so it is
+            // not subject to the fixed-address minimum.
+            "fixed-address-no-op-load-below-minimum",
+            elf_with(
+                2,
+                &[load_segment(2, payload.len()), noop_segment(0x1000)],
+                &payload,
+            ),
+        ),
+    ];
+    for (name, binary) in accepted {
+        let temp = TempDir::new(name);
+        fs::write(temp.join("fixture"), &binary).unwrap();
+        write_spec(
+            &temp.join("workload.toml"),
+            &binary_spec("fixture", "1000:1000"),
+        );
+        assemble(&temp.join("workload.toml"), &temp.join("store"))
+            .unwrap_or_else(|error| panic!("{name} was rejected: {error}"));
+    }
+
+    let temp = TempDir::new("segment-end-past-limit");
+    let binary = elf_with(2, &[segment(LIMIT - length, length, length * 2)], &payload);
+    fs::write(temp.join("fixture"), &binary).unwrap();
+    write_spec(
+        &temp.join("workload.toml"),
+        &binary_spec("fixture", "1000:1000"),
+    );
+    let error = assemble(&temp.join("workload.toml"), &temp.join("store"))
+        .expect_err("a segment past the user address-space limit was accepted");
+    assert!(error.to_string().contains("address space"), "{error}");
+}
+
+#[test]
+fn a_relocated_binary_is_refused_with_a_profile_diagnostic() {
+    // The standalone binary profile is fixed-address only, because a relocated
+    // image's load base, entry, and mapping alignment are chosen by the guest
+    // loader at exec time.
+    let temp = TempDir::new("static-pie-binary");
+    let payload = vec![0x90_u8; 64];
+    let binary = elf_with(3, &[load_segment(1, payload.len())], &payload);
+    fs::write(temp.join("fixture"), &binary).unwrap();
+    write_spec(
+        &temp.join("workload.toml"),
+        &binary_spec("fixture", "1000:1000"),
+    );
+    let store = temp.join("store");
+    let error = assemble(&temp.join("workload.toml"), &store)
+        .expect_err("a relocated binary source was accepted");
+    assert!(error.to_string().contains("static-PIE"), "{error}");
+    assert!(
+        !store.join("raw/closure.json").exists(),
+        "a refused binary source published a raw closure"
+    );
+}
+
+#[test]
+fn the_same_relocated_executable_is_accepted_from_an_oci_source() {
+    // The fixed-address restriction belongs to the binary source alone. An OCI
+    // layer may carry a relocated executable, and assembly and replay leave
+    // loading to the guest.
+    let temp = TempDir::new("static-pie-oci");
+    let payload = vec![0x90_u8; 64];
+    let binary = elf_with(3, &[load_segment(1, payload.len())], &payload);
+    let layout = temp.join("layout");
+    let digest = write_layout(
+        &layout,
+        &[plain_layer(vec![
+            directory("bin"),
+            file_with("bin/simferret-workload", &binary, 0o755, 1000, 1000, 0),
+        ])],
+        default_config(),
+        None,
+        None,
+    );
+    write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+    let store = temp.join("store");
+    let assembled = assemble(&temp.join("workload.toml"), &store).unwrap();
+    let loaded = load(&store).unwrap();
+    assert_eq!(loaded.closure_sha256, assembled.closure_sha256);
+    assert_eq!(entry(&loaded.tree, "bin/simferret-workload").mode, 0o755);
+}
+
+#[test]
+fn a_program_table_at_the_loader_limit_is_accepted() {
+    // 1,170 entries of 56 bytes is exactly the 65,520-byte table the guest
+    // loader accepts, so the limit must not reject the boundary itself.
+    let temp = TempDir::new("program-table-limit");
+    let payload = vec![0x90_u8; 64];
+    let mut headers = vec![load_segment(1170, payload.len())];
+    headers.extend((0..1169).map(|_| null_segment()));
+    let binary = elf_with(2, &headers, &payload);
+    fs::write(temp.join("fixture"), &binary).unwrap();
+    write_spec(
+        &temp.join("workload.toml"),
+        &binary_spec("fixture", "1000:1000"),
+    );
+    let assembled = assemble(&temp.join("workload.toml"), &temp.join("store")).unwrap();
+    assert_eq!(assembled.entries, 3);
 }
 
 #[test]
@@ -1461,6 +1867,10 @@ fn every_launch_identity_class_changes_the_closure() {
         (
             "environment",
             "version = 1\nkind = \"binary\"\npath = \"fixture\"\nargs = []\nenv = [\"MODE=acceptance\"]\nworking_directory = \"/\"\nuser = \"1000:1000\"\n",
+        ),
+        (
+            "working-directory",
+            "version = 1\nkind = \"binary\"\npath = \"fixture\"\nargs = []\nenv = []\nworking_directory = \"/bin\"\nuser = \"1000:1000\"\n",
         ),
         (
             "credentials",
@@ -1571,7 +1981,7 @@ fn tampered_raw_or_derived_content_is_rejected() {
 }
 
 #[test]
-fn a_self_consistent_manifest_and_layer_change_still_fails() {
+fn a_changed_manifest_and_layer_under_the_old_digest_is_rejected() {
     let temp = TempDir::new("self-consistent");
     let binary = static_elf();
     let layout = temp.join("layout");
@@ -1766,12 +2176,856 @@ fn copy_store(from: &Path, to: &Path) {
     }
 }
 
-// Keep the `BTreeMap` import meaningful for future fixtures that compare
-// ordered role maps without changing the public API.
-#[allow(dead_code)]
-fn ordered_roles(roles: &[(&str, &[u8])]) -> BTreeMap<String, Vec<u8>> {
-    roles
+// ---------------------------------------------------------------------------
+// Hardening regression tests
+// ---------------------------------------------------------------------------
+
+struct CpioEntry {
+    name: String,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime: u32,
+    contents: Vec<u8>,
+}
+
+/// Decode a `newc` CPIO archive so template metadata is asserted on the encoded
+/// bytes rather than on substrings.
+fn decode_cpio(bytes: &[u8]) -> Vec<CpioEntry> {
+    let mut entries = Vec::new();
+    let mut offset = 0;
+    loop {
+        assert_eq!(&bytes[offset..offset + 6], b"070701", "bad cpio magic");
+        let field = |index: usize| -> u32 {
+            let start = offset + 6 + index * 8;
+            let text = std::str::from_utf8(&bytes[start..start + 8]).unwrap();
+            u32::from_str_radix(text, 16).unwrap()
+        };
+        let mode = field(1);
+        let uid = field(2);
+        let gid = field(3);
+        let mtime = field(5);
+        let filesize = field(6) as usize;
+        let namesize = field(11) as usize;
+        let name_start = offset + 110;
+        let name =
+            String::from_utf8(bytes[name_start..name_start + namesize - 1].to_vec()).unwrap();
+        let data_start = (name_start + namesize + 3) & !3;
+        let contents = bytes[data_start..data_start + filesize].to_vec();
+        offset = (data_start + filesize + 3) & !3;
+        if name == "TRAILER!!!" {
+            break;
+        }
+        entries.push(CpioEntry {
+            name,
+            mode,
+            uid,
+            gid,
+            mtime,
+            contents,
+        });
+    }
+    entries
+}
+
+fn make_fifo(path: &Path) {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+    assert_eq!(result, 0, "mkfifo failed");
+}
+
+fn permission_bits(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[test]
+fn template_emits_the_root_before_paths_that_sort_before_it() {
+    // `!early` sorts before the `.` root sentinel, and initramfs extraction does
+    // not create missing parents, so the root must be emitted first.
+    let temp = TempDir::new("template-order");
+    let binary = static_elf();
+    let layer = vec![
+        directory("!early"),
+        file_with("!early/data", b"x", 0o644, 0, 0, 0),
+        file_with("bin/simferret-workload", &binary, 0o755, 1000, 1000, 0),
+    ];
+    let layout = temp.join("layout");
+    let digest = write_layout(&layout, &[plain_layer(layer)], default_config(), None, None);
+    write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+    let store = temp.join("store");
+    assemble(&temp.join("workload.toml"), &store).unwrap();
+    let loaded = load(&store).unwrap();
+
+    let entries = decode_cpio(&loaded.template);
+    let names: Vec<String> = entries.iter().map(|entry| entry.name.clone()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "workload",
+            "workload/!early",
+            "workload/!early/data",
+            "workload/bin",
+            "workload/bin/simferret-workload",
+        ]
+    );
+    for (index, name) in names.iter().enumerate() {
+        if let Some((parent, _)) = name.rsplit_once('/') {
+            let parent_index = names
+                .iter()
+                .position(|candidate| candidate == parent)
+                .unwrap();
+            assert!(parent_index < index, "{name} precedes its parent {parent}");
+        }
+    }
+}
+
+#[test]
+fn template_reproduces_canonical_metadata() {
+    let temp = TempDir::new("template-metadata");
+    let binary = static_elf();
+    let layer = vec![
+        Member {
+            mode: 0o750,
+            uid: 2000,
+            gid: 2000,
+            mtime: 1700000003,
+            ..directory("bin")
+        },
+        file_with("bin/simferret-workload", &binary, 0o755, 1000, 1000, 7),
+        Member {
+            mtime: 1700000004,
+            ..symlink("bin/current", "simferret-workload")
+        },
+    ];
+    let layout = temp.join("layout");
+    let digest = write_layout(&layout, &[plain_layer(layer)], default_config(), None, None);
+    write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+    let store = temp.join("store");
+    assemble(&temp.join("workload.toml"), &store).unwrap();
+    let loaded = load(&store).unwrap();
+
+    let entries = decode_cpio(&loaded.template);
+    let root = &entries[0];
+    assert_eq!(root.name, "workload");
+    assert_eq!(root.mode, 0o040755);
+    assert_eq!((root.uid, root.gid, root.mtime), (0, 0, 0));
+
+    let bin = entries
         .iter()
-        .map(|(role, data)| ((*role).to_owned(), data.to_vec()))
-        .collect()
+        .find(|entry| entry.name == "workload/bin")
+        .unwrap();
+    assert_eq!(bin.mode, 0o040750);
+    assert_eq!((bin.uid, bin.gid, bin.mtime), (2000, 2000, 1700000003));
+
+    let executable = entries
+        .iter()
+        .find(|entry| entry.name == "workload/bin/simferret-workload")
+        .unwrap();
+    assert_eq!(executable.mode, 0o100755);
+    assert_eq!(
+        (executable.uid, executable.gid, executable.mtime),
+        (1000, 1000, 7)
+    );
+    assert_eq!(executable.contents, binary);
+
+    let link = entries
+        .iter()
+        .find(|entry| entry.name == "workload/bin/current")
+        .unwrap();
+    assert_eq!(link.mode, 0o120777);
+    assert_eq!(link.mtime, 1700000004);
+    assert_eq!(link.contents, b"simferret-workload");
+}
+
+#[test]
+fn a_non_directory_root_is_rejected() {
+    let temp = TempDir::new("root-file");
+    let binary = static_elf();
+    let layout = temp.join("layout");
+    let digest = write_layout(
+        &layout,
+        &[raw_layer(raw_tar_entry(b".", &binary))],
+        json!({"config": {"Entrypoint": ["/."], "User": "1000:1000"}}),
+        None,
+        None,
+    );
+    write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+    let error = assemble(&temp.join("workload.toml"), &temp.join("store"))
+        .expect_err("a non-directory root was accepted");
+    assert!(
+        error.to_string().contains("root must be a directory"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_fifo_in_the_store_is_rejected() {
+    let temp = TempDir::new("store-fifo-template");
+    let (store, _) = assemble_fixture(&temp);
+    let canonical = load(&store).unwrap().canonical_digest.clone();
+    let template = store.join(format!("derived/{canonical}/template.cpio"));
+    fs::remove_file(&template).unwrap();
+    make_fifo(&template);
+    let error = load(&store).expect_err("a FIFO template was hashed");
+    assert!(
+        error.to_string().contains("is not a regular file"),
+        "{error}"
+    );
+
+    let other = TempDir::new("store-fifo-closure");
+    let (other_store, _) = assemble_fixture(&other);
+    let closure = other_store.join("raw/closure.json");
+    fs::remove_file(&closure).unwrap();
+    make_fifo(&closure);
+    let error = load(&other_store).expect_err("a FIFO closure was read");
+    assert!(
+        error.to_string().contains("is not a regular file"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_symlinked_layout_locator_is_rejected() {
+    let temp = TempDir::new("layout-link");
+    let binary = static_elf();
+    let real = temp.join("real-layout");
+    let digest = write_layout(
+        &real,
+        &[plain_layer(fixture_layer(&binary))],
+        default_config(),
+        None,
+        None,
+    );
+    std::os::unix::fs::symlink(&real, temp.join("link")).unwrap();
+    write_spec(&temp.join("workload.toml"), &oci_spec("link/.", &digest));
+    let error = assemble(&temp.join("workload.toml"), &temp.join("store"))
+        .expect_err("a symlinked layout locator was followed");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+}
+
+#[test]
+fn a_fifo_specification_does_not_block() {
+    let temp = TempDir::new("spec-fifo");
+    let specification = temp.join("workload.toml");
+    make_fifo(&specification);
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_simferret"))
+        .args(["workload", "assemble", "--specification"])
+        .arg(&specification)
+        .args(["--store"])
+        .arg(temp.join("store"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(!status.success(), "a FIFO specification was accepted");
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("assembly blocked on a FIFO specification");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn store_artifacts_are_owner_only() {
+    let temp = TempDir::new("permissions");
+    let (store, _) = assemble_fixture(&temp);
+    let canonical = load(&store).unwrap().canonical_digest.clone();
+    for directory in [
+        store.clone(),
+        store.join("raw"),
+        store.join("raw/sha256"),
+        store.join("derived"),
+        store.join(format!("derived/{canonical}")),
+    ] {
+        assert_eq!(
+            permission_bits(&directory),
+            0o700,
+            "{}",
+            directory.display()
+        );
+    }
+    for file in [
+        store.join("raw/closure.json"),
+        store.join(format!("derived/{canonical}/tree.bin")),
+        store.join(format!("derived/{canonical}/template.cpio")),
+        store.join(format!("derived/{canonical}/lock.json")),
+    ] {
+        assert_eq!(permission_bits(&file), 0o600, "{}", file.display());
+    }
+    for object in fs::read_dir(store.join("raw/sha256")).unwrap() {
+        let object = object.unwrap().path();
+        assert_eq!(permission_bits(&object), 0o600, "{}", object.display());
+    }
+}
+
+#[test]
+fn a_reused_store_path_must_already_be_owner_only() {
+    let binary = static_elf();
+
+    // A pre-existing store root with group or other access is not adopted.
+    let temp = TempDir::new("reused-store-root");
+    fs::write(temp.join("fixture"), &binary).unwrap();
+    write_spec(
+        &temp.join("workload.toml"),
+        &binary_spec("fixture", "1000:1000"),
+    );
+    let store = temp.join("store");
+    fs::create_dir(&store).unwrap();
+    set_mode(&store, 0o777);
+    let error = assemble(&temp.join("workload.toml"), &store)
+        .expect_err("a world-writable store root was adopted");
+    assert!(error.to_string().contains("not owner-only"), "{error}");
+
+    // A pre-existing internal directory with group or other access is not adopted.
+    let temp = TempDir::new("reused-store-directory");
+    fs::write(temp.join("fixture"), &binary).unwrap();
+    write_spec(
+        &temp.join("workload.toml"),
+        &binary_spec("fixture", "1000:1000"),
+    );
+    let store = temp.join("store");
+    fs::create_dir(&store).unwrap();
+    set_mode(&store, 0o700);
+    fs::create_dir(store.join("raw")).unwrap();
+    set_mode(&store.join("raw"), 0o755);
+    let error = assemble(&temp.join("workload.toml"), &store)
+        .expect_err("a group-readable store directory was adopted");
+    assert!(error.to_string().contains("not owner-only"), "{error}");
+
+    // Re-assembling into an existing store must not reuse weakened artifacts.
+    let temp = TempDir::new("reused-store-artifacts");
+    let (store, _) = assemble_fixture(&temp);
+    let canonical = load(&store).unwrap().canonical_digest.clone();
+
+    // A reused object is read without reopening its parent, so the populated
+    // raw object directory is validated on its own.
+    set_mode(&store.join("raw/sha256"), 0o755);
+    let error = assemble(&temp.join("workload.toml"), &store)
+        .expect_err("a reused raw object directory was accepted with group or other access");
+    assert!(error.to_string().contains("not owner-only"), "{error}");
+    set_mode(&store.join("raw/sha256"), 0o700);
+
+    let object = fs::read_dir(store.join("raw/sha256"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    set_mode(&object, 0o644);
+    let error = assemble(&temp.join("workload.toml"), &store)
+        .expect_err("a reused raw object was accepted with group or other access");
+    assert!(error.to_string().contains("not owner-only"), "{error}");
+    set_mode(&object, 0o600);
+
+    set_mode(&store.join(format!("derived/{canonical}")), 0o755);
+    let error = assemble(&temp.join("workload.toml"), &store)
+        .expect_err("a reused derived entry was accepted with group or other access");
+    assert!(error.to_string().contains("not owner-only"), "{error}");
+}
+
+#[test]
+fn a_failed_derived_publication_leaves_no_closure() {
+    let temp = TempDir::new("partial-store");
+    let binary = static_elf();
+    fs::write(temp.join("fixture"), &binary).unwrap();
+    write_spec(
+        &temp.join("workload.toml"),
+        &binary_spec("fixture", "1000:1000"),
+    );
+    let store = temp.join("store");
+    fs::create_dir(&store).unwrap();
+    set_mode(&store, 0o700);
+    fs::write(store.join("derived"), b"not a directory").unwrap();
+    assemble(&temp.join("workload.toml"), &store)
+        .expect_err("publication into a store with a file named derived succeeded");
+    assert!(
+        !store.join("raw/closure.json").exists(),
+        "a raw closure was published without its derived entry"
+    );
+    assert!(load(&store).is_err(), "an incomplete store loaded");
+}
+
+#[test]
+fn a_conflicting_builder_cannot_commit_an_unusable_store() {
+    // Two specifications share one canonical tree but have different closures.
+    // A derived entry left by an interrupted builder must not let a different
+    // closure be committed against it.
+    let temp = TempDir::new("conflicting-builders");
+    let binary = static_elf();
+    fs::write(temp.join("fixture"), &binary).unwrap();
+    write_spec(
+        &temp.join("a.toml"),
+        "version = 1\nkind = \"binary\"\npath = \"fixture\"\nargs = []\nenv = []\nworking_directory = \"/\"\nuser = \"1000:1000\"\n",
+    );
+    write_spec(
+        &temp.join("b.toml"),
+        "version = 1\nkind = \"binary\"\npath = \"fixture\"\nargs = [\"--x\"]\nenv = []\nworking_directory = \"/\"\nuser = \"1000:1000\"\n",
+    );
+    let store = temp.join("store");
+    let first = assemble(&temp.join("a.toml"), &store).unwrap();
+
+    // Simulate an interrupted publication: the derived entry exists, the
+    // closure does not.
+    fs::remove_file(store.join("raw/closure.json")).unwrap();
+
+    let error = assemble(&temp.join("b.toml"), &store)
+        .expect_err("a closure was committed against another builder's derived entry");
+    assert!(
+        error.to_string().contains("does not name this raw closure"),
+        "{error}"
+    );
+    assert!(
+        !store.join("raw/closure.json").exists(),
+        "a closure was committed without a matching derived entry"
+    );
+
+    // The original builder can still complete, and the store then loads.
+    let recovered = assemble(&temp.join("a.toml"), &store).unwrap();
+    assert_eq!(recovered.closure_sha256, first.closure_sha256);
+    assert_eq!(load(&store).unwrap().closure_sha256, first.closure_sha256);
+}
+
+#[test]
+fn a_valid_closure_with_the_wrong_lock_is_rejected() {
+    // Two valid assemblies with the same canonical tree but different closures.
+    // Replacing one store's raw closure with the other's, while keeping the
+    // original derived lock, must fail on the lock rather than on raw content.
+    let temp = TempDir::new("wrong-lock");
+    let binary = static_elf();
+    fs::write(temp.join("fixture"), &binary).unwrap();
+    write_spec(
+        &temp.join("a.toml"),
+        "version = 1\nkind = \"binary\"\npath = \"fixture\"\nargs = []\nenv = []\nworking_directory = \"/\"\nuser = \"1000:1000\"\n",
+    );
+    write_spec(
+        &temp.join("b.toml"),
+        "version = 1\nkind = \"binary\"\npath = \"fixture\"\nargs = [\"--x\"]\nenv = []\nworking_directory = \"/\"\nuser = \"1000:1000\"\n",
+    );
+    let a_store = temp.join("a-store");
+    let b_store = temp.join("b-store");
+    let first = assemble(&temp.join("a.toml"), &a_store).unwrap();
+    let second = assemble(&temp.join("b.toml"), &b_store).unwrap();
+    assert_eq!(first.canonical_digest, second.canonical_digest);
+    assert_ne!(first.closure_sha256, second.closure_sha256);
+
+    for entry in fs::read_dir(b_store.join("raw/sha256")).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(
+            entry.path(),
+            a_store.join("raw/sha256").join(entry.file_name()),
+        )
+        .unwrap();
+    }
+    fs::copy(
+        b_store.join("raw/closure.json"),
+        a_store.join("raw/closure.json"),
+    )
+    .unwrap();
+
+    let error = load(&a_store).expect_err("a closure with the wrong lock was accepted");
+    assert!(
+        error.to_string().contains("does not name this raw closure"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_self_consistent_config_change_is_rejected_by_relationship_checks() {
+    let temp = TempDir::new("self-consistent");
+    let binary = static_elf();
+    let layout = temp.join("layout");
+    let digest = write_layout(
+        &layout,
+        &[plain_layer(fixture_layer(&binary))],
+        default_config(),
+        None,
+        None,
+    );
+    write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+    let store = temp.join("store");
+    assemble(&temp.join("workload.toml"), &store).unwrap();
+
+    // Rewrite the config with a different DiffID under its own digest, then
+    // update the closure so the raw content is internally consistent. The
+    // unchanged manifest/config relationship and derived lock must still reject
+    // the recording.
+    let closure_path = store.join("raw/closure.json");
+    let mut closure: Value = serde_json::from_slice(&fs::read(&closure_path).unwrap()).unwrap();
+    let record = closure["objects"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|record| record["role"] == "config")
+        .unwrap();
+    let old_hex = record["digest"].as_str().unwrap()[7..].to_owned();
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(store.join("raw/sha256").join(&old_hex)).unwrap())
+            .unwrap();
+    config["rootfs"]["diff_ids"][0] = json!("sha256:".to_owned() + &"1".repeat(64));
+    let new_config = serde_json::to_vec(&config).unwrap();
+    let new_hex = sha256_hex(&new_config);
+    fs::write(store.join("raw/sha256").join(&new_hex), &new_config).unwrap();
+    record["digest"] = json!(format!("sha256:{new_hex}"));
+    record["bytes"] = json!(new_config.len());
+    fs::write(&closure_path, serde_json::to_vec(&closure).unwrap()).unwrap();
+
+    let error = load(&store).expect_err("a self-consistent raw change was accepted");
+    assert!(
+        error.to_string().contains("config descriptor")
+            && error.to_string().contains("does not match stored bytes"),
+        "{error}"
+    );
+}
+
+#[test]
+fn oci_launch_arguments_are_bounded() {
+    let binary = static_elf();
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "nul-argument",
+            json!({"config": {"Entrypoint": [INSTALL_PATH], "Cmd": ["a\u{0}b"], "User": "1000:1000"}}),
+        ),
+        (
+            "oversized-argument",
+            json!({"config": {"Entrypoint": [INSTALL_PATH], "Cmd": ["x".repeat(4097)], "User": "1000:1000"}}),
+        ),
+        (
+            "too-many-arguments",
+            json!({"config": {"Entrypoint": [INSTALL_PATH], "Cmd": vec!["a"; 257], "User": "1000:1000"}}),
+        ),
+    ];
+    for (name, config) in cases {
+        let temp = TempDir::new(name);
+        let layout = temp.join("layout");
+        let digest = write_layout(
+            &layout,
+            &[plain_layer(fixture_layer(&binary))],
+            config,
+            None,
+            None,
+        );
+        write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+        let error = assemble(&temp.join("workload.toml"), &temp.join("store"))
+            .expect_err("an unbounded OCI argument vector was accepted");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn the_reserved_owner_identifier_is_rejected() {
+    let binary = static_elf();
+
+    // A binary source may name its owner through the specification.
+    let temp = TempDir::new("reserved-owner-spec");
+    fs::write(temp.join("fixture"), &binary).unwrap();
+    for user in ["4294967295:1000", "1000:4294967295"] {
+        write_spec(&temp.join("workload.toml"), &binary_spec("fixture", user));
+        let error = assemble(&temp.join("workload.toml"), &temp.join("store"))
+            .expect_err("the reserved owner identifier was accepted in the specification");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{user}: {error}"
+        );
+    }
+
+    // The OCI launch credentials reject it as well.
+    let temp = TempDir::new("reserved-owner-config");
+    let layout = temp.join("layout");
+    let digest = write_layout(
+        &layout,
+        &[plain_layer(fixture_layer(&binary))],
+        json!({"config": {"Entrypoint": [INSTALL_PATH], "User": format!("{0}:1000", u32::MAX)}}),
+        None,
+        None,
+    );
+    write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+    let error = assemble(&temp.join("workload.toml"), &temp.join("store"))
+        .expect_err("the reserved owner identifier was accepted in the image configuration");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+
+    // A layer entry may not claim it either, in either ownership field.
+    for (uid, gid) in [(u32::MAX, 1000), (1000, u32::MAX)] {
+        let temp = TempDir::new("reserved-owner-layer");
+        let layout = temp.join("layout");
+        let digest = write_layout(
+            &layout,
+            &[plain_layer(vec![
+                directory("bin"),
+                file_with("bin/simferret-workload", &binary, 0o755, uid, gid, 0),
+            ])],
+            default_config(),
+            None,
+            None,
+        );
+        write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+        let error = assemble(&temp.join("workload.toml"), &temp.join("store"))
+            .expect_err("a layer entry claimed the reserved owner identifier");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+    }
+}
+
+/// Rewrite the retained binary canonical specification and update the closure
+/// record that names it, so the raw subgraph stays internally consistent and
+/// the replay-time validation is what rejects the recording.
+fn rewrite_retained_specification(store: &Path, edit: impl FnOnce(&mut Value)) {
+    let closure_path = store.join("raw/closure.json");
+    let mut closure: Value = serde_json::from_slice(&fs::read(&closure_path).unwrap()).unwrap();
+    let record = closure["objects"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|record| record["role"] == "workload-specification")
+        .unwrap();
+    let old_hex = record["digest"].as_str().unwrap()[7..].to_owned();
+    let mut specification: Value =
+        serde_json::from_slice(&fs::read(store.join("raw/sha256").join(&old_hex)).unwrap())
+            .unwrap();
+    edit(&mut specification);
+    let specification = serde_json::to_vec(&specification).unwrap();
+    let new_hex = sha256_hex(&specification);
+    fs::write(store.join("raw/sha256").join(&new_hex), &specification).unwrap();
+    record["digest"] = json!(format!("sha256:{new_hex}"));
+    record["bytes"] = json!(specification.len());
+    fs::write(&closure_path, serde_json::to_vec(&closure).unwrap()).unwrap();
+}
+
+#[test]
+fn a_retained_specification_with_a_reserved_owner_is_rejected_on_replay() {
+    // The numeric owner in a retained canonical specification never passes
+    // through the specification parser, so replay must enforce the reserved
+    // identifier itself.
+    let temp = TempDir::new("reserved-owner-replay");
+    let (store, _) = assemble_fixture(&temp);
+    rewrite_retained_specification(&store, |specification| {
+        specification["uid"] = json!(u32::MAX);
+    });
+
+    let error = load(&store)
+        .expect_err("a retained specification with the reserved owner identifier was accepted");
+    assert!(error.to_string().contains("reserved owner"), "{error}");
+}
+
+#[test]
+fn a_retained_specification_with_a_moved_install_path_is_rejected_on_replay() {
+    // A self-consistent recording whose install path violates the binary
+    // profile must fail on the profile invariant rather than on a later hash.
+    let temp = TempDir::new("moved-install-path");
+    let (store, _) = assemble_fixture(&temp);
+    rewrite_retained_specification(&store, |specification| {
+        specification["install_path"] = json!("opt/app");
+        specification["arguments"][0] = json!("/opt/app");
+    });
+
+    let error = load(&store).expect_err("a moved binary install path was accepted on replay");
+    assert!(error.to_string().contains("install path"), "{error}");
+}
+
+#[test]
+fn empty_launch_extension_fields_are_treated_as_unconfigured() {
+    // Each unsupported field has its own unconfigured representation: an empty
+    // object, an empty string, and `false` respectively.
+    let temp = TempDir::new("empty-launch-extensions");
+    let binary = static_elf();
+    let layout = temp.join("layout");
+    let digest = write_layout(
+        &layout,
+        &[plain_layer(fixture_layer(&binary))],
+        json!({"config": {
+            "Entrypoint": [INSTALL_PATH],
+            "User": "1000:1000",
+            "WorkingDir": "/",
+            "Volumes": {},
+            "StopSignal": "",
+            "ArgsEscaped": false,
+        }}),
+        None,
+        None,
+    );
+    write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+    let assembled = assemble(&temp.join("workload.toml"), &temp.join("store")).unwrap();
+    assert_eq!(assembled.entries, 3);
+}
+
+#[test]
+fn a_null_environment_is_treated_as_empty() {
+    let temp = TempDir::new("null-env");
+    let binary = static_elf();
+    let layout = temp.join("layout");
+    let digest = write_layout(
+        &layout,
+        &[plain_layer(fixture_layer(&binary))],
+        json!({"config": {"Entrypoint": [INSTALL_PATH], "User": "1000:1000", "Env": null, "WorkingDir": null}}),
+        None,
+        None,
+    );
+    write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+    let store = temp.join("store");
+    assemble(&temp.join("workload.toml"), &store).unwrap();
+    let loaded = load(&store).unwrap();
+    assert!(loaded.launch.environment.is_empty());
+    assert_eq!(loaded.launch.working_directory, "/");
+}
+
+#[test]
+fn an_opaque_marker_may_not_traverse_a_lower_symlink() {
+    let temp = TempDir::new("opaque-symlink");
+    let binary = static_elf();
+    let lower = vec![
+        directory("bin"),
+        file_with("bin/simferret-workload", &binary, 0o755, 1000, 1000, 0),
+        symlink("a", "bin"),
+    ];
+    let upper = vec![file(".wh.a", b""), file("a/.wh..wh..opq", b"")];
+    let layout = temp.join("layout");
+    let digest = write_layout(
+        &layout,
+        &[plain_layer(lower), plain_layer(upper)],
+        default_config(),
+        None,
+        None,
+    );
+    write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+    let error = assemble(&temp.join("workload.toml"), &temp.join("store"))
+        .expect_err("an opaque marker traversed a lower symlink");
+    assert!(error.to_string().contains("traverses symlink"), "{error}");
+}
+
+#[test]
+fn a_self_contained_store_survives_source_mutation() {
+    let temp = TempDir::new("source-mutation");
+    let (store, closure) = assemble_fixture(&temp);
+    fs::write(temp.join("fixture"), b"mutated").unwrap();
+    fs::remove_file(temp.join("workload.toml")).unwrap();
+    let loaded = load(&store).unwrap();
+    assert_eq!(loaded.closure_sha256, closure);
+    assert_eq!(entry(&loaded.tree, "bin/simferret-workload").mode, 0o755);
+}
+
+#[test]
+fn an_expanded_layer_beyond_the_limit_is_rejected() {
+    let temp = TempDir::new("expansion-limit");
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    let chunk = vec![0_u8; 1 << 20];
+    for _ in 0..257 {
+        encoder.write_all(&chunk).unwrap();
+    }
+    let bomb = encoder.finish().unwrap();
+    let layout = temp.join("layout");
+    let digest = write_layout(
+        &layout,
+        &[stored_gzip_layer(bomb)],
+        default_config(),
+        None,
+        None,
+    );
+    write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+    let error = assemble(&temp.join("workload.toml"), &temp.join("store"))
+        .expect_err("an oversized expanded layer was accepted");
+    assert!(error.to_string().contains("expansion limit"), "{error}");
+}
+
+#[test]
+fn an_over_entry_limit_tree_is_rejected_during_construction() {
+    // Nine layers of 4,096 distinct entries push the intermediate tree past the
+    // 32,768-entry bound, and a tenth layer removes enough entries that the
+    // final tree would be legal. A publication-only check would accept the
+    // recording, so this proves the per-layer check runs during construction.
+    let temp = TempDir::new("entry-limit");
+    let binary = static_elf();
+    let mut layers = Vec::new();
+    for layer in 0..9 {
+        let mut members = vec![
+            directory("bin"),
+            file_with("bin/simferret-workload", &binary, 0o755, 1000, 1000, 0),
+        ];
+        for entry in 0..4094 {
+            members.push(file(&format!("layer{layer}/entry{entry}"), b""));
+        }
+        layers.push(plain_layer(members));
+    }
+    let mut whiteouts = Vec::new();
+    for entry in 0..4094 {
+        whiteouts.push(file(&format!("layer8/.wh.entry{entry}"), b""));
+    }
+    whiteouts.push(file("layer7/.wh.entry4093", b""));
+    layers.push(plain_layer(whiteouts));
+
+    // 3 root/bin/executable entries plus 9 * 4,094 additions minus 4,095
+    // whiteouts: legal, and small enough that only the intermediate tree fails.
+    let final_entries = 3 + 9 * 4094 - 4095;
+    assert!(final_entries <= simferret::workload::MAX_VIEW_ENTRIES);
+
+    let layout = temp.join("layout");
+    let digest = write_layout(&layout, &layers, default_config(), None, None);
+    write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
+    let store = temp.join("store");
+    let error = assemble(&temp.join("workload.toml"), &store)
+        .expect_err("an over-limit canonical tree was accepted");
+    assert!(error.to_string().contains("entries"), "{error}");
+    assert!(!store.join("raw/closure.json").exists());
+}
+
+#[test]
+fn oci_launch_identity_is_normalized_and_selected() {
+    let temp = TempDir::new("oci-launch");
+    let binary = static_elf();
+    let layer = vec![
+        directory("bin"),
+        file_with("bin/one", &binary, 0o755, 1000, 1000, 0),
+        file_with("bin/two", &binary, 0o755, 1000, 1000, 0),
+    ];
+    let first = temp.join("first");
+    let first_digest = write_layout(
+        &first,
+        &[plain_layer(layer.clone())],
+        json!({"config": {"Entrypoint": ["/bin/one"], "Cmd": ["--flag"], "Env": ["A=1"], "User": "1000:1000", "WorkingDir": "/bin"}}),
+        None,
+        None,
+    );
+    write_spec(&temp.join("first.toml"), &oci_spec("first", &first_digest));
+    let first_store = temp.join("first-store");
+    assemble(&temp.join("first.toml"), &first_store).unwrap();
+    let loaded = load(&first_store).unwrap();
+    assert_eq!(loaded.launch.executable, "/bin/one");
+    assert_eq!(
+        loaded.launch.arguments,
+        vec!["/bin/one".to_owned(), "--flag".to_owned()]
+    );
+    assert_eq!(loaded.launch.environment, vec!["A=1".to_owned()]);
+    assert_eq!(loaded.launch.working_directory, "/bin");
+    assert_eq!((loaded.launch.uid, loaded.launch.gid), (1000, 1000));
+
+    let second = temp.join("second");
+    let second_digest = write_layout(
+        &second,
+        &[plain_layer(layer)],
+        json!({"config": {"Entrypoint": ["/bin/two"], "User": "1000:1000"}}),
+        None,
+        None,
+    );
+    write_spec(
+        &temp.join("second.toml"),
+        &oci_spec("second", &second_digest),
+    );
+    let second_result = assemble(&temp.join("second.toml"), &temp.join("second-store")).unwrap();
+    assert_eq!(second_result.canonical_digest, loaded.canonical_digest);
+    assert_ne!(second_result.closure_sha256, loaded.closure_sha256);
 }

@@ -212,33 +212,70 @@ impl Tree {
     /// `root_name`. The encoding is a pure function of the canonical tree, so a
     /// verifier can reproduce it byte for byte instead of trusting the stored
     /// copy.
+    ///
+    /// The root entry is emitted first and must be a directory. Initramfs
+    /// extraction does not create missing parent directories, and byte order
+    /// alone would place a path such as `!data` before the root sentinel `.`,
+    /// so emitting the root first is what keeps every child extractable.
     pub fn template(&self, root_name: &str) -> io::Result<Vec<u8>> {
+        let root = self
+            .entries
+            .get(ROOT_PATH)
+            .ok_or_else(|| invalid("canonical tree has no root entry"))?;
+        if root.kind != EntryKind::Directory {
+            return Err(invalid("canonical root must be a directory"));
+        }
         let mut output = Vec::new();
+        append_template_entry(&mut output, root_name.as_bytes(), root)?;
         for (path, entry) in &self.entries {
+            if path.as_slice() == ROOT_PATH {
+                continue;
+            }
             let mut name = Vec::new();
             name.extend_from_slice(root_name.as_bytes());
-            if path.as_slice() != ROOT_PATH {
-                name.push(b'/');
-                name.extend_from_slice(path);
-            }
-            let (mode, contents) = match entry.kind {
-                EntryKind::Directory => (0o040000 | entry.mode, Vec::new()),
-                EntryKind::File => (0o100000 | entry.mode, entry.file_bytes().to_vec()),
-                EntryKind::Symlink => (0o120000 | entry.mode, entry.link_target().to_vec()),
-            };
-            append_cpio(
-                &mut output,
-                &name,
-                mode,
-                entry.uid,
-                entry.gid,
-                entry.mtime,
-                &contents,
-            )?;
+            name.push(b'/');
+            name.extend_from_slice(path);
+            append_template_entry(&mut output, &name, entry)?;
         }
         append_cpio(&mut output, b"TRAILER!!!", 0, 0, 0, 0, &[])?;
         Ok(output)
     }
+}
+
+/// Enforce the canonical tree bounds shared by assembly and replay.
+pub fn validate_canonical_tree(
+    tree: &Tree,
+    max_entries: usize,
+    max_expanded_bytes: usize,
+) -> io::Result<()> {
+    if tree.len() > max_entries {
+        return Err(invalid(format!(
+            "canonical tree exceeds {max_entries} entries"
+        )));
+    }
+    if tree.expanded_bytes() > max_expanded_bytes {
+        return Err(invalid(format!(
+            "canonical tree exceeds {max_expanded_bytes} expanded bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn append_template_entry(output: &mut Vec<u8>, name: &[u8], entry: &Entry) -> io::Result<()> {
+    let (mode, contents) = match entry.kind {
+        EntryKind::Directory => (0o040000 | entry.mode, Vec::new()),
+        EntryKind::File => (0o100000 | entry.mode, entry.file_bytes().to_vec()),
+        EntryKind::Symlink => (0o120000 | entry.mode, entry.link_target().to_vec()),
+    };
+    append_cpio(
+        output,
+        name,
+        mode,
+        entry.uid,
+        entry.gid,
+        entry.mtime,
+        &contents,
+    )
 }
 
 pub fn subtree_prefix(path: &[u8]) -> Vec<u8> {
@@ -586,19 +623,25 @@ mod tests {
     }
 
     #[test]
-    fn template_reproduces_canonical_metadata() {
+    fn template_emits_the_root_first_with_canonical_metadata() {
         let template = sample().template("workload").unwrap();
-        assert!(template.starts_with(b"070701"));
         assert!(template.len().is_multiple_of(4));
-        let text = String::from_utf8_lossy(&template);
-        for name in [
-            "workload",
-            "workload/bin",
-            "workload/bin/app",
-            "workload/link",
-        ] {
-            assert!(text.contains(name), "missing template entry {name}");
-        }
+        assert_eq!(&template[..6], b"070701");
+        let field = |index: usize| -> u32 {
+            let start = 6 + index * 8;
+            u32::from_str_radix(
+                std::str::from_utf8(&template[start..start + 8]).unwrap(),
+                16,
+            )
+            .unwrap()
+        };
+        // The first entry is the root directory, not a child that sorts first.
+        assert_eq!(field(1), 0o040755);
+        assert_eq!(field(2), 0);
+        assert_eq!(field(3), 0);
+        assert_eq!(field(5), 0);
+        let name_size = field(11) as usize;
+        assert_eq!(&template[110..110 + name_size - 1], b"workload");
         assert!(
             template
                 .windows(10)
@@ -609,6 +652,28 @@ mod tests {
             template
                 .windows(7)
                 .any(|window| window == b"bin/app".as_slice())
+        );
+    }
+
+    #[test]
+    fn canonical_tree_bounds_are_enforced() {
+        let tree = sample();
+        assert!(validate_canonical_tree(&tree, tree.len(), tree.expanded_bytes()).is_ok());
+        assert!(validate_canonical_tree(&tree, tree.len() - 1, usize::MAX).is_err());
+        assert!(validate_canonical_tree(&tree, usize::MAX, tree.expanded_bytes() - 1).is_err());
+    }
+
+    #[test]
+    fn a_non_directory_root_has_no_template() {
+        let mut tree = sample();
+        tree.insert(
+            ROOT_PATH.to_vec(),
+            Entry::file(b"root".to_vec(), 0o755, 0, 0, 0),
+        );
+        let error = tree.template("workload").unwrap_err();
+        assert!(
+            error.to_string().contains("root must be a directory"),
+            "{error}"
         );
     }
 

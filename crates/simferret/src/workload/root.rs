@@ -34,6 +34,48 @@ impl Root {
         Ok(Self { fd })
     }
 
+    /// Open one directory that must already satisfy the private-store contract.
+    ///
+    /// A store that already exists with group or other access, or that belongs
+    /// to another user, is rejected instead of being reused. Reusing it would
+    /// let the published artifacts be replaced or read outside the owner, which
+    /// is exactly what the owner-only requirement forbids.
+    pub fn open_private(path: &Path) -> io::Result<Self> {
+        let root = Self::open(path)?;
+        root.require_private(&rustix::fs::fstat(&root.fd)?, &path.display().to_string())?;
+        Ok(root)
+    }
+
+    /// Require one existing directory beneath the root to be owner-only.
+    pub fn require_private_directory(&self, relative: &str) -> io::Result<()> {
+        let directory = self.open_directory(relative)?;
+        self.require_private(&rustix::fs::fstat(&directory.fd)?, relative)
+    }
+
+    /// Require one existing regular file beneath the root to be owner-only.
+    pub fn require_private_file(&self, relative: &str) -> io::Result<()> {
+        let (fd, _) = self.open_regular(relative)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("cannot open file {relative:?}"),
+            )
+        })?;
+        self.require_private(&rustix::fs::fstat(&fd)?, relative)
+    }
+
+    fn require_private(&self, stat: &rustix::fs::Stat, relative: &str) -> io::Result<()> {
+        let mode = stat.st_mode as rustix::fs::RawMode;
+        if stat.st_uid != current_uid() {
+            return Err(invalid(format!(
+                "{relative:?} is not owned by the current user"
+            )));
+        }
+        if mode & 0o077 != 0 {
+            return Err(invalid(format!("{relative:?} is not owner-only")));
+        }
+        Ok(())
+    }
+
     pub fn read_file(&self, relative: &str, limit: usize) -> io::Result<Vec<u8>> {
         match self.read_file_if_exists(relative, limit)? {
             Some(data) => Ok(data),
@@ -46,19 +88,26 @@ impl Root {
 
     pub fn read_file_if_exists(&self, relative: &str, limit: usize) -> io::Result<Option<Vec<u8>>> {
         match self.open_regular(relative)? {
-            Some(fd) => Ok(Some(read_bounded(fd, relative, limit)?)),
+            Some((fd, size)) => Ok(Some(read_bounded(fd, size, relative, limit)?)),
             None => Ok(None),
         }
     }
 
     /// Hash one bounded regular file beneath the root without retaining it.
+    ///
+    /// Type and size validation happen on the same opened descriptor that is
+    /// hashed, so a FIFO, device, or oversized file is rejected here exactly as
+    /// it would be by [`Root::read_file`].
     pub fn sha256_file(&self, relative: &str, limit: usize) -> io::Result<String> {
-        let fd = self.open_regular(relative)?.ok_or_else(|| {
+        let (fd, size) = self.open_regular(relative)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("cannot open file {relative:?}"),
             )
         })?;
+        if size > limit as u64 {
+            return Err(invalid(format!("{relative:?} exceeds {limit} bytes")));
+        }
         let mut file = std::fs::File::from(fd);
         let mut hasher = Sha256::new();
         let mut buffer = vec![0_u8; 64 * 1024];
@@ -77,6 +126,14 @@ impl Root {
         Ok(super::tree::hex(&hasher.finalize()))
     }
 
+    /// Open one directory beneath the root, traversing every component without
+    /// following a symbolic link.
+    pub fn open_directory(&self, relative: &str) -> io::Result<Self> {
+        Ok(Self {
+            fd: self.open_beneath(&components(relative)?)?,
+        })
+    }
+
     /// Report whether any entry exists at the relative path, without following
     /// a symbolic link at that path.
     pub fn exists(&self, relative: &str) -> io::Result<bool> {
@@ -90,6 +147,9 @@ impl Root {
     }
 
     /// Open (creating if needed) one directory beneath the root.
+    ///
+    /// Directories created here are owner-only, because the store may hold
+    /// workload configuration and application data.
     pub fn open_or_create_directory(&self, relative: &str) -> io::Result<OwnedFd> {
         self.open_or_create_beneath(relative, &components(relative)?)
     }
@@ -97,7 +157,7 @@ impl Root {
     fn open_or_create_beneath(&self, relative: &str, components: &[&str]) -> io::Result<OwnedFd> {
         let mut current = self.fd.try_clone()?;
         for component in components {
-            match rustix::fs::mkdirat(&current, *component, Mode::from_bits_truncate(0o755)) {
+            match rustix::fs::mkdirat(&current, *component, Mode::from_bits_truncate(0o700)) {
                 Ok(()) => {}
                 Err(Errno::EXIST) => {}
                 Err(error) => return Err(describe(error, relative)),
@@ -109,6 +169,10 @@ impl Root {
                 Mode::empty(),
             )
             .map_err(|error| describe(error, relative))?;
+            // A directory that already existed is reused only when it already
+            // satisfies the private-store contract, so assembly never adopts a
+            // directory that other users can write to.
+            self.require_private(&rustix::fs::fstat(&current)?, relative)?;
         }
         Ok(current)
     }
@@ -117,7 +181,7 @@ impl Root {
     pub fn create_directory(&self, relative: &str) -> io::Result<()> {
         let (parent, name) = split_relative(relative)?;
         let directory = self.open_beneath(&parent)?;
-        rustix::fs::mkdirat(&directory, name, Mode::from_bits_truncate(0o755))
+        rustix::fs::mkdirat(&directory, name, Mode::from_bits_truncate(0o700))
             .map_err(|error| describe(error, relative))
     }
 
@@ -152,8 +216,13 @@ impl Root {
         let (parent, name) = split_relative(relative)?;
         let directory = self.open_or_create_beneath(relative, &parent)?;
         let temporary = write_staging_file(&directory, name, data)?;
-        rustix::fs::renameat(&directory, temporary.as_str(), &directory, name)
-            .map_err(|error| describe(error, relative))
+        match rustix::fs::renameat(&directory, temporary.as_str(), &directory, name) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = rustix::fs::unlinkat(&directory, temporary.as_str(), AtFlags::empty());
+                Err(describe(error, relative))
+            }
+        }
     }
 
     pub fn rename(&self, from: &str, to: &str) -> io::Result<()> {
@@ -183,23 +252,31 @@ impl Root {
         }
     }
 
-    fn open_regular(&self, relative: &str) -> io::Result<Option<OwnedFd>> {
+    fn open_regular(&self, relative: &str) -> io::Result<Option<(OwnedFd, u64)>> {
         let (parent, name) = split_relative(relative)?;
         let directory = match self.open_beneath(&parent) {
             Ok(directory) => directory,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        match rustix::fs::openat(
+        let fd = match rustix::fs::openat(
             &directory,
             name,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
         ) {
-            Ok(fd) => Ok(Some(fd)),
-            Err(Errno::NOENT) => Ok(None),
-            Err(error) => Err(describe(error, relative)),
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(describe(error, relative)),
+        };
+        let stat = rustix::fs::fstat(&fd)?;
+        if !FileType::from_raw_mode(stat.st_mode as rustix::fs::RawMode).is_file() {
+            return Err(invalid(format!("{relative:?} is not a regular file")));
         }
+        if stat.st_size < 0 {
+            return Err(invalid(format!("{relative:?} has a negative size")));
+        }
+        Ok(Some((fd, stat.st_size as u64)))
     }
 
     fn open_beneath(&self, components: &[&str]) -> io::Result<OwnedFd> {
@@ -217,12 +294,8 @@ impl Root {
     }
 }
 
-fn read_bounded(fd: OwnedFd, relative: &str, limit: usize) -> io::Result<Vec<u8>> {
-    let stat = rustix::fs::fstat(&fd)?;
-    if !FileType::from_raw_mode(stat.st_mode as rustix::fs::RawMode).is_file() {
-        return Err(invalid(format!("{relative:?} is not a regular file")));
-    }
-    if stat.st_size < 0 || stat.st_size as u64 > limit as u64 {
+fn read_bounded(fd: OwnedFd, size: u64, relative: &str, limit: usize) -> io::Result<Vec<u8>> {
+    if size > limit as u64 {
         return Err(invalid(format!("{relative:?} exceeds {limit} bytes")));
     }
     let mut file = std::fs::File::from(fd);
@@ -240,7 +313,7 @@ fn write_staging_file(directory: &OwnedFd, name: &str, data: &[u8]) -> io::Resul
         directory,
         temporary.as_str(),
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_bits_truncate(0o644),
+        Mode::from_bits_truncate(0o600),
     )
     .map_err(|error| describe(error, &temporary))?;
     let written = (|| -> io::Result<()> {
@@ -304,4 +377,10 @@ fn components(relative: &str) -> io::Result<Vec<&str>> {
 
 pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+/// The effective user that owns every file this process creates.
+fn current_uid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    unsafe { libc::geteuid() }
 }

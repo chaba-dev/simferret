@@ -63,9 +63,35 @@ pub struct OciSource {
 }
 
 impl WorkloadSpec {
+    /// Read and parse a specification from one bounded regular file.
+    ///
+    /// The open is non-blocking, so a specification that is a FIFO with no
+    /// writer is rejected instead of blocking the assembler, and the descriptor
+    /// is checked to be a regular file before it is read.
     pub fn read(path: &Path) -> io::Result<Self> {
+        let fd = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| {
+            invalid(format!(
+                "cannot open workload specification {path:?}: {error}"
+            ))
+        })?;
+        let stat = rustix::fs::fstat(&fd)?;
+        if !rustix::fs::FileType::from_raw_mode(stat.st_mode as rustix::fs::RawMode).is_file() {
+            return Err(invalid(format!(
+                "workload specification {path:?} is not a regular file"
+            )));
+        }
+        if stat.st_size < 0 || stat.st_size as u64 > MAX_SPECIFICATION_BYTES as u64 {
+            return Err(invalid(format!(
+                "workload specification must not exceed {MAX_SPECIFICATION_BYTES} bytes"
+            )));
+        }
         let mut source = Vec::new();
-        std::fs::File::open(path)?
+        std::fs::File::from(fd)
             .take(MAX_SPECIFICATION_BYTES as u64 + 1)
             .read_to_end(&mut source)?;
         Self::parse(&source)
@@ -333,6 +359,11 @@ fn parse_user(value: &str) -> io::Result<(u32, u32)> {
         .map_err(|_| invalid(format!("user {value:?} is out of range")))?;
     if uid == 0 || gid == 0 {
         return Err(invalid("root credentials are not supported"));
+    }
+    if uid == super::RESERVED_OWNER || gid == super::RESERVED_OWNER {
+        return Err(invalid(format!(
+            "user {value:?} uses the reserved owner identifier"
+        )));
     }
     Ok((uid, gid))
 }

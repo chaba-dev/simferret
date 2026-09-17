@@ -19,11 +19,12 @@ use super::spec::{
 };
 use super::tree::{
     Entry, EntryKind, Tree, ancestors, join_path, normalize_layer_path, parent_of, sha256_bytes,
-    validate_symlink_syntax, validate_symlinks,
+    validate_canonical_tree, validate_symlink_syntax, validate_symlinks,
 };
 use super::{
     MAX_CONFIG_BYTES, MAX_ENTRIES, MAX_EXPANDED_LAYER_BYTES, MAX_FILE_BYTES, MAX_INDEX_BYTES,
     MAX_LAYER_BYTES, MAX_LAYERS, MAX_LAYOUT_BYTES, MAX_MANIFEST_BYTES, MAX_RAW_OBJECTS,
+    MAX_VIEW_ENTRIES,
 };
 
 pub const LAYOUT_VERSION: &str = "1.0.0";
@@ -216,6 +217,10 @@ pub fn parse_graph(objects: &OciObjects) -> io::Result<OciGraph> {
             )));
         }
         apply_layer(&mut tree, parse_layer(&expanded)?)?;
+        // Bounds are enforced after every layer so a hostile multi-layer image
+        // cannot accumulate an unbounded intermediate tree before the final
+        // check. The same check runs on replay, which shares this path.
+        validate_canonical_tree(&tree, MAX_VIEW_ENTRIES, MAX_EXPANDED_LAYER_BYTES)?;
         evidence.push(LayerEvidence {
             media_type,
             digest: descriptor.digest,
@@ -225,6 +230,9 @@ pub fn parse_graph(objects: &OciObjects) -> io::Result<OciGraph> {
         });
     }
     tree.insert_default_directory(b".");
+    if tree.get(b".").map(|entry| entry.kind) != Some(EntryKind::Directory) {
+        return Err(invalid("canonical root must be a directory"));
+    }
     validate_symlinks(&tree)?;
     let launch = normalize_launch(config, &tree)?;
     Ok(OciGraph {
@@ -347,11 +355,27 @@ fn normalize_launch(config: &Map<String, Value>, tree: &Tree) -> io::Result<Laun
         None => None,
     };
     if let Some(oci) = oci {
-        for field in ["Volumes", "StopSignal", "ArgsEscaped"] {
-            if oci.get(field).is_some_and(truthy) {
-                return Err(invalid(format!(
-                    "the {field} launch field is not supported"
-                )));
+        // Each unsupported field has its own unconfigured representation, so a
+        // value with the wrong JSON type is malformed rather than absent.
+        if let Some(volumes) = oci.get("Volumes").filter(|value| !value.is_null())
+            && !as_object(volumes, "Volumes")?.is_empty()
+        {
+            return Err(invalid("the Volumes launch field is not supported"));
+        }
+        if let Some(signal) = oci.get("StopSignal").filter(|value| !value.is_null()) {
+            let signal = signal
+                .as_str()
+                .ok_or_else(|| invalid("StopSignal must be a string"))?;
+            if !signal.is_empty() {
+                return Err(invalid("the StopSignal launch field is not supported"));
+            }
+        }
+        if let Some(escaped) = oci.get("ArgsEscaped").filter(|value| !value.is_null()) {
+            let escaped = escaped
+                .as_bool()
+                .ok_or_else(|| invalid("ArgsEscaped must be a boolean"))?;
+            if escaped {
+                return Err(invalid("the ArgsEscaped launch field is not supported"));
             }
         }
     }
@@ -360,6 +384,9 @@ fn normalize_launch(config: &Map<String, Value>, tree: &Tree) -> io::Result<Laun
     if arguments.is_empty() {
         return Err(invalid("workload has no executable"));
     }
+    // The combined vector is what the guest executes, so it must satisfy the
+    // same bound as an explicitly declared argument list.
+    let arguments = super::spec::normalize_arguments(&arguments, "arguments")?;
     let executable = &arguments[0];
     if !executable.starts_with('/') {
         return Err(invalid(format!(
@@ -387,7 +414,7 @@ fn normalize_launch(config: &Map<String, Value>, tree: &Tree) -> io::Result<Laun
         "User",
     )?)?;
     let environment = match oci.and_then(|oci| oci.get("Env")) {
-        None => Vec::new(),
+        None | Some(Value::Null) => Vec::new(),
         Some(value) => {
             let array = value
                 .as_array()
@@ -421,9 +448,11 @@ fn string_list(value: Option<&Value>, what: &str) -> io::Result<Vec<String>> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
-    if !truthy(value) {
+    if value.is_null() {
         return Ok(Vec::new());
     }
+    // A known execution field with the wrong JSON type is malformed rather than
+    // absent, so it is rejected instead of being discarded.
     let array = value
         .as_array()
         .ok_or_else(|| invalid(format!("{what} must be a list of strings")))?;
@@ -435,17 +464,6 @@ fn string_list(value: Option<&Value>, what: &str) -> io::Result<Vec<String>> {
                 .ok_or_else(|| invalid(format!("{what} must be a list of strings")))
         })
         .collect()
-}
-
-fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(number) => number.as_f64().is_some_and(|value| value != 0.0),
-        Value::String(value) => !value.is_empty(),
-        Value::Array(value) => !value.is_empty(),
-        Value::Object(value) => !value.is_empty(),
-    }
 }
 
 fn blob_path(digest: &str) -> io::Result<String> {
@@ -546,15 +564,52 @@ impl Marker {
     }
 }
 
+/// Reject a metadata-only USTAR member that declares a data record.
+///
+/// The raw iterator advances by the declared size, so a directory or symbolic
+/// link with a nonzero size would silently drop physical bytes instead of
+/// failing, letting the parsed tree disagree with the stored layer. USTAR
+/// permits a nonzero directory size as a directory-allocation hint, but that
+/// metadata is unsupported by this profile: the pinned iterator cannot
+/// distinguish it from a payload, so it is refused rather than reinterpreted.
+fn reject_declared_size<R: std::io::Read>(
+    entry: &mut tar::Entry<'_, R>,
+    name: &[u8],
+) -> io::Result<()> {
+    let size = entry
+        .header()
+        .size()
+        .map_err(|error| invalid(format!("malformed layer archive: {error}")))?;
+    if size != 0 {
+        return Err(invalid(format!(
+            "nonzero size at {:?}",
+            String::from_utf8_lossy(name)
+        )));
+    }
+    Ok(())
+}
+
 fn parse_layer(expanded: &[u8]) -> io::Result<Vec<Member>> {
     let mut archive = tar::Archive::new(std::io::Cursor::new(expanded));
     let entries = archive
         .entries()
         .map_err(|error| invalid(format!("malformed layer archive: {error}")))?;
     let mut members = Vec::new();
+    let mut end_of_last_member = 0_u64;
     for entry in entries.raw(true) {
         let mut entry =
             entry.map_err(|error| invalid(format!("malformed layer archive: {error}")))?;
+        // The raw iterator advances by the declared size, so this is the physical
+        // end of the member: its header, its data, and any padding.
+        let padded_size = entry
+            .size()
+            .checked_add(511)
+            .ok_or_else(|| invalid("malformed layer archive: member size overflow"))?
+            & !511_u64;
+        end_of_last_member = entry
+            .raw_file_position()
+            .checked_add(padded_size)
+            .ok_or_else(|| invalid("malformed layer archive: member size overflow"))?;
         let entry_type = entry.header().entry_type();
         let name = normalize_layer_path(&entry.path_bytes())?;
         let mode = entry
@@ -585,7 +640,7 @@ fn parse_layer(expanded: &[u8]) -> io::Result<Vec<Member>> {
             .header()
             .mtime()
             .map_err(|error| invalid(format!("malformed layer archive: {error}")))?;
-        if uid > u32::MAX as u64 || gid > u32::MAX as u64 {
+        if uid >= u32::MAX as u64 || gid >= u32::MAX as u64 {
             return Err(invalid(format!(
                 "ownership out of range at {:?}",
                 String::from_utf8_lossy(&name)
@@ -599,9 +654,13 @@ fn parse_layer(expanded: &[u8]) -> io::Result<Vec<Member>> {
         }
         let entry = match entry_type {
             tar::EntryType::Directory => {
+                // USTAR records no data for a directory, so a nonzero declared
+                // size would silently skip physical bytes.
+                reject_declared_size(&mut entry, &name)?;
                 Entry::directory(mode, uid as u32, gid as u32, mtime as u32)
             }
             tar::EntryType::Symlink => {
+                reject_declared_size(&mut entry, &name)?;
                 let target = entry
                     .header()
                     .link_name_bytes()
@@ -676,6 +735,22 @@ fn parse_layer(expanded: &[u8]) -> io::Result<Vec<Member>> {
         if members.len() > MAX_ENTRIES {
             return Err(invalid(format!("layer exceeds {MAX_ENTRIES} entries")));
         }
+    }
+    // POSIX requires two zero blocks after the last member. The pinned raw
+    // iterator stops at the first zero block or at end of input, so without this
+    // check a truncated archive, or one with a member hidden behind a single
+    // zero block, would be accepted. Only the two terminator blocks are
+    // required: POSIX leaves the rest of the final physical block undefined.
+    let terminator_end = end_of_last_member
+        .checked_add(1024)
+        .ok_or_else(|| invalid("layer archive is missing its end-of-archive marker"))?;
+    let terminator = expanded
+        .get(end_of_last_member as usize..terminator_end as usize)
+        .ok_or_else(|| invalid("layer archive is missing its end-of-archive marker"))?;
+    if terminator.iter().any(|byte| *byte != 0) {
+        return Err(invalid(
+            "layer archive is missing its end-of-archive marker",
+        ));
     }
     Ok(members)
 }
@@ -767,7 +842,15 @@ fn apply_layer(tree: &mut Tree, members: Vec<Member>) -> io::Result<()> {
         }
     }
     for marker in &markers {
-        for ancestor in ancestors(marker.target()) {
+        // A whiteout removes its target, so only the target's ancestors are
+        // traversed. An opaque marker applies to its target directory itself,
+        // so that directory must not be a lower-layer symbolic link either.
+        let mut chain = Vec::new();
+        if matches!(marker, Marker::Opaque(_)) {
+            chain.push(marker.target().to_vec());
+        }
+        chain.extend(ancestors(marker.target()));
+        for ancestor in chain {
             if let Some(entry) = tree.get(&ancestor)
                 && entry.kind == EntryKind::Symlink
                 && !provided_directories.contains(&ancestor)
