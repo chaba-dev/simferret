@@ -26,10 +26,14 @@ use crate::workload::LaunchIdentity;
 pub const MAX_RESPONSE_LINE_BYTES: usize = 1024;
 /// The fixed startup line every fixture invocation emits before reading input.
 pub const READY_LINE: &str = "ready version=1";
-/// The fixed line the fixture emits after creating its fresh-root marker.
-pub const FRESH_STATE_LINE: &str = "state value=fresh";
-/// The fixed line the fixture emits if a previous invocation's root survived.
-pub const STALE_STATE_LINE: &str = "state value=stale";
+/// The fixed line the fixture emits after creating its `/tmp` marker and
+/// reporting the mode of its own executable. Both witnesses must be fresh: the
+/// marker proves the writable overlay was recreated, and the executable mode
+/// proves a mutation outside the overlay did not survive either.
+pub const FRESH_STATE_LINE: &str = "state value=fresh root=fresh";
+/// The prefix every state line shares, so a stale witness fails with a precise
+/// message rather than an unexplained line-count mismatch.
+pub const STATE_LINE_PREFIX: &str = "state value=";
 /// The fixed line the fixture emits once its escaped descendant is ready.
 pub const ESCAPED_DESCENDANT_LINE: &str = "descendant state=escaped";
 
@@ -85,6 +89,11 @@ struct InvocationStreams {
     stderr_lines: Vec<CompletedLine>,
     stdout_offset: u64,
     stderr_offset: u64,
+    /// The accepted input offset after the last `input-accepted` event.
+    input_offset: u64,
+    /// The command identifiers of the accepted inputs, in arrival order.
+    input_commands: Vec<u64>,
+    input_events: u64,
     sequence: u64,
     frames: u64,
     violations: Vec<String>,
@@ -100,7 +109,7 @@ impl InvocationStreams {
         sequence: u64,
         data: &[u8],
     ) {
-        if self.frames != 0 && sequence != self.sequence + 1 {
+        if sequence != self.sequence + 1 {
             self.violations.push(format!(
                 "invocation {invocation} sequence jumped from {} to {sequence} at event {}",
                 self.sequence, frame.event_id
@@ -146,6 +155,48 @@ impl InvocationStreams {
             });
         }
     }
+
+    /// Fold one `input-accepted` event. The guest reports the cumulative accepted
+    /// offset after each command, so the offset must advance by exactly the
+    /// accepted byte count, every accepted command must be a distinct later
+    /// command, an end-of-input must carry no bytes, and a data input must carry
+    /// bytes, so a dropped, replayed, or empty input command cannot pass.
+    fn push_input(
+        &mut self,
+        invocation: u64,
+        event_id: u64,
+        command_id: u64,
+        offset: u64,
+        bytes: u64,
+        eof: bool,
+    ) {
+        let expected = self.input_offset.saturating_add(bytes);
+        if offset != expected {
+            self.violations.push(format!(
+                "invocation {invocation} input offset {offset} is not the expected end {expected} at event {event_id}"
+            ));
+        }
+        if eof && bytes != 0 {
+            self.violations.push(format!(
+                "invocation {invocation} accepted an end-of-input with {bytes} bytes at event {event_id}"
+            ));
+        }
+        if !eof && bytes == 0 {
+            self.violations.push(format!(
+                "invocation {invocation} accepted an empty input command at event {event_id}"
+            ));
+        }
+        if let Some(previous) = self.input_commands.last()
+            && command_id <= *previous
+        {
+            self.violations.push(format!(
+                "invocation {invocation} input command {command_id} does not advance past {previous} at event {event_id}"
+            ));
+        }
+        self.input_commands.push(command_id);
+        self.input_offset = offset;
+        self.input_events += 1;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -164,12 +215,14 @@ struct ExitRecord {
     stderr_bytes: u64,
     stderr_sha256: String,
     frames: u64,
+    event_id: u64,
 }
 
 #[derive(Debug, Clone)]
 struct TerminationRecord {
     invocation: u64,
     signal: i32,
+    event_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -228,11 +281,13 @@ impl WorkloadTrace {
                 stderr_bytes: *stderr_bytes,
                 stderr_sha256: stderr_sha256.clone(),
                 frames: *frames,
+                event_id,
             }),
             Event::TerminationRequested { invocation, signal } => {
                 self.terminations.push(TerminationRecord {
                     invocation: *invocation,
                     signal: *signal,
+                    event_id,
                 })
             }
             Event::CleanupComplete { invocation, reaped } => self.cleanups.push(CleanupRecord {
@@ -274,6 +329,12 @@ impl WorkloadTrace {
                     ));
                     return;
                 }
+                if self.exited(*invocation) {
+                    self.violations.push(format!(
+                        "output frame at event {event_id} names invocation {invocation} after it exited"
+                    ));
+                    return;
+                }
                 let Ok(data) =
                     crate::protocol::decode_bytes(bytes, crate::protocol::MAX_OUTPUT_FRAME_BYTES)
                 else {
@@ -291,8 +352,49 @@ impl WorkloadTrace {
                     &data,
                 );
             }
+            Event::InputAccepted {
+                invocation,
+                offset,
+                bytes,
+                eof,
+            } => {
+                if !self
+                    .starts
+                    .iter()
+                    .any(|start| start.invocation == *invocation)
+                {
+                    self.violations.push(format!(
+                        "input-accepted at event {event_id} names invocation {invocation} before it started"
+                    ));
+                    return;
+                }
+                if self.exited(*invocation) {
+                    self.violations.push(format!(
+                        "input-accepted at event {event_id} names invocation {invocation} after it exited"
+                    ));
+                    return;
+                }
+                self.invocations.entry(*invocation).or_default().push_input(
+                    *invocation,
+                    event_id,
+                    frame.command_id,
+                    *offset,
+                    *bytes,
+                    *eof,
+                );
+            }
             _ => {}
         }
+    }
+
+    /// Every stream-structure violation, including the per-invocation offset,
+    /// sequence, and input-stream violations that have no trace-level slot.
+    fn all_violations(&self) -> Vec<&String> {
+        let mut violations = self.violations.iter().collect::<Vec<_>>();
+        for streams in self.invocations.values() {
+            violations.extend(streams.violations.iter());
+        }
+        violations
     }
 
     /// The number of complete stdout lines observed for one invocation.
@@ -375,7 +477,7 @@ fn process_safety(
     choices: &WorkloadChoicePlan,
     launch: &LaunchIdentity,
 ) -> AssertionResult {
-    if let Some(violation) = trace.violations.first() {
+    if let Some(violation) = trace.all_violations().first() {
         return failed(
             AssertionName::ProcessSafety,
             format!("stream structure violation: {violation}"),
@@ -454,10 +556,23 @@ fn process_safety(
             "the first invocation has no cleanup-complete barrier",
         );
     };
-    if first_cleanup.reaped == 0 {
+    if !(terminated.event_id < first_exit.event_id && first_exit.event_id < first_cleanup.event_id)
+    {
         return failed(
             AssertionName::ProcessSafety,
-            "the cleanup barrier reaped no process, so no escaped descendant was killed",
+            "the termination, exit, and cleanup barrier for the first invocation are out of order",
+        );
+    }
+    // The runtime reaps the terminated primary and the escaped descendant the
+    // fixture left behind, so a barrier that reports fewer than two processes
+    // did not prove the descendant was killed.
+    if first_cleanup.reaped < 2 {
+        return failed(
+            AssertionName::ProcessSafety,
+            format!(
+                "the cleanup barrier reaped {} process(es), so the escaped descendant was not confirmed killed",
+                first_cleanup.reaped
+            ),
         );
     }
     if trace.starts[1].event_id <= first_cleanup.event_id {
@@ -466,10 +581,16 @@ fn process_safety(
             "the second invocation started before the first cleanup barrier completed",
         );
     }
-    if trace.any_stdout_line(ESCAPED_DESCENDANT_LINE).is_none() {
+    let Some(escaped) = trace.any_stdout_line(ESCAPED_DESCENDANT_LINE) else {
         return failed(
             AssertionName::ProcessSafety,
             "the first invocation never reported an escaped descendant",
+        );
+    };
+    if escaped.event_id > terminated.event_id {
+        return failed(
+            AssertionName::ProcessSafety,
+            "the escaped descendant was reported after the termination was requested",
         );
     }
     let Some(second_exit) = trace.exits.iter().find(|exit| exit.invocation == 2) else {
@@ -507,11 +628,14 @@ fn process_safety(
         .stdout_lines(1)
         .iter()
         .chain(trace.stdout_lines(2).iter())
-        .any(|line| line.text == STALE_STATE_LINE);
-    if stale {
+        .find(|line| line.text.starts_with(STATE_LINE_PREFIX) && line.text != FRESH_STATE_LINE);
+    if let Some(stale) = stale {
         return failed(
             AssertionName::ProcessSafety,
-            "a restarted invocation observed the first invocation's root mutation",
+            format!(
+                "an invocation observed the first invocation's root mutation at event {}",
+                stale.event_id
+            ),
         );
     }
     if fresh_one != 1 || fresh_two != 1 {
@@ -603,6 +727,32 @@ fn response_integrity(trace: &WorkloadTrace, choices: &WorkloadChoicePlan) -> As
             Some(streams) => (streams.stdout.as_slice(), streams.stderr.as_slice()),
             None => (&[][..], &[][..]),
         };
+        // Each invocation's output is a sequence of complete lines, so an exit
+        // record with bytes after the last newline is an unterminated line. The
+        // pinned fixture never writes to stderr, so any stderr byte is an
+        // application failure.
+        if let Some(streams) = streams {
+            if !streams.stdout_pending.is_empty() {
+                return failed(
+                    AssertionName::ResponseIntegrity,
+                    format!(
+                        "invocation {} ended with {} byte(s) after its last complete line",
+                        exit.invocation,
+                        streams.stdout_pending.len()
+                    ),
+                );
+            }
+            if !streams.stderr_pending.is_empty() || !streams.stderr.is_empty() {
+                return failed(
+                    AssertionName::ResponseIntegrity,
+                    format!(
+                        "invocation {} wrote {} stderr byte(s)",
+                        exit.invocation,
+                        streams.stderr.len() + streams.stderr_pending.len()
+                    ),
+                );
+            }
+        }
         if exit.stdout_bytes != stdout.len() as u64
             || exit.stderr_bytes != stderr.len() as u64
             || exit.frames != streams.map_or(0, |streams| streams.frames)
@@ -625,7 +775,7 @@ fn response_integrity(trace: &WorkloadTrace, choices: &WorkloadChoicePlan) -> As
             );
         }
     }
-    if let Some(violation) = trace.violations.first() {
+    if let Some(violation) = trace.all_violations().first() {
         return failed(
             AssertionName::ResponseIntegrity,
             format!("stream structure violation: {violation}"),
@@ -675,7 +825,13 @@ fn fault_properties(
         })?;
         let wanted = expected_network_line(&choices.requests[index], RequestPhase::Outage);
         let line = trace.any_stdout_line(&wanted)?;
+        // The prohibited request must be observed while the outage is in force,
+        // so it cannot be satisfied by a response that only arrived after the
+        // network was restored.
+        let before_restoration =
+            restoration.is_none_or(|(_, restoration_id)| line.event_id < *restoration_id);
         (line.event_id > *activation_id
+            && before_restoration
             && line.event_id - activation_id <= scenario.outage_event_bound)
             .then_some((line.event_id, line.event_id - activation_id))
     });
@@ -720,15 +876,42 @@ fn fault_properties(
             && line.event_id - restoration_id <= scenario.liveness_event_bound)
             .then_some((line.event_id, line.event_id - restoration_id))
     });
-    let bounded_recovery = match recovery {
-        Some((event_id, distance)) => passed(
+    // A restart is only a recovery if the restarted invocation answers inside the
+    // same liveness bound. Measuring from the second start event, rather than
+    // accepting any recovery, prevents the first invocation's responses from
+    // satisfying the property.
+    let restart = trace
+        .starts
+        .iter()
+        .find(|start| start.invocation == 2)
+        .and_then(|start| {
+            let wanted = format!("echo value={}", echo_token(choices.seed, 2));
+            let line = trace
+                .stdout_lines(2)
+                .iter()
+                .find(|line| line.text == wanted)?;
+            (line.event_id > start.event_id
+                && line.event_id - start.event_id <= scenario.liveness_event_bound)
+                .then_some((line.event_id, line.event_id - start.event_id))
+        });
+    let bounded_recovery = match (recovery, restart) {
+        (Some((event_id, distance)), Some((restart_id, restart_distance))) => passed(
             AssertionName::BoundedRecovery,
-            format!("the workload recovered at event {event_id} after {distance} event(s)"),
+            format!(
+                "the workload recovered at event {event_id} after {distance} event(s) and the restarted invocation answered at event {restart_id} after {restart_distance} event(s)"
+            ),
         ),
-        None => failed(
+        (None, _) => failed(
             AssertionName::BoundedRecovery,
             format!(
                 "no matching workload response arrived within {} event(s) of restoration",
+                scenario.liveness_event_bound
+            ),
+        ),
+        (Some(_), None) => failed(
+            AssertionName::BoundedRecovery,
+            format!(
+                "the restarted invocation did not answer within {} event(s) of its start",
                 scenario.liveness_event_bound
             ),
         ),
@@ -811,13 +994,17 @@ mod tests {
     struct Builder {
         events: Vec<EventFrame>,
         next_event: u64,
+        next_command: u64,
         sequences: BTreeMap<u64, u64>,
+        stdout_offsets: BTreeMap<u64, u64>,
+        input_offsets: BTreeMap<u64, u64>,
     }
 
     impl Builder {
         fn new() -> Self {
             Self {
                 next_event: 1,
+                next_command: 1,
                 ..Self::default()
             }
         }
@@ -826,46 +1013,111 @@ mod tests {
             self.events.push(EventFrame {
                 protocol_version: PROTOCOL_VERSION,
                 event_id: self.next_event,
-                command_id: 1,
+                command_id: self.next_command,
                 event,
                 diagnostics: DiagnosticFields::default(),
             });
             self.next_event += 1;
         }
 
+        /// Start a new command group, as the host driver does for every command.
+        fn begin_command(&mut self) {
+            self.next_command += 1;
+        }
+
+        fn configure(&mut self) {
+            self.begin_command();
+            self.event(Event::NetworkConfigured {
+                interface: "eth0".into(),
+                guest_cidr: "10.0.2.15/24".into(),
+                gateway: "10.0.2.2".into(),
+            });
+        }
+
+        fn activate(&mut self) {
+            self.begin_command();
+            self.event(Event::OutageActivated {
+                peer_cidr: "10.0.2.2/32".into(),
+                rule: "prohibit 10.0.2.2/32".into(),
+            });
+        }
+
+        fn restore(&mut self) {
+            self.begin_command();
+            self.event(Event::NetworkRestored {
+                peer_cidr: "10.0.2.2/32".into(),
+            });
+        }
+
         fn output(&mut self, invocation: u64, text: &str) {
             let sequence = self.sequences.entry(invocation).or_default();
             *sequence += 1;
             let sequence = *sequence;
-            let offset = self
-                .events
-                .iter()
-                .filter_map(|frame| match &frame.event {
-                    Event::WorkloadOutput {
-                        invocation: existing,
-                        stream: OutputStream::Stdout,
-                        bytes,
-                        ..
-                    } if *existing == invocation => {
-                        Some(crate::protocol::decode_bytes(bytes, 1024).unwrap().len())
-                    }
-                    _ => None,
-                })
-                .sum::<usize>();
+            let offset = self.stdout_offsets.entry(invocation).or_default();
+            let start = *offset;
+            *offset += text.len() as u64;
             self.event(Event::WorkloadOutput {
                 invocation,
                 stream: OutputStream::Stdout,
-                offset: offset as u64,
+                offset: start,
                 sequence,
                 bytes: crate::protocol::encode_bytes(text.as_bytes()),
             });
         }
 
+        /// Accept one input command and answer it with one response line. The
+        /// guest reports the cumulative accepted offset, exactly as the runtime
+        /// does.
+        fn command(&mut self, invocation: u64, response: &str) {
+            self.begin_command();
+            let offset = {
+                let offset = self.input_offsets.entry(invocation).or_default();
+                *offset += 8;
+                *offset
+            };
+            self.event(Event::InputAccepted {
+                invocation,
+                offset,
+                bytes: 8,
+                eof: false,
+            });
+            self.output(invocation, response);
+        }
+
         fn start(&mut self, invocation: u64) {
+            self.begin_command();
             self.event(Event::WorkloadStarted {
                 invocation,
                 launch: launch(),
             });
+            self.output(invocation, &format!("{READY_LINE}\n"));
+        }
+
+        fn terminate(&mut self, invocation: u64, reaped: u64) {
+            self.begin_command();
+            self.event(Event::TerminationRequested {
+                invocation,
+                signal: TERMINATION_SIGNAL,
+            });
+            self.exit(
+                invocation,
+                ProcessExit::Signaled {
+                    signal: TERMINATION_SIGNAL,
+                },
+                reaped,
+            );
+        }
+
+        fn input_eof(&mut self, invocation: u64, reaped: u64) {
+            self.begin_command();
+            let offset = self.input_offsets.get(&invocation).copied().unwrap_or(0);
+            self.event(Event::InputAccepted {
+                invocation,
+                offset,
+                bytes: 0,
+                eof: true,
+            });
+            self.exit(invocation, ProcessExit::Exited { code: 0 }, reaped);
         }
 
         fn exit(&mut self, invocation: u64, exit: ProcessExit, reaped: u64) {
@@ -903,69 +1155,104 @@ mod tests {
     }
 
     fn passing_events(choices: &WorkloadChoicePlan) -> Vec<EventFrame> {
+        passing_events_with(choices, false)
+    }
+
+    /// The passing fixture. When `restore_early` is set the network is restored
+    /// immediately after activation, so both outage responses arrive after the
+    /// restoration and the controlled-outage property must fail.
+    fn passing_events_with(choices: &WorkloadChoicePlan, restore_early: bool) -> Vec<EventFrame> {
         let mut builder = Builder::new();
-        builder.event(Event::NetworkConfigured {
-            interface: "eth0".into(),
-            guest_cidr: "10.0.2.15/24".into(),
-            gateway: "10.0.2.2".into(),
-        });
+        builder.configure();
         builder.start(1);
-        builder.output(1, &format!("{READY_LINE}\n"));
-        builder.output(1, &format!("echo value={}\n", echo_token(choices.seed, 1)));
-        builder.output(1, &format!("{FRESH_STATE_LINE}\n"));
-        builder.event(Event::OutageActivated {
-            peer_cidr: "10.0.2.2/32".into(),
-            rule: "prohibit 10.0.2.2/32".into(),
-        });
-        builder.output(
+        builder.command(1, &format!("echo value={}\n", echo_token(choices.seed, 1)));
+        builder.command(1, &format!("{FRESH_STATE_LINE}\n"));
+        builder.command(
             1,
             &format!(
                 "{}\n",
                 expected_network_line(&choices.requests[0], RequestPhase::PreOutage)
             ),
         );
-        builder.output(
+        builder.activate();
+        if restore_early {
+            builder.restore();
+        }
+        builder.command(
             1,
             &format!(
                 "{}\n",
                 expected_network_line(&choices.requests[1], RequestPhase::Outage)
             ),
         );
-        builder.output(1, &format!("{ESCAPED_DESCENDANT_LINE}\n"));
-        builder.event(Event::TerminationRequested {
-            invocation: 1,
-            signal: TERMINATION_SIGNAL,
-        });
-        builder.exit(
-            1,
-            ProcessExit::Signaled {
-                signal: TERMINATION_SIGNAL,
-            },
-            2,
-        );
+        builder.command(1, &format!("{ESCAPED_DESCENDANT_LINE}\n"));
+        builder.terminate(1, 2);
         builder.start(2);
-        builder.output(2, &format!("{READY_LINE}\n"));
-        builder.output(2, &format!("echo value={}\n", echo_token(choices.seed, 2)));
-        builder.output(2, &format!("{FRESH_STATE_LINE}\n"));
-        builder.output(
+        builder.command(2, &format!("echo value={}\n", echo_token(choices.seed, 2)));
+        builder.command(2, &format!("{FRESH_STATE_LINE}\n"));
+        builder.command(
             2,
             &format!(
                 "{}\n",
                 expected_network_line(&choices.requests[2], RequestPhase::Outage)
             ),
         );
-        builder.event(Event::NetworkRestored {
-            peer_cidr: "10.0.2.2/32".into(),
-        });
-        builder.output(
+        if !restore_early {
+            builder.restore();
+        }
+        builder.command(
             2,
             &format!(
                 "{}\n",
                 expected_network_line(&choices.requests[3], RequestPhase::Recovery)
             ),
         );
-        builder.exit(2, ProcessExit::Exited { code: 0 }, 1);
+        builder.input_eof(2, 1);
         builder.events
+    }
+
+    /// Recompute one invocation's exit record from its recorded output frames, so
+    /// a test can change the frames without tripping the totals check first.
+    fn recompute_exit(events: &mut [EventFrame], invocation: u64) {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut frames = 0_u64;
+        for frame in events.iter() {
+            if let Event::WorkloadOutput {
+                invocation: existing,
+                stream,
+                bytes,
+                ..
+            } = &frame.event
+                && *existing == invocation
+            {
+                frames += 1;
+                let data = crate::protocol::decode_bytes(bytes, 1024).unwrap();
+                match stream {
+                    OutputStream::Stdout => stdout.extend_from_slice(&data),
+                    OutputStream::Stderr => stderr.extend_from_slice(&data),
+                }
+            }
+        }
+        let frame = events
+            .iter_mut()
+            .find(|frame| matches!(frame.event, Event::WorkloadExited { invocation: existing, .. } if existing == invocation))
+            .expect("the invocation has an exit record");
+        if let Event::WorkloadExited {
+            stdout_bytes,
+            stdout_sha256,
+            stderr_bytes,
+            stderr_sha256,
+            frames: recorded,
+            ..
+        } = &mut frame.event
+        {
+            *stdout_bytes = stdout.len() as u64;
+            *stdout_sha256 = sha256(&stdout);
+            *stderr_bytes = stderr.len() as u64;
+            *stderr_sha256 = sha256(&stderr);
+            *recorded = frames;
+        }
     }
 
     /// Rewrite the first output frame whose decoded bytes equal `from`.
@@ -1004,7 +1291,13 @@ mod tests {
     fn a_reused_root_fails_process_safety() {
         let choices = fixed_choices();
         let mut events = passing_events(&choices);
-        rewrite(&mut events, b"state value=fresh\n", b"state value=stale\n");
+        // The /tmp marker is fresh, but the first invocation's mutation of its
+        // own executable survived, which only a reused workload root explains.
+        rewrite(
+            &mut events,
+            format!("{FRESH_STATE_LINE}\n").as_bytes(),
+            b"state value=fresh root=stale\n",
+        );
         let report = evaluate_workload(&events, &scenario(), &choices, &launch());
         assert!(!report.assertions[0].passed);
     }
@@ -1025,16 +1318,21 @@ mod tests {
     #[test]
     fn a_descendant_that_was_not_reaped_fails_process_safety() {
         let choices = fixed_choices();
-        let mut events = passing_events(&choices);
-        let frame = events
-            .iter_mut()
-            .find(|frame| matches!(frame.event, Event::CleanupComplete { invocation: 1, .. }))
-            .expect("the first invocation completes cleanup");
-        if let Event::CleanupComplete { reaped, .. } = &mut frame.event {
-            *reaped = 0;
+        for reaped in [0_u64, 1] {
+            let mut events = passing_events(&choices);
+            let frame = events
+                .iter_mut()
+                .find(|frame| matches!(frame.event, Event::CleanupComplete { invocation: 1, .. }))
+                .expect("the first invocation completes cleanup");
+            if let Event::CleanupComplete {
+                reaped: recorded, ..
+            } = &mut frame.event
+            {
+                *recorded = reaped;
+            }
+            let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+            assert!(!report.assertions[0].passed, "reaped = {reaped}");
         }
-        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
-        assert!(!report.assertions[0].passed);
     }
 
     #[test]
@@ -1066,11 +1364,8 @@ mod tests {
     fn a_launch_failure_cannot_satisfy_a_workload_property() {
         let choices = fixed_choices();
         let mut builder = Builder::new();
-        builder.event(Event::NetworkConfigured {
-            interface: "eth0".into(),
-            guest_cidr: "10.0.2.15/24".into(),
-            gateway: "10.0.2.2".into(),
-        });
+        builder.configure();
+        builder.begin_command();
         builder.event(Event::LaunchFailed {
             invocation: 1,
             failure: LaunchFailure::Executable,
@@ -1078,5 +1373,219 @@ mod tests {
         });
         let report = evaluate_workload(&builder.events, &scenario(), &choices, &launch());
         assert!(!report.passed);
+    }
+
+    /// Mutate the first invocation-1 output frame that satisfies `predicate`.
+    fn mutate_output(
+        events: &mut [EventFrame],
+        invocation: u64,
+        last: bool,
+        mutate: impl Fn(&mut u64, &mut u64, &mut u64),
+    ) {
+        let matching = events
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| {
+                matches!(
+                    &frame.event,
+                    Event::WorkloadOutput { invocation: existing, .. } if *existing == invocation
+                )
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let index = if last {
+            *matching.last().expect("the invocation produced output")
+        } else {
+            matching[0]
+        };
+        if let Event::WorkloadOutput {
+            offset, sequence, ..
+        } = &mut events[index].event
+        {
+            mutate(offset, sequence, &mut events[index].event_id);
+        }
+    }
+
+    #[test]
+    fn a_sequence_that_does_not_start_at_one_fails_process_safety() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        mutate_output(&mut events, 1, false, |_, sequence, _| *sequence = 2);
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[0].passed);
+    }
+
+    #[test]
+    fn a_sequence_gap_fails_process_safety() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        mutate_output(&mut events, 2, true, |_, sequence, _| *sequence = 99);
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[0].passed);
+    }
+
+    #[test]
+    fn a_non_contiguous_output_offset_fails_process_safety() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        mutate_output(&mut events, 1, true, |offset, _, _| *offset += 1);
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[0].passed);
+    }
+
+    #[test]
+    fn a_non_contiguous_input_offset_fails_process_safety() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let frame = events
+            .iter_mut()
+            .find(|frame| {
+                matches!(
+                    frame.event,
+                    Event::InputAccepted {
+                        invocation: 2,
+                        eof: false,
+                        ..
+                    }
+                )
+            })
+            .expect("the second invocation accepts input");
+        if let Event::InputAccepted { offset, .. } = &mut frame.event {
+            *offset += 1;
+        }
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[0].passed);
+    }
+
+    #[test]
+    fn a_replayed_input_command_fails_process_safety() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let commands = events
+            .iter()
+            .filter_map(|frame| match frame.event {
+                Event::InputAccepted {
+                    invocation: 1,
+                    eof: false,
+                    ..
+                } => Some(frame.command_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(commands.len() >= 2);
+        let replayed = commands[1];
+        let frame = events
+            .iter_mut()
+            .find(|frame| {
+                frame.command_id == replayed
+                    && matches!(
+                        frame.event,
+                        Event::InputAccepted {
+                            invocation: 1,
+                            eof: false,
+                            ..
+                        }
+                    )
+            })
+            .expect("the first invocation has a second input command");
+        frame.command_id = commands[0];
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[0].passed);
+    }
+
+    #[test]
+    fn an_unterminated_stdout_line_fails_response_integrity() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        // A complete expected line followed by a partial line: the line count is
+        // unchanged, so only the pending-byte check can catch it.
+        let recovery = expected_network_line(&choices.requests[3], RequestPhase::Recovery);
+        rewrite(
+            &mut events,
+            format!("{recovery}\n").as_bytes(),
+            format!("{recovery}\npartial").as_bytes(),
+        );
+        recompute_exit(&mut events, 2);
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[1].passed, "{report:#?}");
+        assert!(
+            report.assertions[1]
+                .detail
+                .contains("after its last complete line"),
+            "{}",
+            report.assertions[1].detail
+        );
+    }
+
+    #[test]
+    fn stderr_output_fails_response_integrity() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let index = events
+            .iter()
+            .position(|frame| matches!(frame.event, Event::WorkloadExited { invocation: 2, .. }))
+            .expect("the second invocation exits");
+        let next_sequence = events
+            .iter()
+            .filter(|frame| matches!(&frame.event, Event::WorkloadOutput { invocation: 2, .. }))
+            .count() as u64
+            + 1;
+        for later in events[index..].iter_mut() {
+            later.event_id += 1;
+        }
+        let event_id = events[index].event_id - 1;
+        events.insert(
+            index,
+            EventFrame {
+                protocol_version: PROTOCOL_VERSION,
+                event_id,
+                command_id: events[index].command_id,
+                event: Event::WorkloadOutput {
+                    invocation: 2,
+                    stream: OutputStream::Stderr,
+                    offset: 0,
+                    sequence: next_sequence,
+                    bytes: crate::protocol::encode_bytes(b"fixture: truncated"),
+                },
+                diagnostics: DiagnosticFields::default(),
+            },
+        );
+        recompute_exit(&mut events, 2);
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[1].passed, "{report:#?}");
+        assert!(
+            report.assertions[1].detail.contains("stderr byte(s)"),
+            "{}",
+            report.assertions[1].detail
+        );
+    }
+
+    #[test]
+    fn a_slow_restart_fails_bounded_recovery() {
+        let choices = fixed_choices();
+        // The events are the passing fixture, but the restarted invocation's first
+        // answer is three events after its start, so a two-event liveness bound
+        // must reject it even though the network recovery is still in bounds.
+        let mut scenario = scenario();
+        scenario.liveness_event_bound = 2;
+        let events = passing_events(&choices);
+        let report = evaluate_workload(&events, &scenario, &choices, &launch());
+        assert!(report.assertions[1].passed, "{report:#?}");
+        assert!(report.assertions[3].passed, "{report:#?}");
+        assert!(!report.assertions[4].passed, "{report:#?}");
+        assert!(
+            report.assertions[4].detail.contains("restarted invocation"),
+            "{}",
+            report.assertions[4].detail
+        );
+    }
+
+    #[test]
+    fn an_outage_observed_after_restoration_fails_controlled_outage() {
+        let choices = fixed_choices();
+        let events = passing_events_with(&choices, true);
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(report.assertions[1].passed, "{report:#?}");
+        assert!(!report.assertions[2].passed, "{report:#?}");
     }
 }
