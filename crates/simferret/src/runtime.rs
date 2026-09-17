@@ -312,6 +312,9 @@ pub struct Runtime {
     /// The greatest invocation identifier ever accepted. Identifiers must be
     /// strictly increasing, so a completed invocation can never be reused.
     last_invocation: Option<u64>,
+    /// A failed start whose root could not be removed. While the path is still
+    /// on disk, a new invocation is refused instead of starting on top of it.
+    pending_removal: Option<PathBuf>,
 }
 
 impl Runtime {
@@ -333,6 +336,7 @@ impl Runtime {
             config,
             active: None,
             last_invocation: None,
+            pending_removal: None,
         })
     }
 
@@ -387,6 +391,26 @@ impl Runtime {
         invocation: u64,
         launch: &LaunchIdentity,
     ) -> Result<Event, (LaunchFailure, String)> {
+        // A failed start whose root could not be removed leaves the path on
+        // disk. Retry the removal instead of starting on top of it, and refuse
+        // the start while the path survives.
+        if let Some(path) = self.pending_removal.clone() {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => self.pending_removal = None,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.pending_removal = None;
+                }
+                Err(error) => {
+                    return Err((
+                        LaunchFailure::Materialization,
+                        format!(
+                            "the previous invocation root {} could not be removed: {error}",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+        }
         if self.active.is_some() {
             return Err((
                 LaunchFailure::InvocationActive,
@@ -426,23 +450,26 @@ impl Runtime {
         }
         // The guard owns the root from the moment it exists, so every failure
         // below leaves no partially materialized root behind.
-        let mut root = RootGuard::create(path)
+        let root = RootGuard::create(path)
             .map_err(|error| (LaunchFailure::Materialization, error.to_string()))?;
         if let Err(error) =
             materialize_into(&self.config.template_root, root.path(), &self.config.limits)
         {
-            // A failed start must not leak the partially materialized root, and
-            // a removal failure must be reported instead of swallowed.
-            root.remove().map_err(|removal| {
-                (
-                    LaunchFailure::Materialization,
-                    format!("{error}; {removal}"),
-                )
-            })?;
-            return Err((LaunchFailure::Materialization, error.to_string()));
+            return Err(self.discard_failed_root(
+                root,
+                LaunchFailure::Materialization,
+                error.to_string(),
+            ));
         }
-        verify_launch_target(root.path(), launch)?;
-        let spawned = spawn(root.path(), launch, self.config.scope)?;
+        if let Err((failure, detail)) = verify_launch_target(root.path(), launch) {
+            return Err(self.discard_failed_root(root, failure, detail));
+        }
+        let spawned = match spawn(root.path(), launch, self.config.scope) {
+            Ok(spawned) => spawned,
+            Err((failure, detail)) => {
+                return Err(self.discard_failed_root(root, failure, detail));
+            }
+        };
         self.active = Some(Invocation {
             id: invocation,
             _root: root,
@@ -658,6 +685,26 @@ impl Runtime {
         active.release_root()?;
         self.active = None;
         Ok(events)
+    }
+
+    /// Remove the root of a failed start and report both the launch failure and
+    /// a cleanup failure. A root that could not be removed is remembered, so a
+    /// later start is refused while it is still on disk instead of reusing the
+    /// same filesystem space.
+    fn discard_failed_root(
+        &mut self,
+        mut root: RootGuard,
+        failure: LaunchFailure,
+        detail: String,
+    ) -> (LaunchFailure, String) {
+        let path = root.path().to_path_buf();
+        match root.remove() {
+            Ok(()) => (failure, detail),
+            Err(error) => {
+                self.pending_removal = Some(path);
+                (failure, format!("{detail}; {error}"))
+            }
+        }
     }
 
     fn invocation_mut(&mut self, invocation: u64) -> io::Result<&mut Invocation> {
@@ -1408,20 +1455,22 @@ fn drain_batch(
     let mut bytes = 0_usize;
     loop {
         let mut progress = false;
-        let remaining_frames = MAX_SERVICE_FRAMES - frames;
-        let remaining_bytes = MAX_SERVICE_BYTES - bytes;
-        if remaining_frames == 0 || remaining_bytes == 0 {
-            return Ok(());
-        }
-        // Each stream is offered at most half of what is left. A stream that is
-        // continuously readable would otherwise consume the whole batch before
-        // the other was serviced, and every later batch would start with it
-        // again, so the other stream could be starved until the invocation
-        // failed. A single ready stream still drains the whole budget across
-        // the loop's iterations.
-        let share_frames = remaining_frames.div_ceil(2);
-        let share_bytes = remaining_bytes.div_ceil(2);
         for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+            let remaining_frames = MAX_SERVICE_FRAMES.saturating_sub(frames);
+            let remaining_bytes = MAX_SERVICE_BYTES.saturating_sub(bytes);
+            if remaining_frames == 0 || remaining_bytes == 0 {
+                return Ok(());
+            }
+            // Each stream is offered at most half of what is left, recomputed
+            // before every call. A stream that is continuously readable would
+            // otherwise consume the whole batch before the other was serviced,
+            // and every later batch would start with it again, so the other
+            // stream could be starved until the invocation failed. A single
+            // ready stream still drains the whole budget across the loop's
+            // iterations, and the allowance is always clamped to what is
+            // actually left, so a rounded-up share can never exceed the budget.
+            let share_frames = remaining_frames.div_ceil(2);
+            let share_bytes = remaining_bytes.div_ceil(2);
             let (drained, size) =
                 drain_stream(active, stream, limits, share_frames, share_bytes, events)?;
             frames += drained;
@@ -2192,6 +2241,102 @@ mod tests {
         std::fs::write(&path, b"occupied").unwrap();
         let error = guard.remove().unwrap_err();
         assert!(error.to_string().contains("invocation root"), "{error}");
+    }
+
+    /// Build an invocation whose pipes are already full, so a batch cannot rely
+    /// on a producer refilling them. The write ends are dropped, so each read
+    /// end also reaches end of file once drained.
+    fn invocation_with_prefilled_pipes(directory: &TempDir) -> (Invocation, usize) {
+        let root = RootGuard::create(directory.0.join("invocation")).unwrap();
+        let stdout = create_pipe().unwrap();
+        let stderr = create_pipe().unwrap();
+        for pipe in [&stdout, &stderr] {
+            set_nonblocking(pipe.write.as_raw_fd()).unwrap();
+            set_nonblocking(pipe.read.as_raw_fd()).unwrap();
+        }
+        let mut filled = 0;
+        let mut buffer = vec![b'x'; 4096];
+        loop {
+            // SAFETY: `buffer` is a live buffer and the write end is a live
+            // non-blocking pipe.
+            let written = unsafe {
+                libc::write(
+                    stdout.write.as_raw_fd(),
+                    buffer.as_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if written <= 0 {
+                break;
+            }
+            filled += written as usize;
+            buffer.clear();
+            buffer.resize(4096, b'x');
+        }
+        // SAFETY: the stderr write end is a live pipe.
+        assert_eq!(
+            unsafe { libc::write(stderr.write.as_raw_fd(), b"err\n".as_ptr().cast(), 4) },
+            4
+        );
+        let active = Invocation {
+            id: 1,
+            _root: root,
+            pid: 0,
+            stdin: None,
+            stdout: Some(stdout.read),
+            stderr: Some(stderr.read),
+            stdout_state: StreamState::new(),
+            stderr_state: StreamState::new(),
+            input_offset: 0,
+            input_bytes: 0,
+            pending_input: Vec::new(),
+            eof_requested: false,
+            terminating: false,
+            sequence: 0,
+            frames: 0,
+            exit: None,
+            reaped: 0,
+            cleanup_complete: false,
+        };
+        drop(stdout.write);
+        drop(stderr.write);
+        (active, filled)
+    }
+
+    /// One batch must reach the other stream before it spends its budget on a
+    /// stream that already has a whole batch of data waiting.
+    #[test]
+    fn a_batch_services_the_other_stream_before_the_budget_is_spent() {
+        let directory = TempDir::new();
+        let (mut active, filled) = invocation_with_prefilled_pipes(&directory);
+        assert!(
+            filled >= MAX_SERVICE_BYTES,
+            "the fixture must prefill at least one whole batch, filled {filled}"
+        );
+        let limits = RuntimeLimits {
+            output_frame_bytes: 4096,
+            ..RuntimeLimits::default()
+        };
+        let mut events = Vec::new();
+        drain_batch(&mut active, &limits, &mut events).unwrap();
+        let frames = events
+            .iter()
+            .filter(|event| matches!(event, Event::WorkloadOutput { .. }))
+            .count();
+        assert!(
+            frames as u64 <= MAX_SERVICE_FRAMES,
+            "a batch must not exceed its frame bound"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::WorkloadOutput {
+                    stream: OutputStream::Stderr,
+                    ..
+                }
+            )),
+            "the batch starved standard error: {frames} frames"
+        );
     }
 
     #[test]
