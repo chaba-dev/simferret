@@ -101,11 +101,25 @@ def directory_entry(name, mode=0o755, uid=0, gid=0, mtime=0):
     return {"name": name, "kind": "dir", "mode": mode, "uid": uid, "gid": gid, "mtime": mtime}
 
 
-def workload_layer(binary):
+def workload_layer(binary, entrypoint=None):
+    name = (entrypoint or ENTRYPOINT[0]).lstrip("/")
     return [
         directory_entry("bin"),
-        file_entry("bin/simferret-workload-fixture", binary, 0o755, 65534, 65534, 0),
+        file_entry(name, binary, 0o755, 65534, 65534, 0),
     ]
+
+
+def workload_config(entrypoint=None):
+    """The launch config for one workload layer.
+
+    The default entrypoint is the spike fixture path. A caller that needs the
+    layer to normalize to the standalone binary profile passes the binary
+    install path instead, so both source forms converge on one canonical tree.
+    """
+    config = json.loads(json.dumps(DEFAULT_CONFIG))
+    if entrypoint is not None:
+        config["config"]["Entrypoint"] = [entrypoint]
+    return config
 
 
 def dynamic_base_layer(loader, library):
@@ -261,17 +275,22 @@ def write_layout(out, layers, config=None, platform=None, mutate=None):
     return capture
 
 
-def build_static(out, binary):
-    return write_layout(out, [{"entries": workload_layer(binary)}])
+def build_static(out, binary, entrypoint=None):
+    return write_layout(
+        out,
+        [{"entries": workload_layer(binary, entrypoint)}],
+        config=workload_config(entrypoint),
+    )
 
 
-def build_dynamic(out, binary, loader, library):
+def build_dynamic(out, binary, loader, library, entrypoint=None):
     return write_layout(
         out,
         [
             {"entries": dynamic_base_layer(loader, library), "compressed": True},
-            {"entries": workload_layer(binary)},
+            {"entries": workload_layer(binary, entrypoint)},
         ],
+        config=workload_config(entrypoint),
     )
 
 
@@ -570,12 +589,14 @@ def main(argv):
 
     static_parser = subcommands.add_parser("static")
     static_parser.add_argument("--binary", required=True)
+    static_parser.add_argument("--entrypoint", default=None)
     static_parser.add_argument("--out", required=True)
 
     dynamic_parser = subcommands.add_parser("dynamic")
     dynamic_parser.add_argument("--binary", required=True)
     dynamic_parser.add_argument("--loader", required=True)
     dynamic_parser.add_argument("--library", required=True)
+    dynamic_parser.add_argument("--entrypoint", default=None)
     dynamic_parser.add_argument("--out", required=True)
 
     root_opacity_parser = subcommands.add_parser("root-opacity")
@@ -602,13 +623,16 @@ def main(argv):
         print("\n".join(DEFECTS))
         return 0
     if arguments.command == "static":
-        capture = build_static(arguments.out, Path(arguments.binary).read_bytes())
+        capture = build_static(
+            arguments.out, Path(arguments.binary).read_bytes(), arguments.entrypoint
+        )
     elif arguments.command == "dynamic":
         capture = build_dynamic(
             arguments.out,
             Path(arguments.binary).read_bytes(),
             Path(arguments.loader).read_bytes(),
             Path(arguments.library).read_bytes(),
+            arguments.entrypoint,
         )
     elif arguments.command == "root-opacity":
         capture = build_root_opacity(arguments.out, Path(arguments.binary).read_bytes())
