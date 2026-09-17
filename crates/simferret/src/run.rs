@@ -845,15 +845,16 @@ fn validate_response(command: &Command, event_index: usize, frame: &EventFrame) 
 }
 
 fn valid_report(report: &AssertionReport) -> bool {
-    use crate::assertions::AssertionName;
+    valid_profile(report, &crate::assertions::AssertionName::NETWORK_PROFILE)
+}
 
-    let mut seen = [false; 4];
+/// Require exactly the profile's assertion names, each once, and a summary that
+/// agrees with them.
+fn valid_profile(report: &AssertionReport, profile: &[crate::assertions::AssertionName]) -> bool {
+    let mut seen = vec![false; profile.len()];
     for assertion in &report.assertions {
-        let index = match assertion.name {
-            AssertionName::Safety => 0,
-            AssertionName::ControlledOutage => 1,
-            AssertionName::Restoration => 2,
-            AssertionName::BoundedRecovery => 3,
+        let Some(index) = profile.iter().position(|name| *name == assertion.name) else {
+            return false;
         };
         if seen[index] {
             return false;
