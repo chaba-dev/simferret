@@ -559,6 +559,18 @@ impl WorkloadTrace {
                     ));
                     return;
                 }
+                if self
+                    .terminations
+                    .iter()
+                    .any(|termination| termination.invocation == *invocation)
+                {
+                    // The runtime refuses input, including end of input, once the
+                    // invocation is being terminated.
+                    self.violations.push(format!(
+                        "input-accepted at event {event_id} names invocation {invocation} after it was terminated"
+                    ));
+                    return;
+                }
                 self.invocations.entry(*invocation).or_default().push_input(
                     *invocation,
                     event_id,
@@ -1550,13 +1562,36 @@ mod tests {
         let mut events = passing_events(&choices);
         // A termination for an invocation that has already exited and completed
         // its cleanup cannot be part of a passing process history.
-        let index = events.len() - 1;
+        let event_id = events.last().expect("the fixture has events").event_id + 1;
+        events.push(EventFrame {
+            protocol_version: PROTOCOL_VERSION,
+            event_id,
+            command_id: 1,
+            event: Event::TerminationRequested {
+                invocation: 2,
+                signal: TERMINATION_SIGNAL,
+            },
+            diagnostics: DiagnosticFields::default(),
+        });
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
+    }
+
+    #[test]
+    fn an_input_acknowledgement_after_termination_fails_process_safety() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        // The runtime refuses input, including end of input, once an invocation
+        // is being terminated.
+        let index = exit_index(&events, 1);
         insert_event(
             &mut events,
             index,
-            Event::TerminationRequested {
-                invocation: 2,
-                signal: TERMINATION_SIGNAL,
+            Event::InputAccepted {
+                invocation: 1,
+                offset: 24,
+                bytes: 0,
+                eof: true,
             },
             1,
         );
