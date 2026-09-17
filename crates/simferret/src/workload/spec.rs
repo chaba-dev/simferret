@@ -106,7 +106,7 @@ impl WorkloadSpec {
         let text = std::str::from_utf8(source)
             .map_err(|error| invalid(format!("workload specification is not UTF-8: {error}")))?;
         let probe: KindProbe = toml::from_str(text).map_err(|error| {
-            crate::diagnostics::toml_input_error("malformed workload specification", &error)
+            crate::diagnostics::toml_error("malformed workload specification", &error)
         })?;
         if probe.version != WORKLOAD_SPEC_VERSION {
             return Err(invalid(format!(
@@ -117,7 +117,7 @@ impl WorkloadSpec {
         match probe.kind {
             SourceKind::Binary => {
                 let document: BinaryDocument = toml::from_str(text).map_err(|error| {
-                    crate::diagnostics::toml_input_error("malformed binary workload", &error)
+                    crate::diagnostics::toml_error("malformed binary workload", &error)
                 })?;
                 if document.kind != SourceKind::Binary {
                     return Err(invalid("binary workload must declare kind = \"binary\""));
@@ -143,7 +143,7 @@ impl WorkloadSpec {
             }
             SourceKind::Oci => {
                 let document: OciDocument = toml::from_str(text).map_err(|error| {
-                    crate::diagnostics::toml_input_error("malformed OCI workload", &error)
+                    crate::diagnostics::toml_error("malformed OCI workload", &error)
                 })?;
                 if document.kind != SourceKind::Oci {
                     return Err(invalid("OCI workload must declare kind = \"oci\""));

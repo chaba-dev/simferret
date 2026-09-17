@@ -3,9 +3,10 @@
 //! A parser error can quote the document it failed on, and a private artifact or
 //! a guest frame can hold a launch environment value or an exact stream byte.
 //! Every parser failure that can reach a shareable failure report or the CLI is
-//! therefore reduced to a fixed context plus a numeric location. A document the
-//! user authored and can inspect directly keeps a message whose quoted spans are
-//! replaced, so a type error still names the field it rejected.
+//! therefore reduced to a fixed context plus a numeric location. A parser
+//! message is never reused: both serde and TOML format the offending value with
+//! escaping that a redactor cannot reliably undo, so only the category and the
+//! location survive.
 
 use std::io;
 
@@ -38,48 +39,6 @@ pub fn toml_error(context: &str, error: &toml::de::Error) -> io::Error {
     }
 }
 
-/// Reduce one TOML failure for a user-authored document, keeping the message
-/// with every quoted or backticked span replaced.
-pub fn toml_input_error(context: &str, error: &toml::de::Error) -> io::Error {
-    let message = redact_quoted(error.message());
-    match error.span() {
-        Some(span) => invalid(format!(
-            "{context}: {message} at byte offset {}..{}",
-            span.start, span.end
-        )),
-        None => invalid(format!("{context}: {message}")),
-    }
-}
-
-/// Replace the content of every quoted or backticked span in one message.
-///
-/// A TOML or serde message quotes the value it rejected, and a rejected value
-/// can be an environment entry or a stream byte, so only the delimiter and the
-/// placeholder survive.
-fn redact_quoted(message: &str) -> String {
-    let mut output = String::with_capacity(message.len());
-    let mut delimiter = None;
-    for character in message.chars() {
-        match delimiter {
-            Some(active) => {
-                if character == active {
-                    delimiter = None;
-                    output.push(active);
-                }
-            }
-            None => match character {
-                '"' | '\'' | '`' => {
-                    delimiter = Some(character);
-                    output.push(character);
-                    output.push('…');
-                }
-                _ => output.push(character),
-            },
-        }
-    }
-    output
-}
-
 fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -109,14 +68,20 @@ mod tests {
     }
 
     #[test]
-    fn toml_failures_name_a_location_and_redact_values() {
-        let error = toml::from_str::<Probe>("environment = [\"SECRET=value\", 17]").unwrap_err();
-        let message = toml_input_error("malformed workload specification", &error).to_string();
-        assert!(!message.contains("SECRET"), "{message}");
-        assert!(message.contains("byte offset"), "{message}");
-
-        let private = toml_error("malformed workload specification", &error).to_string();
-        assert!(!private.contains("SECRET"), "{private}");
-        assert!(private.contains("byte offset"), "{private}");
+    fn toml_failures_name_a_location_only() {
+        for source in [
+            // A type error whose value is a quoted string.
+            "environment = [\"SECRET=value\", 17]",
+            // A type error whose value embeds the delimiter the message quotes it
+            // with, which a redactor cannot undo reliably.
+            "environment = 'TOKEN=\"CANARY'",
+        ] {
+            let error = toml::from_str::<Probe>(source).unwrap_err();
+            let message = toml_error("malformed workload specification", &error).to_string();
+            assert!(!message.contains("SECRET"), "{message}");
+            assert!(!message.contains("CANARY"), "{message}");
+            assert!(!message.contains("TOKEN"), "{message}");
+            assert!(message.contains("byte offset"), "{message}");
+        }
     }
 }

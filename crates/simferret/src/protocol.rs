@@ -500,7 +500,7 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<Opt
     reader.read_exact(&mut body)?;
     serde_json::from_slice(&body)
         .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .map_err(|error| crate::diagnostics::json_error("malformed frame", &error))
 }
 
 pub fn read_line_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<Option<T>> {
@@ -532,7 +532,7 @@ pub fn read_line_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Resul
     }
     serde_json::from_slice(&body)
         .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .map_err(|error| crate::diagnostics::json_error("malformed frame", &error))
 }
 
 pub fn read_acknowledged_line_frame<T: DeserializeOwned>(
@@ -571,7 +571,7 @@ pub fn read_acknowledged_line_frame<T: DeserializeOwned>(
     }
     serde_json::from_slice(&body)
         .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .map_err(|error| crate::diagnostics::json_error("malformed frame", &error))
 }
 
 pub fn require_version(version: u16) -> io::Result<()> {
@@ -910,6 +910,19 @@ mod tests {
                 assert!(!described.contains(secret), "{described}");
             }
         }
+    }
+
+    #[test]
+    fn malformed_frames_never_quote_the_launch_identity() {
+        // The guest-agent command reads its command frames with `read_frame`, so a
+        // malformed launch field must not reach the CLI with its value intact.
+        let body = br#"{"protocol_version":1,"command_id":1,"command":{"type":"start","invocation":1,"launch":{"executable":"/bin/app","arguments":[],"environment":["MODE=ok"],"working_directory":"/","uid":"SECRET=frame-marker","gid":1}}}"#;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(body);
+        let error = read_frame::<CommandFrame>(&mut frame.as_slice()).unwrap_err();
+        assert!(!error.to_string().contains("frame-marker"), "{error}");
+        assert!(error.to_string().contains("malformed frame"), "{error}");
     }
 
     #[test]

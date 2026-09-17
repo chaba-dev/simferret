@@ -111,7 +111,7 @@ impl WorkloadScenario {
         let text = std::str::from_utf8(&source)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let scenario: Self = toml::from_str(text)
-            .map_err(|error| crate::diagnostics::toml_input_error("malformed scenario", &error))?;
+            .map_err(|error| crate::diagnostics::toml_error("malformed scenario", &error))?;
         scenario.validate()?;
         Ok((scenario, source))
     }
@@ -218,7 +218,7 @@ impl Scenario {
         let text = std::str::from_utf8(&source)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let scenario: Self = toml::from_str(text)
-            .map_err(|error| crate::diagnostics::toml_input_error("malformed scenario", &error))?;
+            .map_err(|error| crate::diagnostics::toml_error("malformed scenario", &error))?;
         scenario.validate()?;
         Ok((scenario, source))
     }

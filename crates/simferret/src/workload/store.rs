@@ -565,8 +565,10 @@ fn replay_graph(
             if objects.len() != 2 {
                 return Err(invalid("binary closure names unexpected objects"));
             }
-            let canonical: CanonicalBinarySpec = serde_json::from_slice(specification)
-                .map_err(|error| invalid(format!("malformed canonical specification: {error}")))?;
+            let canonical: CanonicalBinarySpec =
+                serde_json::from_slice(specification).map_err(|error| {
+                    crate::diagnostics::json_error("malformed canonical specification", &error)
+                })?;
             if canonical.version != WORKLOAD_SPEC_VERSION || canonical.kind != SourceKind::Binary {
                 return Err(invalid("canonical specification is not a version-1 binary"));
             }
