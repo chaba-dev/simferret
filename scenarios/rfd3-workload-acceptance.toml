@@ -1,0 +1,8 @@
+version = 1
+name = "workload-network-outage"
+request_count = 6
+payload_bytes = 16
+fixture_peer = "10.0.2.2"
+outage_event_bound = 8
+liveness_event_bound = 8
+corrupt_responses = false

@@ -12,14 +12,23 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::assertions::{AssertionReport, evaluate};
+use crate::checker::{
+    ESCAPED_DESCENDANT_LINE, FRESH_STATE_LINE, WorkloadTrace, echo_token, evaluate_workload,
+    expected_network_line, request_phase,
+};
 use crate::protocol::{
     Command, CommandFrame, Event, EventFrame, NormalizedEvent, PROTOCOL_VERSION, RequestPhase,
+    encode_bytes,
 };
-use crate::scenario::{ChoicePlan, MAX_SCENARIO_SOURCE_BYTES, Scenario};
+use crate::scenario::{
+    ChoicePlan, MAX_SCENARIO_SOURCE_BYTES, PlannedRequest, Scenario, WorkloadChoicePlan,
+    WorkloadScenario,
+};
 use crate::vm::{
     NetworkConfig, NetworkIdentity, QemuAdapter, RecordConfig, RunningVm, VmAdapter, VmIdentity,
     digest_fixture_entries, sha256_file, validate_replay_network_identity,
 };
+use crate::workload::{LaunchIdentity, SourceKind};
 
 const MANIFEST_VERSION: u16 = 1;
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
@@ -28,6 +37,16 @@ const MAX_DIAGNOSTIC_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FAILURE_LOG_BYTES: usize = 64 * 1024;
 const MAX_FAILURE_TEXT_BYTES: usize = 64 * 1024;
 const MAX_REPLAY_LOG_BYTES: usize = 1024 * 1024 * 1024;
+/// The version of the private workload lock artifact.
+const WORKLOAD_LOCK_VERSION: u16 = 1;
+/// The private workload lock artifact name, which is present only for a
+/// workload-driven run.
+const WORKLOAD_LOCK_PATH: &str = "workload.lock";
+const MAX_WORKLOAD_LOCK_BYTES: usize = 1024 * 1024;
+/// The single path component naming the content-addressed workload store. The
+/// store lives in the runs directory so a recording and its passive replays
+/// share one raw and derived closure without copying it into every run.
+const WORKLOAD_STORE_NAME: &str = ".workload-store";
 const ARTIFACT_NAMES: [&str; 7] = [
     "scenario.toml",
     "choices.json",
@@ -46,6 +65,10 @@ pub struct RunOptions {
     pub runs_directory: PathBuf,
     pub kernel: PathBuf,
     pub executable: PathBuf,
+    /// The workload specification. When present the scenario is parsed as a
+    /// workload-driven acceptance scenario and the packaged workload originates
+    /// the recorded requests.
+    pub workload: Option<PathBuf>,
 }
 
 pub struct ReplayOptions {
@@ -95,6 +118,33 @@ struct Manifest {
     initial_state_sha256: String,
     semantic_outcome_sha256: String,
     artifacts: BTreeMap<String, String>,
+    /// The normalized workload identity, present only for a workload-driven run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workload: Option<WorkloadIdentity>,
+}
+
+/// The normalized workload identity a run manifest records. It is derived from
+/// the verified raw closure at assembly time and re-derived independently on
+/// replay.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadIdentity {
+    pub source_kind: SourceKind,
+    pub closure_sha256: String,
+    pub canonical_digest: String,
+    pub template_sha256: String,
+    pub launch: LaunchIdentity,
+}
+
+/// The private workload lock artifact. It names the shared content store and the
+/// complete workload identity the run was recorded with, so replay can locate
+/// the raw closure without consulting a live source.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkloadLock {
+    version: u16,
+    store: String,
+    workload: WorkloadIdentity,
 }
 
 #[derive(Debug, Serialize)]
@@ -255,51 +305,33 @@ fn record_with_adapter_and_assets(
         )
     })?;
     let attempt = (|| {
-        let (scenario, scenario_source) = Scenario::read(&options.scenario)?;
-        let choices = scenario.choices(options.seed);
-        let image = build_guest_image_with_assets(
-            &options.executable,
-            &options.runs_directory,
-            assets,
-            None,
-        )?;
-        fs::create_dir(staging.path.join("logs"))?;
-        fs::write(staging.path.join("scenario.toml"), scenario_source)?;
-        write_json(staging.path.join("choices.json"), &choices)?;
-        let fixture_directory = staging.path.join("fixture");
-        let fixture_entries = fixture_entries(&choices, scenario.corrupt_responses);
-        materialize_fixture(&fixture_directory, &fixture_entries)?;
-        let network = NetworkConfig::restricted_tftp_record_with_tool_digest(
-            fixture_directory.clone(),
-            sha256_bytes(&assets.busybox),
-        )?;
-        diagnostics.set_network(&network.identity);
-        let config = RecordConfig {
-            kernel: fs::canonicalize(&options.kernel)?,
-            initramfs: image.path,
-            replay_log: staging.path.join("replay.bin"),
-            qmp_socket: qmp.path.join("qmp.sock"),
-            serial_log: staging.path.join("logs/serial.log"),
-            qemu_log: staging.path.join("logs/qemu.log"),
-            network: Some(network),
+        let outcome = match &options.workload {
+            Some(specification) => record_workload_scenario(
+                options,
+                adapter,
+                assets,
+                &staging,
+                &qmp,
+                &mut diagnostics,
+                specification,
+            )?,
+            None => {
+                record_network_scenario(options, adapter, assets, &staging, &qmp, &mut diagnostics)?
+            }
         };
-        diagnostics.stage = "launch".into();
-        let mut vm = adapter.launch_record(&config)?;
-        diagnostics.stage = "execution".into();
-        let identity = vm.identity().clone();
-        let (events, assertions) =
-            drive_scenario(&scenario, &choices, vm.as_mut(), &mut diagnostics)?;
-        diagnostics.stage = "shutdown".into();
-        let status = vm.wait()?;
-        if !status.success() {
-            return Err(io::Error::other(format!("QEMU exited with {status}")));
-        }
+        let RecordOutcome {
+            scenario_name,
+            image,
+            identity,
+            events,
+            assertions,
+            workload,
+        } = outcome;
         diagnostics.stage = "publication".into();
-        fs::remove_dir_all(fixture_directory)?;
         let event_bytes = encode_events(&events)?;
-        fs::write(staging.path.join("events.jsonl"), &event_bytes)?;
+        write_private(staging.path.join("events.jsonl"), &event_bytes)?;
         let assertion_bytes = json_bytes(&assertions)?;
-        fs::write(staging.path.join("assertions.json"), &assertion_bytes)?;
+        write_private(staging.path.join("assertions.json"), &assertion_bytes)?;
         let choice_bytes = fs::read(staging.path.join("choices.json"))?;
         let scenario_bytes = fs::read(staging.path.join("scenario.toml"))?;
         let semantic_outcome_sha256 = digest_parts([
@@ -308,11 +340,11 @@ fn record_with_adapter_and_assets(
             event_bytes.as_slice(),
             assertion_bytes.as_slice(),
         ]);
-        let artifacts = artifact_digests(&staging.path)?;
+        let artifacts = artifact_digests(&staging.path, workload.is_some())?;
         let manifest = Manifest {
             version: MANIFEST_VERSION,
             run_id: run_id.clone(),
-            scenario_name: scenario.name,
+            scenario_name,
             seed: options.seed,
             simferret_version: env!("CARGO_PKG_VERSION").into(),
             simferret_path: options
@@ -327,8 +359,9 @@ fn record_with_adapter_and_assets(
             semantic_outcome_sha256,
             vm: identity,
             artifacts,
+            workload,
         };
-        write_json(staging.path.join("manifest.json"), &manifest)?;
+        write_private_json(staging.path.join("manifest.json"), &manifest)?;
         let directory = staging.publish()?;
         Ok(RunResult {
             run_id: run_id.clone(),
@@ -345,6 +378,175 @@ fn record_with_adapter_and_assets(
             Some(&qmp.path),
             &diagnostics,
         )
+    })
+}
+
+/// Everything the shared publication tail needs from one record attempt.
+struct RecordOutcome {
+    scenario_name: String,
+    image: GuestImage,
+    identity: VmIdentity,
+    events: Vec<NormalizedEvent>,
+    assertions: AssertionReport,
+    workload: Option<WorkloadIdentity>,
+}
+
+/// The Phase 4 network-fixture record path. The agent originates every request.
+fn record_network_scenario(
+    options: &RunOptions,
+    adapter: &dyn VmAdapter,
+    assets: &GuestImageAssets,
+    staging: &StagingDirectory,
+    qmp: &QmpDirectory,
+    diagnostics: &mut FailureDiagnostics,
+) -> io::Result<RecordOutcome> {
+    let (scenario, scenario_source) = Scenario::read(&options.scenario)?;
+    let choices = scenario.choices(options.seed);
+    let image =
+        build_guest_image_with_assets(&options.executable, &options.runs_directory, assets, None)?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(staging.path.join("logs"))?;
+    write_private(staging.path.join("scenario.toml"), &scenario_source)?;
+    write_private_json(staging.path.join("choices.json"), &choices)?;
+    let fixture_directory = staging.path.join("fixture");
+    let fixture_entries = fixture_entries(&choices.requests, scenario.corrupt_responses);
+    materialize_fixture(&fixture_directory, &fixture_entries)?;
+    let network = NetworkConfig::restricted_tftp_record_with_tool_digest(
+        fixture_directory.clone(),
+        sha256_bytes(&assets.busybox),
+    )?;
+    diagnostics.set_network(&network.identity);
+    let config = RecordConfig {
+        kernel: fs::canonicalize(&options.kernel)?,
+        initramfs: image.path.clone(),
+        replay_log: staging.path.join("replay.bin"),
+        qmp_socket: qmp.path.join("qmp.sock"),
+        serial_log: staging.path.join("logs/serial.log"),
+        qemu_log: staging.path.join("logs/qemu.log"),
+        network: Some(network),
+    };
+    diagnostics.stage = "launch".into();
+    let mut vm = adapter.launch_record(&config)?;
+    diagnostics.stage = "execution".into();
+    let identity = vm.identity().clone();
+    let (events, assertions) = drive_scenario(&scenario, &choices, vm.as_mut(), diagnostics)?;
+    diagnostics.stage = "shutdown".into();
+    let status = vm.wait()?;
+    if !status.success() {
+        return Err(io::Error::other(format!("QEMU exited with {status}")));
+    }
+    fs::remove_dir_all(fixture_directory)?;
+    Ok(RecordOutcome {
+        scenario_name: scenario.name,
+        image,
+        identity,
+        events,
+        assertions,
+        workload: None,
+    })
+}
+
+/// The Phase 3 workload record path. The packaged workload originates every
+/// request through recorded input commands, and its raw and derived closure is
+/// published to the shared content store before QEMU starts.
+fn record_workload_scenario(
+    options: &RunOptions,
+    adapter: &dyn VmAdapter,
+    assets: &GuestImageAssets,
+    staging: &StagingDirectory,
+    qmp: &QmpDirectory,
+    diagnostics: &mut FailureDiagnostics,
+    specification: &Path,
+) -> io::Result<RecordOutcome> {
+    let (scenario, scenario_source) = WorkloadScenario::read(&options.scenario)?;
+    let choices = scenario.choices(options.seed);
+    let store = options.runs_directory.join(WORKLOAD_STORE_NAME);
+    let assembled = crate::workload::assemble(specification, &store)?;
+    // Re-derive the workload from the raw closure that was just published, so
+    // the identity the run records is the verified one rather than an assembly
+    // summary.
+    let loaded = crate::workload::load(&store)?;
+    let template_sha256 = sha256_bytes(&loaded.template);
+    if assembled.source_kind != loaded.source_kind
+        || assembled.closure_sha256 != loaded.closure_sha256
+        || assembled.canonical_digest != loaded.canonical_digest
+        || assembled.template_sha256 != template_sha256
+        || assembled.launch != loaded.launch
+    {
+        return Err(invalid_data(
+            "workload assembly and independent verification disagreed",
+        ));
+    }
+    let workload = WorkloadIdentity {
+        source_kind: loaded.source_kind,
+        closure_sha256: loaded.closure_sha256.clone(),
+        canonical_digest: loaded.canonical_digest.clone(),
+        template_sha256,
+        launch: loaded.launch.clone(),
+    };
+    let image = build_guest_image_with_assets(
+        &options.executable,
+        &options.runs_directory,
+        assets,
+        Some(&loaded.template),
+    )?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(staging.path.join("logs"))?;
+    write_private(staging.path.join("scenario.toml"), &scenario_source)?;
+    write_private_json(staging.path.join("choices.json"), &choices)?;
+    write_private_json(
+        staging.path.join(WORKLOAD_LOCK_PATH),
+        &WorkloadLock {
+            version: WORKLOAD_LOCK_VERSION,
+            store: WORKLOAD_STORE_NAME.into(),
+            workload: workload.clone(),
+        },
+    )?;
+    let fixture_directory = staging.path.join("fixture");
+    let fixture_entries = fixture_entries(&choices.requests, scenario.corrupt_responses);
+    materialize_fixture(&fixture_directory, &fixture_entries)?;
+    let network = NetworkConfig::restricted_tftp_record_with_tool_digest(
+        fixture_directory.clone(),
+        sha256_bytes(&assets.busybox),
+    )?;
+    diagnostics.set_network(&network.identity);
+    let config = RecordConfig {
+        kernel: fs::canonicalize(&options.kernel)?,
+        initramfs: image.path.clone(),
+        replay_log: staging.path.join("replay.bin"),
+        qmp_socket: qmp.path.join("qmp.sock"),
+        serial_log: staging.path.join("logs/serial.log"),
+        qemu_log: staging.path.join("logs/qemu.log"),
+        network: Some(network),
+    };
+    diagnostics.stage = "launch".into();
+    let mut vm = adapter.launch_record(&config)?;
+    diagnostics.stage = "execution".into();
+    let identity = vm.identity().clone();
+    let (events, assertions) = drive_workload_scenario(
+        &scenario,
+        &choices,
+        &loaded.launch,
+        vm.as_mut(),
+        true,
+        None,
+        diagnostics,
+    )?;
+    diagnostics.stage = "shutdown".into();
+    let status = vm.wait()?;
+    if !status.success() {
+        return Err(io::Error::other(format!("QEMU exited with {status}")));
+    }
+    fs::remove_dir_all(fixture_directory)?;
+    Ok(RecordOutcome {
+        scenario_name: scenario.name,
+        image,
+        identity,
+        events,
+        assertions,
+        workload: Some(workload),
     })
 }
 
@@ -377,6 +579,20 @@ fn replay_with_adapter_and_assets(
         let manifest: Manifest = read_json(&directory.join("manifest.json"), MAX_MANIFEST_BYTES)?;
         validate_manifest(&directory, &manifest)?;
         validate_artifacts(&directory, &manifest.artifacts)?;
+        if manifest.workload.is_some() != manifest.artifacts.contains_key(WORKLOAD_LOCK_PATH) {
+            return Err(invalid_data(
+                "the manifest workload identity and lock artifact disagree",
+            ));
+        }
+        if manifest.workload.is_some() {
+            let context = ReplayContext {
+                directory: &directory,
+                runs_directory,
+                runtime: &runtime,
+                manifest: &manifest,
+            };
+            return replay_workload_scenario(options, adapter, assets, &context, &mut diagnostics);
+        }
 
         let scenario_bytes =
             read_bounded(&directory.join("scenario.toml"), MAX_SCENARIO_SOURCE_BYTES)?;
@@ -390,7 +606,7 @@ fn replay_with_adapter_and_assets(
         let materialized_choices = scenario.choices(manifest.seed);
         let network = NetworkConfig::restricted_tftp_replay(
             digest_fixture_entries(&fixture_entries(
-                &materialized_choices,
+                &materialized_choices.requests,
                 scenario.corrupt_responses,
             )),
             sha256_bytes(&assets.busybox),
@@ -405,9 +621,7 @@ fn replay_with_adapter_and_assets(
                 "recorded choice plan does not match the scenario and seed",
             ));
         }
-        let expected_event_bytes =
-            read_bounded(&directory.join("events.jsonl"), MAX_SEMANTIC_ARTIFACT_BYTES)?;
-        let expected_events = decode_events(&expected_event_bytes)?;
+        let (expected_events, expected_event_bytes) = read_recorded_events(&directory)?;
         let expected_event_count = scenario
             .request_count
             .checked_mul(2)
@@ -419,20 +633,7 @@ fn replay_with_adapter_and_assets(
                 expected_events.len()
             )));
         }
-        for (index, event) in expected_events.iter().enumerate() {
-            if event.protocol_version != PROTOCOL_VERSION || event.event_id != index as u64 + 1 {
-                return Err(invalid_data(format!(
-                    "recorded event envelope is invalid at index {index}: {event:#?}"
-                )));
-            }
-        }
-        let expected_assertion_bytes = read_bounded(
-            &directory.join("assertions.json"),
-            MAX_SEMANTIC_ARTIFACT_BYTES,
-        )?;
-        let expected_assertions: AssertionReport =
-            serde_json::from_slice(&expected_assertion_bytes)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let (expected_assertions, expected_assertion_bytes) = read_recorded_assertions(&directory)?;
         if !valid_report(&expected_assertions) {
             return Err(invalid_data(
                 "recorded assertion report has an invalid shape",
@@ -485,19 +686,7 @@ fn replay_with_adapter_and_assets(
             ));
         }
 
-        let replay_log = runtime.path.join("replay.bin");
-        copy_regular_file(
-            &directory.join("replay.bin"),
-            &replay_log,
-            MAX_REPLAY_LOG_BYTES,
-        )?;
-        let expected_replay_digest = &manifest.artifacts["replay.bin"];
-        let copied_replay_digest = sha256_file(&replay_log)?;
-        if &copied_replay_digest != expected_replay_digest {
-            return Err(invalid_data(format!(
-                "replay log changed while preparing replay: expected {expected_replay_digest}, found {copied_replay_digest}"
-            )));
-        }
+        let replay_log = copy_replay_log(&directory, &runtime, &manifest)?;
         if manifest.vm.network.is_none() {
             return Err(invalid_data("recording has no network identity"));
         }
@@ -578,6 +767,276 @@ fn replay_with_adapter_and_assets(
     })
 }
 
+/// The paths and recorded manifest one replay attempt shares.
+struct ReplayContext<'a> {
+    directory: &'a Path,
+    runs_directory: &'a Path,
+    runtime: &'a QmpDirectory,
+    manifest: &'a Manifest,
+}
+
+/// The passive replay of a workload-driven recording. It re-derives the complete
+/// workload from the verified raw closure, requires the raw evidence even when a
+/// derived cache entry exists, rechecks the recorded scenario, choice plan, event
+/// stream, and assertion report, and only then launches QEMU.
+fn replay_workload_scenario(
+    options: &ReplayOptions,
+    adapter: &dyn VmAdapter,
+    assets: &GuestImageAssets,
+    context: &ReplayContext<'_>,
+    diagnostics: &mut FailureDiagnostics,
+) -> io::Result<ReplayResult> {
+    let ReplayContext {
+        directory,
+        runs_directory,
+        runtime,
+        manifest,
+    } = context;
+    let recorded = manifest
+        .workload
+        .clone()
+        .ok_or_else(|| invalid_data("recording has no workload identity"))?;
+    let lock: WorkloadLock =
+        read_json(&directory.join(WORKLOAD_LOCK_PATH), MAX_WORKLOAD_LOCK_BYTES)?;
+    if lock.version != WORKLOAD_LOCK_VERSION {
+        return Err(invalid_data(format!(
+            "unsupported workload lock version {}",
+            lock.version
+        )));
+    }
+    if lock.store != WORKLOAD_STORE_NAME {
+        return Err(invalid_data(
+            "the workload lock names an unsupported content store",
+        ));
+    }
+    if lock.workload != recorded {
+        return Err(invalid_data(
+            "the workload lock identity differs from the manifest",
+        ));
+    }
+    // The complete raw closure is required. `load` verifies every raw object
+    // against its digest, rechecks the stored-layer-to-DiffID relationships,
+    // re-derives the canonical tree and template, and verifies the derived cache
+    // entry against those independently computed identities.
+    let store = runs_directory.join(&lock.store);
+    let loaded = crate::workload::load(&store)?;
+    if loaded.source_kind != recorded.source_kind
+        || loaded.closure_sha256 != recorded.closure_sha256
+        || loaded.canonical_digest != recorded.canonical_digest
+        || loaded.launch != recorded.launch
+        || sha256_bytes(&loaded.template) != recorded.template_sha256
+    {
+        return Err(invalid_data(
+            "the re-derived workload identity differs from the recording",
+        ));
+    }
+
+    let (scenario, scenario_bytes) = WorkloadScenario::parse(read_bounded(
+        &directory.join("scenario.toml"),
+        MAX_SCENARIO_SOURCE_BYTES,
+    )?)?;
+    if scenario.name != manifest.scenario_name {
+        return Err(invalid_data(format!(
+            "scenario name differs from manifest: expected {:?}, found {:?}",
+            manifest.scenario_name, scenario.name
+        )));
+    }
+    let materialized_choices = scenario.choices(manifest.seed);
+    let network = NetworkConfig::restricted_tftp_replay(
+        digest_fixture_entries(&fixture_entries(
+            &materialized_choices.requests,
+            scenario.corrupt_responses,
+        )),
+        sha256_bytes(&assets.busybox),
+    );
+    diagnostics.set_network(&network.identity);
+    let choice_bytes = read_bounded(&directory.join("choices.json"), MAX_SEMANTIC_ARTIFACT_BYTES)?;
+    let choices: WorkloadChoicePlan = serde_json::from_slice(&choice_bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if choices != materialized_choices {
+        return Err(invalid_data(
+            "recorded choice plan does not match the scenario and seed",
+        ));
+    }
+    let (expected_events, expected_event_bytes) = read_recorded_events(directory)?;
+    let (expected_assertions, expected_assertion_bytes) = read_recorded_assertions(directory)?;
+    if !valid_profile(
+        &expected_assertions,
+        &crate::assertions::AssertionName::WORKLOAD_PROFILE,
+    ) {
+        return Err(invalid_data(
+            "recorded assertion report has an invalid shape",
+        ));
+    }
+    let expected_frames = expected_events
+        .iter()
+        .map(|event| EventFrame {
+            protocol_version: event.protocol_version,
+            event_id: event.event_id,
+            command_id: event.command_id,
+            event: event.event.clone(),
+            diagnostics: Default::default(),
+        })
+        .collect::<Vec<_>>();
+    let evaluated_assertions =
+        evaluate_workload(&expected_frames, &scenario, &choices, &loaded.launch);
+    if expected_assertions != evaluated_assertions {
+        return Err(invalid_data(
+            "recorded assertion report does not match recorded events",
+        ));
+    }
+    let recorded_semantic_digest = digest_parts([
+        scenario_bytes.as_slice(),
+        choice_bytes.as_slice(),
+        expected_event_bytes.as_slice(),
+        expected_assertion_bytes.as_slice(),
+    ]);
+    if recorded_semantic_digest != manifest.semantic_outcome_sha256 {
+        return Err(invalid_data(format!(
+            "recorded semantic outcome digest mismatch: expected {}, found {recorded_semantic_digest}",
+            manifest.semantic_outcome_sha256
+        )));
+    }
+
+    let image = build_guest_image_with_assets(
+        &options.executable,
+        runs_directory,
+        assets,
+        Some(&loaded.template),
+    )?;
+    if image.executable_sha256 != manifest.simferret_sha256 {
+        return Err(invalid_data(format!(
+            "SimFerret executable digest differs from recording: expected {}, found {}",
+            manifest.simferret_sha256, image.executable_sha256
+        )));
+    }
+    if sha256_file(&image.path)? != manifest.initial_state_sha256 {
+        return Err(invalid_data(
+            "rebuilt initial state digest differs from recording",
+        ));
+    }
+
+    let replay_log = copy_replay_log(directory, runtime, manifest)?;
+    if manifest.vm.network.is_none() {
+        return Err(invalid_data("recording has no network identity"));
+    }
+    validate_replay_network_identity(&manifest.vm, Some(&network.identity))?;
+    let config = RecordConfig {
+        kernel: fs::canonicalize(&options.kernel)?,
+        initramfs: image.path,
+        replay_log,
+        qmp_socket: runtime.path.join("qmp.sock"),
+        serial_log: runtime.path.join("logs/serial.log"),
+        qemu_log: runtime.path.join("logs/qemu.log"),
+        network: Some(network),
+    };
+    diagnostics.stage = "launch".into();
+    let mut vm = adapter.launch_replay(&config, &manifest.vm)?;
+    diagnostics.stage = "execution".into();
+    let (events, assertions) = drive_workload_scenario(
+        &scenario,
+        &choices,
+        &loaded.launch,
+        vm.as_mut(),
+        false,
+        Some(&expected_events),
+        diagnostics,
+    )?;
+    diagnostics.stage = "shutdown".into();
+    let status = vm.wait()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "QEMU replay exited with {status}"
+        )));
+    }
+    diagnostics.stage = "replay-validation".into();
+    compare_events(&expected_events, &events)?;
+    if assertions != expected_assertions {
+        return Err(invalid_data(format!(
+            "replayed assertion report diverged\nexpected: {expected_assertions:#?}\nactual: {assertions:#?}"
+        )));
+    }
+    let event_bytes = encode_events(&events)?;
+    if event_bytes != expected_event_bytes {
+        return Err(invalid_data(
+            "replayed normalized event encoding is not byte-identical",
+        ));
+    }
+    let assertion_bytes = json_bytes(&assertions)?;
+    if assertion_bytes != expected_assertion_bytes {
+        return Err(invalid_data(
+            "replayed assertion encoding is not byte-identical",
+        ));
+    }
+    let semantic_outcome_sha256 = digest_parts([
+        scenario_bytes.as_slice(),
+        choice_bytes.as_slice(),
+        event_bytes.as_slice(),
+        assertion_bytes.as_slice(),
+    ]);
+    if semantic_outcome_sha256 != manifest.semantic_outcome_sha256 {
+        return Err(invalid_data(format!(
+            "semantic outcome digest diverged: expected {}, found {semantic_outcome_sha256}",
+            manifest.semantic_outcome_sha256
+        )));
+    }
+    Ok(ReplayResult {
+        run_id: manifest.run_id.clone(),
+        event_count: events.len(),
+        semantic_outcome_sha256,
+        assertions,
+    })
+}
+
+/// Read and envelope-check the recorded normalized event stream.
+fn read_recorded_events(directory: &Path) -> io::Result<(Vec<NormalizedEvent>, Vec<u8>)> {
+    let expected_event_bytes =
+        read_bounded(&directory.join("events.jsonl"), MAX_SEMANTIC_ARTIFACT_BYTES)?;
+    let expected_events = decode_events(&expected_event_bytes)?;
+    for (index, event) in expected_events.iter().enumerate() {
+        if event.protocol_version != PROTOCOL_VERSION || event.event_id != index as u64 + 1 {
+            return Err(invalid_data(format!(
+                "recorded event envelope is invalid at index {index}: {event:#?}"
+            )));
+        }
+    }
+    Ok((expected_events, expected_event_bytes))
+}
+
+/// Read the recorded assertion report and its exact bytes.
+fn read_recorded_assertions(directory: &Path) -> io::Result<(AssertionReport, Vec<u8>)> {
+    let expected_assertion_bytes = read_bounded(
+        &directory.join("assertions.json"),
+        MAX_SEMANTIC_ARTIFACT_BYTES,
+    )?;
+    let expected_assertions: AssertionReport = serde_json::from_slice(&expected_assertion_bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok((expected_assertions, expected_assertion_bytes))
+}
+
+/// Copy the recorded replay log into the attempt directory and require it to
+/// still match the manifest digest.
+fn copy_replay_log(
+    directory: &Path,
+    runtime: &QmpDirectory,
+    manifest: &Manifest,
+) -> io::Result<PathBuf> {
+    let replay_log = runtime.path.join("replay.bin");
+    copy_regular_file(
+        &directory.join("replay.bin"),
+        &replay_log,
+        MAX_REPLAY_LOG_BYTES,
+    )?;
+    let expected_replay_digest = &manifest.artifacts["replay.bin"];
+    let copied_replay_digest = sha256_file(&replay_log)?;
+    if &copied_replay_digest != expected_replay_digest {
+        return Err(invalid_data(format!(
+            "replay log changed while preparing replay: expected {expected_replay_digest}, found {copied_replay_digest}"
+        )));
+    }
+    Ok(replay_log)
+}
+
 fn drive_scenario(
     scenario: &Scenario,
     choices: &ChoicePlan,
@@ -586,7 +1045,6 @@ fn drive_scenario(
 ) -> io::Result<(Vec<NormalizedEvent>, AssertionReport)> {
     drive_scenario_inner(scenario, choices, vm, true, None, diagnostics)
 }
-
 fn drive_replay_scenario(
     scenario: &Scenario,
     choices: &ChoicePlan,
@@ -865,6 +1323,356 @@ fn valid_profile(report: &AssertionReport, profile: &[crate::assertions::Asserti
         && report.passed == report.assertions.iter().all(|assertion| assertion.passed)
 }
 
+/// One logical step of the workload acceptance sequence. The plan is derived
+/// from the seeded choice plan before any command is sent, so a recording and
+/// its passive replays execute exactly the same steps and diverge only if the
+/// guest does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkloadStep {
+    Echo(u64),
+    State(u64),
+    SpawnDescendant(u64),
+    Start(u64),
+    Terminate(u64),
+    Activate,
+    Restore,
+    Request { invocation: u64, index: usize },
+    StdinEof(u64),
+}
+
+fn workload_steps(choices: &WorkloadChoicePlan) -> Vec<WorkloadStep> {
+    let mut steps = vec![
+        WorkloadStep::Start(1),
+        WorkloadStep::Echo(1),
+        WorkloadStep::State(1),
+    ];
+    let mut invocation = 1_u64;
+    for index in 0..choices.requests.len() {
+        if index == choices.process_fault_request_index {
+            steps.push(WorkloadStep::SpawnDescendant(invocation));
+            steps.push(WorkloadStep::Terminate(invocation));
+            invocation += 1;
+            steps.push(WorkloadStep::Start(invocation));
+            steps.push(WorkloadStep::Echo(invocation));
+            steps.push(WorkloadStep::State(invocation));
+        }
+        if index == choices.outage_activation_request_index {
+            steps.push(WorkloadStep::Activate);
+        }
+        if index == choices.restoration_request_index {
+            steps.push(WorkloadStep::Restore);
+        }
+        steps.push(WorkloadStep::Request { invocation, index });
+    }
+    steps.push(WorkloadStep::StdinEof(invocation));
+    steps
+}
+
+/// The workload control loop. Unlike the network controller, responses to a
+/// command are interleaved with live output frames, so it reads until the
+/// expected typed event or response line appears and folds every frame into the
+/// host checker's trace.
+struct WorkloadController<'a> {
+    vm: &'a mut dyn RunningVm,
+    diagnostics: &'a mut FailureDiagnostics,
+    send_commands: bool,
+    expected_events: Option<Vec<NormalizedEvent>>,
+    next_command_id: u64,
+    next_event_id: u64,
+    raw_events: Vec<EventFrame>,
+    events: Vec<NormalizedEvent>,
+    trace: WorkloadTrace,
+    consumed_lines: BTreeMap<u64, usize>,
+}
+
+impl<'a> WorkloadController<'a> {
+    fn new(
+        vm: &'a mut dyn RunningVm,
+        send_commands: bool,
+        expected_events: Option<&[NormalizedEvent]>,
+        diagnostics: &'a mut FailureDiagnostics,
+    ) -> Self {
+        Self {
+            vm,
+            diagnostics,
+            send_commands,
+            expected_events: expected_events.map(<[NormalizedEvent]>::to_vec),
+            next_command_id: 1,
+            next_event_id: 1,
+            raw_events: Vec::new(),
+            events: Vec::new(),
+            trace: WorkloadTrace::default(),
+            consumed_lines: BTreeMap::new(),
+        }
+    }
+
+    /// Assign a command identifier and send the command when this run is a live
+    /// recording. Passive replay only advances the identifier, so the expected
+    /// envelope stays identical.
+    fn issue(&mut self, command: Command) -> io::Result<u64> {
+        let command_id = self.next_command_id;
+        self.next_command_id += 1;
+        if self.send_commands {
+            self.vm.send(&CommandFrame {
+                protocol_version: PROTOCOL_VERSION,
+                command_id,
+                command,
+            })?;
+        }
+        Ok(command_id)
+    }
+
+    fn receive_one(&mut self) -> io::Result<EventFrame> {
+        let frame = self.vm.receive()?;
+        if frame.protocol_version != PROTOCOL_VERSION || frame.event_id != self.next_event_id {
+            return Err(invalid_data(format!(
+                "unexpected event envelope: version={}, event_id={}, command_id={}",
+                frame.protocol_version, frame.event_id, frame.command_id
+            )));
+        }
+        self.next_event_id += 1;
+        let normalized = frame.normalize();
+        if let Some(expected) = &self.expected_events {
+            let index = self.events.len();
+            match expected.get(index) {
+                Some(expected) if expected == &normalized => {}
+                Some(expected) => {
+                    return Err(invalid_data(format!(
+                        "normalized event divergence at index {index}\nexpected: {expected:#?}\nactual: {normalized:#?}"
+                    )));
+                }
+                None => {
+                    return Err(invalid_data(format!(
+                        "replay produced surplus normalized event at index {index}\nactual: {normalized:#?}"
+                    )));
+                }
+            }
+        }
+        self.diagnostics.observe(&normalized);
+        self.trace.push(&frame);
+        self.raw_events.push(frame.clone());
+        self.events.push(normalized);
+        Ok(frame)
+    }
+
+    /// Read until the expected typed event for the just-issued command arrives,
+    /// folding live output frames into the trace.
+    fn expect(
+        &mut self,
+        command_id: u64,
+        description: &str,
+        predicate: impl Fn(&Event) -> bool,
+    ) -> io::Result<EventFrame> {
+        loop {
+            let frame = self.receive_one()?;
+            if frame.command_id > command_id {
+                return Err(invalid_data(format!(
+                    "event for a later command arrived while waiting for {description}"
+                )));
+            }
+            if predicate(&frame.event) {
+                return Ok(frame);
+            }
+            if !matches!(frame.event, Event::WorkloadOutput { .. }) {
+                return Err(invalid_data(format!(
+                    "unexpected event while waiting for {description}: {:#?}",
+                    frame.event
+                )));
+            }
+        }
+    }
+
+    /// Send one bounded input line to a live invocation. Returns `false` when
+    /// the invocation has already exited or failed to start, so the driver stops
+    /// issuing workload commands and lets the checker report the failure.
+    fn write_stdin(&mut self, invocation: u64, offset: &mut u64, text: &str) -> io::Result<bool> {
+        if self.trace.exited(invocation) || self.trace.launch_failed(invocation) {
+            return Ok(false);
+        }
+        let command_id = self.issue(Command::StdinWrite {
+            invocation,
+            offset: *offset,
+            bytes: encode_bytes(text.as_bytes()),
+        })?;
+        *offset += text.len() as u64;
+        self.expect(command_id, "input-accepted", |event| {
+            matches!(event, Event::InputAccepted { .. })
+        })?;
+        Ok(true)
+    }
+
+    /// Read until one invocation's next response line matches `expected`.
+    /// Returns `false` when the invocation exits first.
+    fn wait_for_line(&mut self, invocation: u64, expected: &str) -> io::Result<bool> {
+        loop {
+            let consumed = self.consumed_lines.get(&invocation).copied().unwrap_or(0);
+            if let Some(index) = (consumed..self.trace.stdout_line_count(invocation))
+                .find(|index| self.trace.stdout_line(invocation, *index) == Some(expected))
+            {
+                self.consumed_lines.insert(invocation, index + 1);
+                return Ok(true);
+            }
+            if self.trace.exited(invocation) || self.trace.launch_failed(invocation) {
+                return Ok(false);
+            }
+            self.receive_one()?;
+        }
+    }
+}
+
+fn drive_workload_scenario(
+    scenario: &WorkloadScenario,
+    choices: &WorkloadChoicePlan,
+    launch: &LaunchIdentity,
+    vm: &mut dyn RunningVm,
+    send_commands: bool,
+    expected_events: Option<&[NormalizedEvent]>,
+    diagnostics: &mut FailureDiagnostics,
+) -> io::Result<(Vec<NormalizedEvent>, AssertionReport)> {
+    let mut controller = WorkloadController::new(vm, send_commands, expected_events, diagnostics);
+    let configure = controller.issue(Command::ConfigureNetwork {
+        interface: "eth0".into(),
+        guest_cidr: "10.0.2.15/24".into(),
+        gateway: scenario.fixture_peer.clone(),
+    })?;
+    controller.expect(configure, "network-configured", |event| {
+        matches!(event, Event::NetworkConfigured { .. })
+    })?;
+    let peer_cidr = format!("{}/32", scenario.fixture_peer);
+    let mut offsets = BTreeMap::<u64, u64>::new();
+    let mut stopped = false;
+    for step in workload_steps(choices) {
+        if stopped {
+            break;
+        }
+        match step {
+            WorkloadStep::Echo(invocation) => {
+                let token = echo_token(choices.seed, invocation);
+                let offset = offsets.entry(invocation).or_default();
+                if !controller.write_stdin(invocation, offset, &format!("echo {token}\n"))?
+                    || !controller.wait_for_line(invocation, &format!("echo value={token}"))?
+                {
+                    stopped = true;
+                }
+            }
+            WorkloadStep::State(invocation) => {
+                let offset = offsets.entry(invocation).or_default();
+                if !controller.write_stdin(invocation, offset, "state\n")?
+                    || !controller.wait_for_line(invocation, FRESH_STATE_LINE)?
+                {
+                    stopped = true;
+                }
+            }
+            WorkloadStep::SpawnDescendant(invocation) => {
+                let offset = offsets.entry(invocation).or_default();
+                if !controller.write_stdin(invocation, offset, "spawn-descendant\n")?
+                    || !controller.wait_for_line(invocation, ESCAPED_DESCENDANT_LINE)?
+                {
+                    stopped = true;
+                }
+            }
+            WorkloadStep::Request { invocation, index } => {
+                let request = &choices.requests[index];
+                let offset = offsets.entry(invocation).or_default();
+                let line = expected_network_line(
+                    request,
+                    request_phase(
+                        index,
+                        choices.outage_activation_request_index,
+                        choices.restoration_request_index,
+                    ),
+                );
+                if !controller.write_stdin(
+                    invocation,
+                    offset,
+                    &format!("fetch {} {}\n", request.request_id, request.payload),
+                )? || !controller.wait_for_line(invocation, &line)?
+                {
+                    stopped = true;
+                }
+            }
+            WorkloadStep::Activate => {
+                let command = controller.issue(Command::ActivateOutage {
+                    peer_cidr: peer_cidr.clone(),
+                })?;
+                controller.expect(command, "outage-activated", |event| {
+                    matches!(event, Event::OutageActivated { .. })
+                })?;
+            }
+            WorkloadStep::Restore => {
+                let command = controller.issue(Command::RestoreNetwork {
+                    peer_cidr: peer_cidr.clone(),
+                })?;
+                controller.expect(command, "network-restored", |event| {
+                    matches!(event, Event::NetworkRestored { .. })
+                })?;
+            }
+            WorkloadStep::Start(invocation) => {
+                let command = controller.issue(Command::Start {
+                    invocation,
+                    launch: launch.clone(),
+                })?;
+                controller.expect(command, "workload-started", |event| {
+                    matches!(
+                        event,
+                        Event::WorkloadStarted { .. } | Event::LaunchFailed { .. }
+                    )
+                })?;
+            }
+            WorkloadStep::Terminate(invocation) => {
+                let command = controller.issue(Command::Terminate { invocation })?;
+                controller.expect(command, "termination-requested", |event| {
+                    matches!(event, Event::TerminationRequested { .. })
+                })?;
+                controller.expect(command, "workload-exited", |event| {
+                    matches!(event, Event::WorkloadExited { .. })
+                })?;
+                controller.expect(command, "cleanup-complete", |event| {
+                    matches!(event, Event::CleanupComplete { .. })
+                })?;
+            }
+            WorkloadStep::StdinEof(invocation) => {
+                let command = controller.issue(Command::StdinEof { invocation })?;
+                controller.expect(command, "input-accepted", |event| {
+                    matches!(event, Event::InputAccepted { eof: true, .. })
+                })?;
+                controller.expect(command, "workload-exited", |event| {
+                    matches!(event, Event::WorkloadExited { .. })
+                })?;
+                controller.expect(command, "cleanup-complete", |event| {
+                    matches!(event, Event::CleanupComplete { .. })
+                })?;
+            }
+        }
+    }
+    // The runtime may still be finishing a barrier when the agent stops, so
+    // drain every remaining event until the agent reports it stopped.
+    let shutdown = controller.issue(Command::Shutdown {})?;
+    loop {
+        let frame = controller.receive_one()?;
+        if frame.command_id > shutdown {
+            return Err(invalid_data(
+                "an event for a later command arrived while waiting for agent-stopped",
+            ));
+        }
+        if matches!(frame.event, Event::AgentStopped {}) {
+            break;
+        }
+    }
+    controller.vm.finish_events()?;
+    if let Some(expected) = &controller.expected_events
+        && controller.events.len() != expected.len()
+    {
+        return Err(invalid_data(format!(
+            "replay ended after {} normalized events; expected {}",
+            controller.events.len(),
+            expected.len()
+        )));
+    }
+    let report = evaluate_workload(&controller.raw_events, scenario, choices, launch);
+    Ok((controller.events, report))
+}
+
 struct StagingDirectory {
     path: PathBuf,
     destination: PathBuf,
@@ -877,7 +1685,10 @@ impl StagingDirectory {
         let root = fs::canonicalize(root)?;
         let destination = root.join(run_id);
         let path = root.join(format!(".{run_id}.tmp-{}", std::process::id()));
-        fs::create_dir(&path)?;
+        // The run directory carries the private replay closure, the exact
+        // workload streams, and the recorded launch environment, so it is
+        // owner-only. The shareable failure bundle is a separate directory.
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(Self {
             path,
             destination,
@@ -1111,9 +1922,8 @@ fn decompress_kernel_module(path: &Path) -> io::Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-fn fixture_entries(choices: &ChoicePlan, corrupt_responses: bool) -> Vec<(String, Vec<u8>)> {
-    choices
-        .requests
+fn fixture_entries(requests: &[PlannedRequest], corrupt_responses: bool) -> Vec<(String, Vec<u8>)> {
+    requests
         .iter()
         .enumerate()
         .map(|(index, request)| {
@@ -1237,8 +2047,12 @@ fn pad_four(output: &mut Vec<u8>) {
     }
 }
 
-fn artifact_digests(root: &Path) -> io::Result<BTreeMap<String, String>> {
-    ARTIFACT_NAMES
+fn artifact_digests(root: &Path, workload: bool) -> io::Result<BTreeMap<String, String>> {
+    let mut names = ARTIFACT_NAMES.to_vec();
+    if workload {
+        names.push(WORKLOAD_LOCK_PATH);
+    }
+    names
         .into_iter()
         .map(|name| Ok((name.into(), sha256_file(&root.join(name))?)))
         .collect()
@@ -1280,6 +2094,22 @@ fn validate_manifest(directory: &Path, manifest: &Manifest) -> io::Result<()> {
             return Err(invalid_data("manifest contains an invalid SHA-256 digest"));
         }
     }
+    if let Some(workload) = &manifest.workload {
+        for digest in [
+            &workload.closure_sha256,
+            &workload.canonical_digest,
+            &workload.template_sha256,
+        ] {
+            if !valid_sha256(digest) {
+                return Err(invalid_data(
+                    "manifest workload identity contains an invalid SHA-256 digest",
+                ));
+            }
+        }
+        crate::workload::validate_launch_identity(&workload.launch).map_err(|error| {
+            invalid_data(format!("manifest workload launch is invalid: {error}"))
+        })?;
+    }
     Ok(())
 }
 
@@ -1299,10 +2129,12 @@ fn valid_run_id(run_id: &str) -> bool {
 }
 
 fn validate_artifacts(directory: &Path, expected: &BTreeMap<String, String>) -> io::Result<()> {
-    if expected.len() != ARTIFACT_NAMES.len()
-        || !ARTIFACT_NAMES
-            .into_iter()
-            .all(|name| expected.contains_key(name))
+    if !ARTIFACT_NAMES
+        .into_iter()
+        .all(|name| expected.contains_key(name))
+        || expected
+            .keys()
+            .any(|name| name != WORKLOAD_LOCK_PATH && !ARTIFACT_NAMES.contains(&name.as_str()))
     {
         return Err(invalid_data(
             "manifest artifact set does not match the replay contract",
@@ -1358,6 +2190,7 @@ fn artifact_limit(name: &str) -> usize {
         "choices.json" | "events.jsonl" | "assertions.json" => MAX_SEMANTIC_ARTIFACT_BYTES,
         "logs/qemu.log" | "logs/serial.log" => MAX_DIAGNOSTIC_ARTIFACT_BYTES,
         "replay.bin" => MAX_REPLAY_LOG_BYTES,
+        WORKLOAD_LOCK_PATH => MAX_WORKLOAD_LOCK_BYTES,
         _ => 0,
     }
 }
@@ -1471,6 +2304,23 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 
 fn write_json(path: PathBuf, value: &impl Serialize) -> io::Result<()> {
     fs::write(path, json_bytes(value)?)
+}
+
+/// Write one private run artifact with owner-only permissions. These artifacts
+/// may carry the recorded launch environment or exact workload stream bytes, so
+/// they are never world-readable even inside the owner-only run directory.
+fn write_private(path: PathBuf, bytes: &[u8]) -> io::Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?
+        .write_all(bytes)
+}
+
+fn write_private_json(path: PathBuf, value: &impl Serialize) -> io::Result<()> {
+    write_private(path, &json_bytes(value)?)
 }
 
 fn json_bytes(value: &impl Serialize) -> io::Result<Vec<u8>> {
@@ -1734,7 +2584,22 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::protocol::DiagnosticFields;
+    use crate::protocol::{DiagnosticFields, OutputStream, ProcessExit};
+
+    /// A deterministic model of the pinned acceptance fixture's line protocol,
+    /// so the workload driver and host checker can be exercised without QEMU.
+    #[derive(Default)]
+    struct FakeWorkload {
+        network_up: bool,
+        fetched: usize,
+        descendant: bool,
+        live: Option<u64>,
+        sequences: BTreeMap<u64, u64>,
+        input_offsets: BTreeMap<u64, u64>,
+        stdout: BTreeMap<u64, Vec<u8>>,
+        stderr: BTreeMap<u64, Vec<u8>>,
+        frames: BTreeMap<u64, u64>,
+    }
 
     struct FakeVm {
         identity: VmIdentity,
@@ -1750,6 +2615,7 @@ mod tests {
         malformed_after_shutdown: bool,
         recorded_events: Option<Arc<Mutex<Vec<EventFrame>>>>,
         playback: bool,
+        workload: FakeWorkload,
     }
 
     struct FakeAdapter {
@@ -1816,6 +2682,7 @@ mod tests {
                 malformed_after_shutdown: self.malformed_after_shutdown,
                 recorded_events: (!playback).then(|| Arc::clone(&self.recorded_events)),
                 playback,
+                workload: FakeWorkload::default(),
             })
         }
     }
@@ -1907,6 +2774,145 @@ mod tests {
     }
 
     impl FakeVm {
+        /// Emit one live output frame with the next sequence number and the
+        /// current per-stream offset, exactly as the guest runtime does.
+        fn emit_output(
+            &mut self,
+            command_id: u64,
+            invocation: u64,
+            stream: OutputStream,
+            text: &str,
+        ) {
+            let sequence = {
+                let sequence = self.workload.sequences.entry(invocation).or_default();
+                *sequence += 1;
+                *sequence
+            };
+            let bytes = text.as_bytes().to_vec();
+            let offset = match stream {
+                OutputStream::Stdout => self.workload.stdout.get(&invocation).map_or(0, Vec::len),
+                OutputStream::Stderr => self.workload.stderr.get(&invocation).map_or(0, Vec::len),
+            };
+            match stream {
+                OutputStream::Stdout => self
+                    .workload
+                    .stdout
+                    .entry(invocation)
+                    .or_default()
+                    .extend_from_slice(&bytes),
+                OutputStream::Stderr => self
+                    .workload
+                    .stderr
+                    .entry(invocation)
+                    .or_default()
+                    .extend_from_slice(&bytes),
+            }
+            *self.workload.frames.entry(invocation).or_default() += 1;
+            self.event(
+                command_id,
+                Event::WorkloadOutput {
+                    invocation,
+                    stream,
+                    offset: offset as u64,
+                    sequence,
+                    bytes: crate::protocol::encode_bytes(&bytes),
+                },
+            );
+        }
+
+        /// Emit the independently computed exit record and the cleanup barrier.
+        fn emit_workload_exit(
+            &mut self,
+            command_id: u64,
+            invocation: u64,
+            exit: ProcessExit,
+            reaped: u64,
+        ) {
+            let stdout = self.workload.stdout.remove(&invocation).unwrap_or_default();
+            let stderr = self.workload.stderr.remove(&invocation).unwrap_or_default();
+            let frames = self.workload.frames.remove(&invocation).unwrap_or(0);
+            self.workload.sequences.remove(&invocation);
+            self.workload.live = None;
+            self.event(
+                command_id,
+                Event::WorkloadExited {
+                    invocation,
+                    exit,
+                    stdout_bytes: stdout.len() as u64,
+                    stdout_sha256: sha256_bytes(&stdout),
+                    stderr_bytes: stderr.len() as u64,
+                    stderr_sha256: sha256_bytes(&stderr),
+                    frames,
+                },
+            );
+            self.event(command_id, Event::CleanupComplete { invocation, reaped });
+        }
+
+        /// Answer one recorded fixture command with the pinned fixture's exact
+        /// response line.
+        fn respond(&mut self, command_id: u64, invocation: u64, data: &[u8]) {
+            let text = String::from_utf8_lossy(data);
+            let line = text.trim_end_matches('\n');
+            if let Some(token) = line.strip_prefix("echo ") {
+                self.emit_output(
+                    command_id,
+                    invocation,
+                    OutputStream::Stdout,
+                    &format!("echo value={token}\n"),
+                );
+            } else if line == "state" {
+                self.emit_output(
+                    command_id,
+                    invocation,
+                    OutputStream::Stdout,
+                    "state value=fresh\n",
+                );
+            } else if line == "spawn-descendant" {
+                self.workload.descendant = true;
+                self.emit_output(
+                    command_id,
+                    invocation,
+                    OutputStream::Stdout,
+                    "descendant state=escaped\n",
+                );
+            } else if let Some(rest) = line.strip_prefix("fetch ") {
+                let mut parts = rest.split(' ');
+                let request_id = parts.next().unwrap_or_default();
+                self.workload.fetched += 1;
+                if self.corrupt && self.workload.fetched == 1 {
+                    self.emit_output(
+                        command_id,
+                        invocation,
+                        OutputStream::Stderr,
+                        "fixture: response content mismatch\n",
+                    );
+                    self.emit_workload_exit(
+                        command_id,
+                        invocation,
+                        ProcessExit::Exited { code: 1 },
+                        1,
+                    );
+                } else if self.workload.network_up {
+                    self.emit_output(
+                        command_id,
+                        invocation,
+                        OutputStream::Stdout,
+                        &format!("network state=ok request={request_id}\n"),
+                    );
+                } else {
+                    self.emit_output(
+                        command_id,
+                        invocation,
+                        OutputStream::Stdout,
+                        &format!(
+                            "network state=unavailable request={request_id} errno={}\n",
+                            libc::EACCES
+                        ),
+                    );
+                }
+            }
+        }
+
         fn event(&mut self, command_id: u64, event: Event) {
             let frame = EventFrame {
                 protocol_version: PROTOCOL_VERSION,
@@ -1940,6 +2946,7 @@ mod tests {
                     gateway,
                 } => {
                     self.running = true;
+                    self.workload.network_up = true;
                     self.event(
                         frame.command_id,
                         Event::NetworkConfigured {
@@ -1951,6 +2958,7 @@ mod tests {
                 }
                 Command::ActivateOutage { peer_cidr } => {
                     self.running = false;
+                    self.workload.network_up = false;
                     self.event(
                         frame.command_id,
                         Event::OutageActivated {
@@ -1961,6 +2969,7 @@ mod tests {
                 }
                 Command::RestoreNetwork { peer_cidr } => {
                     self.running = true;
+                    self.workload.network_up = true;
                     self.event(
                         frame.command_id,
                         Event::NetworkRestored {
@@ -2030,9 +3039,88 @@ mod tests {
                         self.event(frame.command_id, Event::AgentStopped {});
                     }
                 }
-                // The fake models the network fixture only; process commands
-                // are exercised by the runtime and phase 2 suites.
-                _ => {}
+                Command::Start { invocation, launch } => {
+                    self.workload.live = Some(*invocation);
+                    self.workload.descendant = false;
+                    self.workload.fetched = 0;
+                    self.event(
+                        frame.command_id,
+                        Event::WorkloadStarted {
+                            invocation: *invocation,
+                            launch: launch.clone(),
+                        },
+                    );
+                    self.emit_output(
+                        frame.command_id,
+                        *invocation,
+                        OutputStream::Stdout,
+                        "ready version=1\n",
+                    );
+                }
+                Command::StdinWrite {
+                    invocation,
+                    offset,
+                    bytes,
+                } => {
+                    let data = crate::protocol::decode_bytes(
+                        bytes,
+                        crate::protocol::MAX_STDIN_FRAME_BYTES,
+                    )
+                    .expect("the driver sends bounded input");
+                    let end = offset + data.len() as u64;
+                    self.workload.input_offsets.insert(*invocation, end);
+                    self.event(
+                        frame.command_id,
+                        Event::InputAccepted {
+                            invocation: *invocation,
+                            offset: end,
+                            bytes: data.len() as u64,
+                            eof: false,
+                        },
+                    );
+                    self.respond(frame.command_id, *invocation, &data);
+                }
+                Command::StdinEof { invocation } => {
+                    let offset = self
+                        .workload
+                        .input_offsets
+                        .get(invocation)
+                        .copied()
+                        .unwrap_or(0);
+                    self.event(
+                        frame.command_id,
+                        Event::InputAccepted {
+                            invocation: *invocation,
+                            offset,
+                            bytes: 0,
+                            eof: true,
+                        },
+                    );
+                    self.emit_workload_exit(
+                        frame.command_id,
+                        *invocation,
+                        ProcessExit::Exited { code: 0 },
+                        1,
+                    );
+                }
+                Command::Terminate { invocation } => {
+                    self.event(
+                        frame.command_id,
+                        Event::TerminationRequested {
+                            invocation: *invocation,
+                            signal: crate::protocol::TERMINATION_SIGNAL,
+                        },
+                    );
+                    let reaped = if self.workload.descendant { 2 } else { 1 };
+                    self.emit_workload_exit(
+                        frame.command_id,
+                        *invocation,
+                        ProcessExit::Signaled {
+                            signal: crate::protocol::TERMINATION_SIGNAL,
+                        },
+                        reaped,
+                    );
+                }
             }
             Ok(())
         }
@@ -2099,6 +3187,7 @@ mod tests {
             malformed_after_shutdown: false,
             recorded_events: None,
             playback: false,
+            workload: FakeWorkload::default(),
         };
         let mut diagnostics = failure_diagnostics("record");
         let (events, report) =
@@ -2164,6 +3253,7 @@ mod tests {
                 runs_directory: runs_directory.clone(),
                 kernel,
                 executable: executable.clone(),
+                workload: None,
             },
             &adapter,
         )
@@ -3102,6 +4192,7 @@ mod tests {
             runs_directory: root.join("runs"),
             kernel,
             executable,
+            workload: None,
         }
     }
 
@@ -3152,6 +4243,335 @@ mod tests {
         }
     }
 
+    /// A minimal but strictly valid fixed-address static x86-64 ELF. The
+    /// assembler validates the header, the program table, and each loadable
+    /// segment, so a placeholder cannot be used.
+    fn workload_elf() -> Vec<u8> {
+        let mut elf = vec![0_u8; 128];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x40_0000_u64.to_le_bytes());
+        elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+        // One PT_LOAD segment covering the whole file at 0x400000.
+        elf[64..68].copy_from_slice(&1_u32.to_le_bytes());
+        elf[72..80].copy_from_slice(&0_u64.to_le_bytes());
+        elf[80..88].copy_from_slice(&0x40_0000_u64.to_le_bytes());
+        elf[88..96].copy_from_slice(&0x40_0000_u64.to_le_bytes());
+        elf[96..104].copy_from_slice(&128_u64.to_le_bytes());
+        elf[104..112].copy_from_slice(&128_u64.to_le_bytes());
+        elf[112..120].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf
+    }
+
+    fn workload_options(root: &Path, corrupt: bool) -> RunOptions {
+        let scenario = root.join("scenario.toml");
+        fs::write(
+            &scenario,
+            format!(
+                "version = 1\nname = \"workload-network-outage\"\nrequest_count = 4\npayload_bytes = 2\nfixture_peer = \"10.0.2.2\"\noutage_event_bound = 8\nliveness_event_bound = 8\ncorrupt_responses = {corrupt}\n"
+            ),
+        )
+        .unwrap();
+        let specification = root.join("workload.toml");
+        fs::write(
+            &specification,
+            "version = 1\nkind = \"binary\"\npath = \"app\"\nargs = []\nenv = [\"MODE=acceptance\"]\nworking_directory = \"/\"\nuser = \"65534:65534\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("app"), workload_elf()).unwrap();
+        let executable = root.join("simferret");
+        let mut elf = vec![0_u8; 64];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        fs::write(&executable, elf).unwrap();
+        let kernel = root.join("kernel");
+        fs::write(&kernel, b"kernel").unwrap();
+        RunOptions {
+            scenario,
+            seed: 42,
+            runs_directory: root.join("runs"),
+            kernel,
+            executable,
+            workload: Some(specification),
+        }
+    }
+
+    fn replay_options(options: &RunOptions, directory: PathBuf) -> ReplayOptions {
+        ReplayOptions {
+            directory,
+            kernel: options.kernel.clone(),
+            executable: options.executable.clone(),
+        }
+    }
+
+    #[test]
+    fn a_workload_records_and_passively_replays_from_raw_evidence_alone() {
+        let root = temporary_root("workload-replay");
+        let options = workload_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        assert!(recorded.assertions.passed, "{:#?}", recorded.assertions);
+        let manifest: Manifest =
+            serde_json::from_slice(&fs::read(recorded.directory.join("manifest.json")).unwrap())
+                .unwrap();
+        let identity = manifest
+            .workload
+            .clone()
+            .expect("the run manifest records the workload identity");
+        assert_eq!(identity.source_kind, SourceKind::Binary);
+        assert_eq!(manifest.artifacts.len(), 8);
+        let lock: WorkloadLock =
+            serde_json::from_slice(&fs::read(recorded.directory.join(WORKLOAD_LOCK_PATH)).unwrap())
+                .unwrap();
+        assert_eq!(lock.version, WORKLOAD_LOCK_VERSION);
+        assert_eq!(lock.store, WORKLOAD_STORE_NAME);
+        assert_eq!(lock.workload, identity);
+        let store = options.runs_directory.join(WORKLOAD_STORE_NAME);
+        assert!(store.join("raw/closure.json").is_file());
+        assert!(store.join("derived").is_dir());
+
+        // The live source is not part of the replay closure.
+        fs::remove_file(root.join("app")).unwrap();
+        fs::remove_file(options.workload.clone().unwrap()).unwrap();
+
+        let replay_options = replay_options(&options, recorded.directory.clone());
+        let first = replay_with_adapter(&replay_options, &adapter).unwrap();
+        let second = replay_with_adapter(&replay_options, &adapter).unwrap();
+        assert_eq!(first, second);
+        assert!(first.assertions.passed);
+        assert_eq!(
+            first.semantic_outcome_sha256,
+            manifest.semantic_outcome_sha256
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replay_rejects_every_independently_changed_workload_identity() {
+        let root = temporary_root("workload-tamper");
+        let options = workload_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        let replay_options = replay_options(&options, recorded.directory.clone());
+        let store = options.runs_directory.join(WORKLOAD_STORE_NAME);
+
+        // A self-consistently changed lock, whose artifact digest in the
+        // manifest is updated too, still disagrees with the recorded identity.
+        let lock_path = recorded.directory.join(WORKLOAD_LOCK_PATH);
+        let original_lock = fs::read(&lock_path).unwrap();
+        let mut lock: serde_json::Value = serde_json::from_slice(&original_lock).unwrap();
+        lock["workload"]["canonical_digest"] = serde_json::Value::String("0".repeat(64));
+        let tampered_lock = serde_json::to_vec_pretty(&lock).unwrap();
+        fs::write(&lock_path, &tampered_lock).unwrap();
+        let manifest_path = recorded.directory.join("manifest.json");
+        let original_manifest = fs::read(&manifest_path).unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&original_manifest).unwrap();
+        manifest["artifacts"][WORKLOAD_LOCK_PATH] =
+            serde_json::Value::String(sha256_bytes(&tampered_lock));
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = replay_with_adapter(&replay_options, &adapter).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the workload lock identity differs from the manifest"),
+            "{error}"
+        );
+        fs::write(&lock_path, &original_lock).unwrap();
+        fs::write(&manifest_path, &original_manifest).unwrap();
+
+        // An independently changed launch identity is rejected before launch.
+        let mut manifest: serde_json::Value = serde_json::from_slice(&original_manifest).unwrap();
+        manifest["workload"]["launch"]["uid"] = serde_json::Value::from(1234);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = replay_with_adapter(&replay_options, &adapter).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the workload lock identity differs from the manifest"),
+            "{error}"
+        );
+        fs::write(&manifest_path, &original_manifest).unwrap();
+
+        // Missing raw evidence fails even though the derived entry still exists.
+        let closure_path = store.join("raw/closure.json");
+        let closure = fs::read(&closure_path).unwrap();
+        fs::remove_file(&closure_path).unwrap();
+        assert!(store.join("derived").is_dir());
+        let error = replay_with_adapter(&replay_options, &adapter).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        fs::write(&closure_path, &closure).unwrap();
+
+        // A changed raw object fails digest verification.
+        let closure: serde_json::Value = serde_json::from_slice(&closure).unwrap();
+        let digest = closure["objects"][0]["digest"].as_str().unwrap();
+        let object_path = store.join(format!("raw/sha256/{}", &digest["sha256:".len()..]));
+        let object = fs::read(&object_path).unwrap();
+        fs::write(&object_path, b"tampered object").unwrap();
+        let error = replay_with_adapter(&replay_options, &adapter).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its recorded identity"),
+            "{error}"
+        );
+        fs::write(&object_path, &object).unwrap();
+
+        // A changed derived template fails independent verification.
+        let template = store
+            .join("derived")
+            .join(closure["canonical_digest"].as_str().unwrap())
+            .join("template.cpio");
+        let bytes = fs::read(&template).unwrap();
+        fs::write(&template, b"tampered template").unwrap();
+        let error = replay_with_adapter(&replay_options, &adapter).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("derived guest template does not match the raw closure"),
+            "{error}"
+        );
+        fs::write(&template, &bytes).unwrap();
+
+        // The recorded scenario is a digested artifact and cannot change.
+        let scenario_path = recorded.directory.join("scenario.toml");
+        let scenario = fs::read(&scenario_path).unwrap();
+        let changed = String::from_utf8(scenario.clone())
+            .unwrap()
+            .replace("payload_bytes = 2", "payload_bytes = 3");
+        fs::write(&scenario_path, changed).unwrap();
+        let error = replay_with_adapter(&replay_options, &adapter).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("artifact digest mismatch for scenario.toml"),
+            "{error}"
+        );
+        fs::write(&scenario_path, &scenario).unwrap();
+
+        // The untouched recording still replays.
+        assert!(
+            replay_with_adapter(&replay_options, &adapter)
+                .unwrap()
+                .assertions
+                .passed
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_corrupted_workload_response_fails_safety_without_an_infrastructure_error() {
+        let root = temporary_root("workload-corrupt");
+        let options = workload_options(&root, true);
+        let mut adapter = fake_adapter(None);
+        adapter.corrupt = true;
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        assert!(!recorded.assertions.passed);
+        assert_eq!(recorded.exit_code(), 1);
+        let failed = recorded
+            .assertions
+            .assertions
+            .iter()
+            .filter(|assertion| !assertion.passed)
+            .map(|assertion| assertion.name)
+            .collect::<Vec<_>>();
+        assert!(failed.contains(&crate::assertions::AssertionName::ProcessSafety));
+        assert!(failed.contains(&crate::assertions::AssertionName::ResponseIntegrity));
+        // The failing run is still published with a complete artifact set, and
+        // its replays reproduce the same failure.
+        let manifest: Manifest =
+            serde_json::from_slice(&fs::read(recorded.directory.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest.artifacts.len(), 8);
+        let replay_options = replay_options(&options, recorded.directory.clone());
+        let replay = replay_with_adapter(&replay_options, &adapter).unwrap();
+        assert_eq!(replay.assertions, recorded.assertions);
+        assert_eq!(replay.exit_code(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_run_artifacts_are_owner_only_and_failures_exclude_workload_data() {
+        fn bundle_bytes(root: &Path) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(directory) = stack.pop() {
+                for entry in fs::read_dir(&directory).unwrap() {
+                    let entry = entry.unwrap();
+                    let file_type = entry.file_type().unwrap();
+                    if file_type.is_dir() {
+                        stack.push(entry.path());
+                    } else if file_type.is_file() {
+                        bytes.extend_from_slice(&fs::read(entry.path()).unwrap());
+                    }
+                }
+            }
+            bytes
+        }
+
+        let root = temporary_root("workload-classification");
+        let options = workload_options(&root, false);
+        // A distinctive environment value that must never reach the shareable
+        // failure metadata.
+        let specification = options.workload.clone().unwrap();
+        let specification_text = fs::read_to_string(&specification)
+            .unwrap()
+            .replace("MODE=acceptance", "SECRET=classification-marker");
+        fs::write(&specification, specification_text).unwrap();
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        assert!(recorded.assertions.passed, "{:#?}", recorded.assertions);
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&recorded.directory), 0o700);
+        for name in [
+            "scenario.toml",
+            "choices.json",
+            "events.jsonl",
+            "assertions.json",
+            "manifest.json",
+            WORKLOAD_LOCK_PATH,
+        ] {
+            assert_eq!(mode(&recorded.directory.join(name)), 0o600, "{name}");
+        }
+
+        // A private failure bundle never carries the environment value or the
+        // exact workload stream bytes.
+        let store = options.runs_directory.join(WORKLOAD_STORE_NAME);
+        let closure = store.join("raw/closure.json");
+        let saved = fs::read(&closure).unwrap();
+        fs::remove_file(&closure).unwrap();
+        let replay_options = replay_options(&options, recorded.directory.clone());
+        let error = replay_with_adapter(&replay_options, &adapter).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        fs::write(&closure, saved).unwrap();
+
+        let bundles = failure_bundles(&options.runs_directory);
+        assert_eq!(bundles.len(), 1);
+        let retained = bundle_bytes(&bundles[0]);
+        let retained = String::from_utf8_lossy(&retained);
+        assert!(!retained.contains("classification-marker"), "{retained}");
+        assert!(!retained.contains("ready version=1"), "{retained}");
+        assert!(retained.contains("\"error_kind\""), "{retained}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn fake_vm(mismatch: bool, extra: bool, malformed: bool) -> FakeVm {
         FakeVm {
             identity: identity(),
@@ -3167,6 +4587,7 @@ mod tests {
             malformed_after_shutdown: malformed,
             recorded_events: None,
             playback: false,
+            workload: FakeWorkload::default(),
         }
     }
 
