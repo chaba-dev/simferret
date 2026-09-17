@@ -1719,6 +1719,12 @@ impl<'a> WorkloadController<'a> {
     /// never come. Output frames are folded as they arrive, so a stderr byte or an
     /// over-bound unfinished line ends the wait as soon as it is observed.
     fn await_exit(&mut self, command_id: u64, invocation: u64) -> io::Result<bool> {
+        // The acknowledgement that was awaited before this call can fold a
+        // failing output frame, so an already-observed failure must end the wait
+        // before the first blocking receive rather than after the next one.
+        if !self.healthy(invocation) {
+            return Ok(false);
+        }
         loop {
             let frame = self.receive_one()?;
             match &frame.event {
@@ -3073,6 +3079,15 @@ mod tests {
         frames: BTreeMap<u64, u64>,
     }
 
+    /// A failing tail the fake guest writes while the host is waiting for the
+    /// end-of-input acknowledgement, so the driver has already observed the
+    /// failure when it starts waiting for an exit that never comes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FailingTail {
+        Stderr,
+        OverBound,
+    }
+
     struct FakeVm {
         identity: VmIdentity,
         queued: VecDeque<EventFrame>,
@@ -3123,6 +3138,9 @@ mod tests {
         /// Withhold the over-bound tail until the next command is processed, so
         /// the recording observes it later than a replay does.
         late_tail_after_response: bool,
+        /// Write a failing tail while the host waits for the end-of-input
+        /// acknowledgement, then acknowledge it and stay alive.
+        failing_tail_before_eof: Option<FailingTail>,
         pending_tail: Option<u64>,
     }
 
@@ -3207,6 +3225,7 @@ mod tests {
                 over_bound_line_without_exit: false,
                 over_bound_tail_after_response: false,
                 late_tail_after_response: self.late_tail_after_response,
+                failing_tail_before_eof: None,
                 pending_tail: None,
             })
         }
@@ -3764,6 +3783,22 @@ mod tests {
                         .get(invocation)
                         .copied()
                         .unwrap_or(0);
+                    if let Some(tail) = self.failing_tail_before_eof {
+                        // A failing invocation can still acknowledge the end of
+                        // input, so the host observes the failure before it waits
+                        // for an exit that never comes.
+                        let (stream, data) = match tail {
+                            FailingTail::Stderr => (
+                                OutputStream::Stderr,
+                                "fixture: injected application failure\n".to_owned(),
+                            ),
+                            FailingTail::OverBound => (
+                                OutputStream::Stdout,
+                                "x".repeat(MAX_RESPONSE_LINE_BYTES + 1),
+                            ),
+                        };
+                        self.emit_output(frame.command_id, *invocation, stream, &data);
+                    }
                     self.event(
                         frame.command_id,
                         Event::InputAccepted {
@@ -3773,12 +3808,14 @@ mod tests {
                             eof: true,
                         },
                     );
-                    self.emit_workload_exit(
-                        frame.command_id,
-                        *invocation,
-                        ProcessExit::Exited { code: 0 },
-                        1,
-                    );
+                    if self.failing_tail_before_eof.is_none() {
+                        self.emit_workload_exit(
+                            frame.command_id,
+                            *invocation,
+                            ProcessExit::Exited { code: 0 },
+                            1,
+                        );
+                    }
                 }
                 Command::Terminate { invocation } => {
                     self.require_live(*invocation)?;
@@ -3883,6 +3920,7 @@ mod tests {
             over_bound_line_without_exit: false,
             over_bound_tail_after_response: false,
             late_tail_after_response: false,
+            failing_tail_before_eof: None,
             pending_tail: None,
         };
         let mut diagnostics = failure_diagnostics("record");
@@ -5752,6 +5790,44 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn a_failure_before_the_end_of_input_acknowledgement_stops_the_run() {
+        // The acknowledgement the host awaits can fold a failing tail, so the
+        // failure is already observed when the driver starts waiting for the exit
+        // that follows it. Waiting for one more output frame first would turn a
+        // known application failure into a receive error.
+        for tail in [FailingTail::Stderr, FailingTail::OverBound] {
+            let mut vm = fake_workload_vm();
+            vm.failing_tail_before_eof = Some(tail);
+            let (events, report) = drive_fake_workload(&mut vm);
+            assert!(!report.passed, "{tail:?}");
+            assert!(
+                !report.assertions[0].passed,
+                "{tail:?} {:#?}",
+                report.assertions
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|frame| matches!(frame.event, Event::InputAccepted { eof: true, .. })),
+                "{tail:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|frame| matches!(frame.event, Event::AgentStopped {})),
+                "{tail:?}"
+            );
+            if tail == FailingTail::Stderr {
+                assert!(
+                    report.assertions[1].detail.contains("application error"),
+                    "{:#?}",
+                    report.assertions
+                );
+            }
+        }
+    }
+
     /// A fake guest and scenario for driving the workload control loop directly,
     /// without a record or replay publication.
     fn workload_scenario_fixture() -> WorkloadScenario {
@@ -5807,6 +5883,7 @@ mod tests {
             over_bound_line_without_exit: false,
             over_bound_tail_after_response: false,
             late_tail_after_response: false,
+            failing_tail_before_eof: None,
             pending_tail: None,
         }
     }
@@ -5962,6 +6039,7 @@ mod tests {
             over_bound_line_without_exit: false,
             over_bound_tail_after_response: false,
             late_tail_after_response: false,
+            failing_tail_before_eof: None,
             pending_tail: None,
         }
     }
