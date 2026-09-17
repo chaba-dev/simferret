@@ -3128,6 +3128,9 @@ mod tests {
         /// Answer the state command during the preceding echo command, so the
         /// response is buffered before the command it answers is accepted.
         state_before_its_command: bool,
+        /// Report a typed launch failure instead of starting this invocation, as
+        /// an unsuccessful start does.
+        launch_failure: Option<(u64, crate::protocol::LaunchFailure)>,
         /// Exit the invocation immediately after its startup line, before any
         /// input is read.
         exit_after_start: bool,
@@ -3239,6 +3242,7 @@ mod tests {
                 exit_on_outage: self.exit_on_outage,
                 stale_root: false,
                 state_before_its_command: false,
+                launch_failure: None,
                 exit_after_start: false,
                 duplicate_input_accept: false,
                 mismatched_network: false,
@@ -3763,6 +3767,21 @@ mod tests {
                     }
                 }
                 Command::Start { invocation, launch } => {
+                    if let Some((failed, failure)) = self.launch_failure
+                        && failed == *invocation
+                    {
+                        // An unsuccessful start reports only the typed failure, so
+                        // the invocation is never live and emits no startup line.
+                        self.event(
+                            frame.command_id,
+                            Event::LaunchFailed {
+                                invocation: *invocation,
+                                failure,
+                                detail: "the fake guest could not start the workload".into(),
+                            },
+                        );
+                        return Ok(());
+                    }
                     self.workload.live = Some(*invocation);
                     self.workload.descendant = false;
                     self.workload.fetched = 0;
@@ -3988,6 +4007,7 @@ mod tests {
             exit_on_outage: false,
             stale_root: false,
             state_before_its_command: false,
+            launch_failure: None,
             exit_after_start: false,
             duplicate_input_accept: false,
             mismatched_network: false,
@@ -6035,6 +6055,7 @@ mod tests {
             exit_on_outage: false,
             stale_root: false,
             state_before_its_command: false,
+            launch_failure: None,
             exit_after_start: false,
             duplicate_input_accept: false,
             mismatched_network: false,
@@ -6066,6 +6087,38 @@ mod tests {
         let mut diagnostics = failure_diagnostics("record");
         drive_workload_scenario(scenario, choices, &workload_launch(), vm, &mut diagnostics)
             .expect("an application failure must not become an infrastructure failure")
+    }
+
+    #[test]
+    fn a_failed_start_is_reported_instead_of_waiting_for_a_startup_line() {
+        // An unsuccessful start reports only the typed failure, so a driver that
+        // requires a start record before it recognizes the failure waits for a
+        // startup line that can never arrive.
+        for invocation in [1_u64, 2] {
+            let mut vm = fake_workload_vm();
+            vm.launch_failure = Some((invocation, crate::protocol::LaunchFailure::Executable));
+            let (events, report) = drive_fake_workload(&mut vm);
+            assert!(!report.passed, "invocation {invocation}");
+            assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
+            assert!(
+                report.assertions[0].detail.contains("launch failure"),
+                "{}",
+                report.assertions[0].detail
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|frame| matches!(frame.event, Event::AgentStopped {})),
+                "invocation {invocation}"
+            );
+            assert!(
+                !events.iter().any(|frame| matches!(
+                    frame.event,
+                    Event::WorkloadStarted { invocation: started, .. } if started == invocation
+                )),
+                "invocation {invocation}"
+            );
+        }
     }
 
     #[test]
@@ -6238,6 +6291,7 @@ mod tests {
             exit_on_outage: false,
             stale_root: false,
             state_before_its_command: false,
+            launch_failure: None,
             exit_after_start: false,
             duplicate_input_accept: false,
             mismatched_network: false,

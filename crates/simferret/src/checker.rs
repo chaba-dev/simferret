@@ -470,9 +470,19 @@ impl WorkloadTrace {
                 failure,
                 ..
             } => {
-                if !self.started(*invocation) {
+                // An unsuccessful start reports the typed failure instead of a
+                // start record, so a launch failure does not require one. It is
+                // still a single outcome of one invocation: it cannot repeat, and
+                // it cannot arrive for an invocation that already exited.
+                if self.launch_failed(*invocation) {
                     self.violations.push(format!(
-                        "launch-failed at event {event_id} names invocation {invocation} before it started"
+                        "invocation {invocation} reported a launch failure twice, the second time at event {event_id}"
+                    ));
+                    return;
+                }
+                if self.exited(*invocation) {
+                    self.violations.push(format!(
+                        "invocation {invocation} reported a launch failure at event {event_id} after it exited"
                     ));
                     return;
                 }
@@ -1914,6 +1924,12 @@ mod tests {
         });
         let report = evaluate_workload(&builder.events, &scenario(), &choices, &launch());
         assert!(!report.passed);
+        assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
+        assert!(
+            report.assertions[0].detail.contains("launch failure"),
+            "{}",
+            report.assertions[0].detail
+        );
     }
 
     /// Mutate the first invocation-1 output frame that satisfies `predicate`.
