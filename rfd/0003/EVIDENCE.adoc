@@ -1388,7 +1388,12 @@ The run directory and the host-written run artifacts are owner-only (`0700` and
 bytes, and the private replay closure. The shareable failure bundle is a separate
 directory and carries bounded protocol metadata, counts, digests, and typed
 errors only; a regression test asserts that neither the recorded environment
-value nor a recorded workload output line appears anywhere in it.
+value nor a recorded workload output line appears anywhere in it. The sanitizer
+replaces every private path it knows — the staging directory, the runtime
+directory, and the whole runs directory, which holds the workload store, the
+guest image cache, and the run artifacts — with a fixed `<private-path>` label,
+so a diagnostic that names one of them cannot carry the operator's own path into
+the shareable report.
 
 === Adversarial review hardening
 
@@ -1480,7 +1485,10 @@ one of them was addressed in the same phase rather than deferred:
   The same evidence anchors the fault witnesses: `controlled_outage` and
   `bounded_recovery` require the witness's acknowledgement to follow the
   activation or restoration, so a response whose bytes were already present before
-  the transition cannot count once its newline arrives.
+  the transition cannot count once its newline arrives. The witness arithmetic is
+  lazy, so a witness that precedes its transition fails the property instead of
+  underflowing, and the accepted input offset is compared through a checked sum,
+  so a positive byte count can no longer repeat a saturated offset and pass.
 * *Process evidence.* The first cleanup barrier must reap at least two processes
   (the terminated primary and the escaped descendant) and the escaped-descendant
   line must precede the termination request, with termination, exit, and cleanup
@@ -1659,7 +1667,13 @@ manifest, and replay preflight are exercised without QEMU. The tests cover:
 * a missing binary path and a missing OCI layout, whose locator must not appear
   in the CLI text or the failure bundle; and
 * a recording whose output sequence is the maximum value, whose next frame must
-  report the structural violation instead of overflowing the comparison.
+  report the structural violation instead of overflowing the comparison;
+* an outage witness and a recovery witness that both precede their transition,
+  which must fail the property instead of underflowing;
+* a trace whose input acknowledgements repeat a saturated offset, which must fail
+  process safety; and
+* a record against a marked runs directory whose store is not owner-only, whose
+  retained report must replace the whole path.
 
 `crates/simferret/tests/rfd3_phase3.rs` pins the public contract: the strict
 versioned workload scenario, the seeded choice plan and its bounds, the request

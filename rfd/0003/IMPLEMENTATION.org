@@ -338,6 +338,24 @@ content-addressed guest workload, and preserve exact passive replay.
   - [X] Add regression tests for each fix: a record-path canary for a missing
     binary path and a missing OCI layout, and a checker case that folds a maximal
     sequence followed by another frame.
+- [X] Harden the phase against the eleventh adversarial review, which confirmed
+  both tenth-round fixes and found three further defects:
+  - [X] Make the witness arithmetic lazy: the outage, recovery, and restart
+    witnesses built their reported distance with `then_some`, so the subtraction
+    ran even when the predicate was false and a witness that preceded its
+    transition underflowed instead of failing the property.
+  - [X] Compare the accepted input offset through a checked sum: the saturating
+    sum accepted an acknowledgement of the maximum byte count at the maximum
+    offset, after which every later acknowledgement could repeat the same offset
+    without advancing and still pass every property.
+  - [X] Replace the whole runs directory in a retained report: the sanitizer
+    covered only the staging and runtime directories, so a diagnostic that named
+    the workload store, the guest image cache, or a run artifact kept the
+    operator's own runs path in `failure.json`, and the replacement label now
+    names a private path rather than a runtime directory.
+  - [X] Add regression tests for each fix: two witness cases that precede their
+    transition, a non-advancing input offset, and a record against a marked runs
+    directory whose store is not owner-only.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
