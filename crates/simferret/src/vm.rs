@@ -647,13 +647,13 @@ fn validate_identity_compatibility(expected: &VmIdentity, actual: &VmIdentity) -
     }
     let expected = serde_json::to_value(expected).map_err(io::Error::other)?;
     let actual = serde_json::to_value(actual).map_err(io::Error::other)?;
-    let (field, expected, actual) = first_identity_difference("vm", &expected, &actual)
+    let field = first_identity_difference("vm", &expected, &actual)
         .expect("unequal identities have a differing field");
+    // The differing value is artifact data and may be a private host path or an
+    // arbitrary recorded string, so the diagnostic names the field only.
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        format!(
-            "replay environment identity differs at {field}: expected {expected}, actual {actual}"
-        ),
+        format!("replay environment identity differs at {field}"),
     ))
 }
 
@@ -666,13 +666,11 @@ pub(crate) fn validate_replay_network_identity(
     }
     let expected = serde_json::to_value(&expected.network).map_err(io::Error::other)?;
     let actual = serde_json::to_value(actual).map_err(io::Error::other)?;
-    let (field, expected, actual) = first_identity_difference("vm.network", &expected, &actual)
+    let field = first_identity_difference("vm.network", &expected, &actual)
         .expect("unequal network identities have a differing field");
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        format!(
-            "replay environment identity differs at {field}: expected {expected}, actual {actual}"
-        ),
+        format!("replay environment identity differs at {field}"),
     ))
 }
 
@@ -680,13 +678,13 @@ fn first_identity_difference(
     path: &str,
     expected: &serde_json::Value,
     actual: &serde_json::Value,
-) -> Option<(String, String, String)> {
+) -> Option<String> {
     match (expected, actual) {
         (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => {
             for (name, expected_value) in expected {
                 let child = format!("{path}.{name}");
                 let Some(actual_value) = actual.get(name) else {
-                    return Some((child, expected_value.to_string(), "<missing>".into()));
+                    return Some(child);
                 };
                 if let Some(difference) =
                     first_identity_difference(&child, expected_value, actual_value)
@@ -697,19 +695,13 @@ fn first_identity_difference(
             actual
                 .iter()
                 .find(|(name, _)| !expected.contains_key(*name))
-                .map(|(name, value)| {
-                    (
-                        format!("{path}.{name}"),
-                        "<missing>".into(),
-                        value.to_string(),
-                    )
-                })
+                .map(|(name, _)| format!("{path}.{name}"))
         }
         (serde_json::Value::Array(expected), serde_json::Value::Array(actual)) => {
             for (index, expected_value) in expected.iter().enumerate() {
                 let child = format!("{path}[{index}]");
                 let Some(actual_value) = actual.get(index) else {
-                    return Some((child, expected_value.to_string(), "<missing>".into()));
+                    return Some(child);
                 };
                 if let Some(difference) =
                     first_identity_difference(&child, expected_value, actual_value)
@@ -717,16 +709,12 @@ fn first_identity_difference(
                     return Some(difference);
                 }
             }
-            actual.get(expected.len()).map(|value| {
-                (
-                    format!("{path}[{}]", expected.len()),
-                    "<missing>".into(),
-                    value.to_string(),
-                )
-            })
+            actual
+                .get(expected.len())
+                .map(|_| format!("{path}[{}]", expected.len()))
         }
         _ if expected == actual => None,
-        _ => Some((path.into(), expected.to_string(), actual.to_string())),
+        _ => Some(path.into()),
     }
 }
 
@@ -2177,7 +2165,7 @@ time.sleep(30)
     }
 
     #[test]
-    fn actual_replay_network_mismatch_has_field_and_values() {
+    fn actual_replay_network_mismatch_names_the_field_only() {
         let root = network_test_root("actual-mismatch");
         fs::create_dir_all(&root).unwrap();
         let mut actual = network_config(&root);
@@ -2191,8 +2179,9 @@ time.sleep(30)
         };
         let message = error.to_string();
         assert!(message.contains("vm.network.nic.mac_address"), "{message}");
-        assert!(message.contains("52:54:00:12:34:56"), "{message}");
-        assert!(message.contains("52:54:00:12:34:57"), "{message}");
+        // The differing value is artifact data, so it is never quoted.
+        assert!(!message.contains("52:54:00:12:34:56"), "{message}");
+        assert!(!message.contains("52:54:00:12:34:57"), "{message}");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2249,7 +2238,7 @@ time.sleep(30)
     }
 
     #[test]
-    fn identity_mismatch_reports_the_first_field_with_both_values() {
+    fn identity_mismatch_reports_the_first_field_only() {
         let root = network_test_root("identity");
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::create_dir_all(root.join("share/qemu")).unwrap();
@@ -2280,8 +2269,10 @@ time.sleep(30)
         let error = validate_identity_compatibility(&expected, &actual).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("vm.network.nic.mac_address"), "{message}");
-        assert!(message.contains("52:54:00:12:34:57"), "{message}");
-        assert!(message.contains("52:54:00:12:34:56"), "{message}");
+        // Neither side of the comparison is quoted, because a recorded identity
+        // can carry an arbitrary string or a private host path.
+        assert!(!message.contains("52:54:00:12:34:57"), "{message}");
+        assert!(!message.contains("52:54:00:12:34:56"), "{message}");
         fs::remove_dir_all(root).unwrap();
     }
 
