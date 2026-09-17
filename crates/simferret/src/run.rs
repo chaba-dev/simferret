@@ -5806,6 +5806,50 @@ mod tests {
     }
 
     #[test]
+    fn a_tampered_raw_closure_names_objects_by_position_not_by_value() {
+        // The raw closure is a private artifact, but its role and digest fields
+        // are free-form strings and a replay that rejects it retains a shareable
+        // failure bundle. Neither the CLI text nor the bundle may quote them.
+        let root = temporary_root("raw-closure-privacy");
+        let options = workload_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        let closure_path = options
+            .runs_directory
+            .join(WORKLOAD_STORE_NAME)
+            .join("raw/closure.json");
+        let original = fs::read(&closure_path).unwrap();
+
+        for (tamper, expected) in [("role", "unknown role"), ("digest", "policy limit")] {
+            let mut closure: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            if tamper == "role" {
+                closure["objects"][0]["role"] = serde_json::Value::String("SECRET=CANARY".into());
+            } else {
+                // An oversized object must not name its unvalidated digest.
+                closure["objects"][0]["bytes"] = serde_json::Value::from(u64::MAX);
+                closure["objects"][0]["digest"] = serde_json::Value::String("SECRET=CANARY".into());
+            }
+            fs::write(&closure_path, serde_json::to_vec(&closure).unwrap()).unwrap();
+
+            let error = replay_with_adapter(
+                &replay_options(&options, recorded.directory.clone()),
+                &adapter,
+            )
+            .unwrap_err();
+            assert!(!error.to_string().contains("CANARY"), "{error}");
+            assert!(error.to_string().contains(expected), "{error}");
+            let bundle = only_failure_bundle(&options.runs_directory);
+            let report = fs::read(bundle.join("failure.json")).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&report).contains("CANARY"),
+                "{tamper}: {report:?}"
+            );
+            fs::remove_dir_all(bundle).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_rejected_guest_fault_transition_never_reaches_the_failure_bundle() {
         // The guest's own event strings are unvalidated: a diverging activation
         // can carry any bytes. Neither the error text nor the retained bundle may

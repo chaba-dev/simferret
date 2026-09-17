@@ -452,11 +452,15 @@ fn publish(store: &Path, graph: WorkloadGraph) -> io::Result<AssembledWorkload> 
         )));
     }
     let mut records = Vec::with_capacity(graph.objects.len());
-    for (role, data) in &graph.objects {
-        let limit = role_limit(role)?;
+    for (index, (role, data)) in graph.objects.iter().enumerate() {
+        let Some(limit) = role_limit(role) else {
+            return Err(invalid(format!(
+                "assembled raw closure object {index} names an unknown role"
+            )));
+        };
         if data.len() > limit {
             return Err(invalid(format!(
-                "{role} object exceeds its {limit}-byte policy limit"
+                "raw object {index} exceeds its {limit}-byte policy limit"
             )));
         }
         records.push(ObjectRecord {
@@ -668,12 +672,17 @@ fn read_objects(root: &Root, closure: &Closure) -> io::Result<BTreeMap<String, V
         )));
     }
     let mut objects = BTreeMap::new();
-    for record in &closure.objects {
-        let limit = role_limit(&record.role)?;
+    for (index, record) in closure.objects.iter().enumerate() {
+        let Some(limit) = role_limit(&record.role) else {
+            // The role is an arbitrary string from a private artifact, so the
+            // diagnostic names the object's position instead of its value.
+            return Err(invalid(format!(
+                "raw closure object {index} names an unknown role"
+            )));
+        };
         if record.bytes > limit {
             return Err(invalid(format!(
-                "raw object {} exceeds the {limit}-byte policy limit",
-                record.digest
+                "raw object {index} exceeds the {limit}-byte policy limit"
             )));
         }
         let hex = parse_digest(&record.digest)?;
@@ -700,21 +709,19 @@ fn read_objects(root: &Root, closure: &Closure) -> io::Result<BTreeMap<String, V
     Ok(objects)
 }
 
-fn role_limit(role: &str) -> io::Result<usize> {
+fn role_limit(role: &str) -> Option<usize> {
     match role {
-        "oci-layout" => Ok(MAX_LAYOUT_BYTES),
-        "index.json" => Ok(MAX_INDEX_BYTES),
-        "manifest" => Ok(MAX_MANIFEST_BYTES),
-        "config" => Ok(MAX_CONFIG_BYTES),
-        "executable" => Ok(MAX_FILE_BYTES),
-        "workload-specification" => Ok(MAX_SPECIFICATION_BYTES),
+        "oci-layout" => Some(MAX_LAYOUT_BYTES),
+        "index.json" => Some(MAX_INDEX_BYTES),
+        "manifest" => Some(MAX_MANIFEST_BYTES),
+        "config" => Some(MAX_CONFIG_BYTES),
+        "executable" => Some(MAX_FILE_BYTES),
+        "workload-specification" => Some(MAX_SPECIFICATION_BYTES),
         _ => match role.strip_prefix("layer-") {
             Some(index) if !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()) => {
-                Ok(MAX_LAYER_BYTES)
+                Some(MAX_LAYER_BYTES)
             }
-            _ => Err(invalid(format!(
-                "raw closure names unknown object role {role:?}"
-            ))),
+            _ => None,
         },
     }
 }
