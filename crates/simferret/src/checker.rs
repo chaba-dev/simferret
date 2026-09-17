@@ -97,6 +97,10 @@ struct InvocationStreams {
     stderr_offset: u64,
     /// Whether the current stdout line has already exceeded the response bound.
     stdout_over_bound: bool,
+    /// Whether any stdout line has exceeded the response bound. The failure is
+    /// permanent: completing the offending line cannot make the invocation
+    /// healthy again.
+    stdout_over_bound_seen: bool,
     /// The accepted input offset after the last `input-accepted` event.
     input_offset: u64,
     /// The command identifiers of the accepted inputs, in arrival order.
@@ -162,6 +166,9 @@ impl InvocationStreams {
                     "invocation {invocation} {} line exceeds the response bound",
                     stream.name()
                 ));
+                if stream == OutputStream::Stdout {
+                    self.stdout_over_bound_seen = true;
+                }
             }
             lines.push(CompletedLine {
                 text,
@@ -179,6 +186,7 @@ impl InvocationStreams {
             && pending.len() > MAX_RESPONSE_LINE_BYTES
         {
             self.stdout_over_bound = true;
+            self.stdout_over_bound_seen = true;
             self.violations.push(format!(
                 "invocation {invocation} stdout line exceeds the response bound before its newline"
             ));
@@ -639,13 +647,14 @@ impl WorkloadTrace {
         })
     }
 
-    /// Whether one invocation's current stdout line has already exceeded the
-    /// response bound. The driver stops waiting for a line that can no longer be
-    /// valid instead of reaching the VM deadline.
+    /// Whether one invocation's stdout has exceeded the response bound, either on
+    /// its current unfinished line or on a line that has already completed. The
+    /// driver stops waiting for a line that can no longer be valid instead of
+    /// reaching the VM deadline.
     pub fn over_bound_line(&self, invocation: u64) -> bool {
         self.invocations
             .get(&invocation)
-            .is_some_and(|streams| streams.stdout_over_bound)
+            .is_some_and(|streams| streams.stdout_over_bound || streams.stdout_over_bound_seen)
     }
 
     fn stdout_lines(&self, invocation: u64) -> &[CompletedLine] {

@@ -3092,7 +3092,13 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum FailingTail {
         Stderr,
+        /// An over-bound stdout line with no newline, so only the response bound
+        /// can end the wait.
         OverBound,
+        /// An over-bound stdout line completed by its newline in the same frame.
+        OverBoundLine,
+        /// An over-bound stdout line whose newline arrives in a later frame.
+        OverBoundSplit,
     }
 
     struct FakeVm {
@@ -3818,17 +3824,40 @@ mod tests {
                         // A failing invocation can still acknowledge the end of
                         // input, so the host observes the failure before it waits
                         // for an exit that never comes.
-                        let (stream, data) = match tail {
-                            FailingTail::Stderr => (
+                        match tail {
+                            FailingTail::Stderr => self.emit_output(
+                                frame.command_id,
+                                *invocation,
                                 OutputStream::Stderr,
-                                "fixture: injected application failure\n".to_owned(),
+                                "fixture: injected application failure\n",
                             ),
-                            FailingTail::OverBound => (
+                            FailingTail::OverBound => self.emit_output(
+                                frame.command_id,
+                                *invocation,
                                 OutputStream::Stdout,
-                                "x".repeat(MAX_RESPONSE_LINE_BYTES + 1),
+                                &"x".repeat(MAX_RESPONSE_LINE_BYTES + 1),
                             ),
-                        };
-                        self.emit_output(frame.command_id, *invocation, stream, &data);
+                            FailingTail::OverBoundLine => self.emit_output(
+                                frame.command_id,
+                                *invocation,
+                                OutputStream::Stdout,
+                                &format!("{}\n", "x".repeat(MAX_RESPONSE_LINE_BYTES + 1)),
+                            ),
+                            FailingTail::OverBoundSplit => {
+                                self.emit_output(
+                                    frame.command_id,
+                                    *invocation,
+                                    OutputStream::Stdout,
+                                    &"x".repeat(MAX_RESPONSE_LINE_BYTES + 1),
+                                );
+                                self.emit_output(
+                                    frame.command_id,
+                                    *invocation,
+                                    OutputStream::Stdout,
+                                    "\n",
+                                );
+                            }
+                        }
                     }
                     self.event(
                         frame.command_id,
@@ -5861,7 +5890,12 @@ mod tests {
         // failure is already observed when the driver starts waiting for the exit
         // that follows it. Waiting for one more output frame first would turn a
         // known application failure into a receive error.
-        for tail in [FailingTail::Stderr, FailingTail::OverBound] {
+        for tail in [
+            FailingTail::Stderr,
+            FailingTail::OverBound,
+            FailingTail::OverBoundLine,
+            FailingTail::OverBoundSplit,
+        ] {
             let mut vm = fake_workload_vm();
             vm.failing_tail_before_eof = Some(tail);
             let (events, report) = drive_fake_workload(&mut vm);
