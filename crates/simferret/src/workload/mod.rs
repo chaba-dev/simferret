@@ -17,6 +17,7 @@ use std::io;
 
 pub use spec::{
     BINARY_INSTALL_PATH, BinarySource, LaunchIdentity, OciSource, SourceKind, WorkloadSource,
+    validate_launch_identity,
 };
 pub use store::{AssembledWorkload, LoadedWorkload};
 pub use tree::{Entry, EntryKind, Tree};
