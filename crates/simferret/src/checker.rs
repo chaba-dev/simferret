@@ -167,7 +167,9 @@ impl InvocationStreams {
                 text,
                 event_id: frame.event_id,
             });
-            self.stdout_over_bound = false;
+            if stream == OutputStream::Stdout {
+                self.stdout_over_bound = false;
+            }
         }
         // A line that already exceeds the bound without a newline is a failing
         // response too, and waiting for the newline would only reach the VM
@@ -366,6 +368,22 @@ impl WorkloadTrace {
                 if !self.started(*invocation) {
                     self.violations.push(format!(
                         "termination-requested at event {event_id} names invocation {invocation} before it started"
+                    ));
+                    return;
+                }
+                if self.exited(*invocation) {
+                    self.violations.push(format!(
+                        "termination-requested at event {event_id} names invocation {invocation} after it exited"
+                    ));
+                    return;
+                }
+                if self
+                    .terminations
+                    .iter()
+                    .any(|termination| termination.invocation == *invocation)
+                {
+                    self.violations.push(format!(
+                        "invocation {invocation} was terminated twice, the second time at event {event_id}"
                     ));
                     return;
                 }
@@ -702,6 +720,17 @@ fn process_safety(
         return failed(
             AssertionName::ProcessSafety,
             "the started invocation identities do not match the materialized workload",
+        );
+    }
+    // The acceptance profile terminates exactly the first invocation, so a
+    // second termination record anywhere is not a passing process history.
+    if trace.terminations.len() != 1 {
+        return failed(
+            AssertionName::ProcessSafety,
+            format!(
+                "expected exactly one termination record, observed {}",
+                trace.terminations.len()
+            ),
         );
     }
     let Some(terminated) = trace
@@ -1513,6 +1542,44 @@ mod tests {
                 matches!(frame.event, Event::WorkloadExited { invocation: existing, .. } if existing == invocation)
             })
             .expect("the invocation has an exit record")
+    }
+
+    #[test]
+    fn a_termination_after_cleanup_fails_process_safety() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        // A termination for an invocation that has already exited and completed
+        // its cleanup cannot be part of a passing process history.
+        let index = events.len() - 1;
+        insert_event(
+            &mut events,
+            index,
+            Event::TerminationRequested {
+                invocation: 2,
+                signal: TERMINATION_SIGNAL,
+            },
+            1,
+        );
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
+    }
+
+    #[test]
+    fn a_duplicated_termination_fails_process_safety() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let index = exit_index(&events, 1);
+        insert_event(
+            &mut events,
+            index,
+            Event::TerminationRequested {
+                invocation: 1,
+                signal: TERMINATION_SIGNAL,
+            },
+            1,
+        );
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
     }
 
     #[test]
