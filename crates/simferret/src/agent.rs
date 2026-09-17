@@ -114,7 +114,7 @@ impl Agent {
     /// workload output pipes together, so output frames are emitted while the
     /// workload runs instead of only between commands.
     fn poll_loop(&mut self, input_fd: RawFd, output: &mut impl Write) -> io::Result<()> {
-        let mut buffer = Vec::new();
+        let mut buffer = SerialBuffer::default();
         loop {
             self.service_runtime(output)?;
             let mut descriptors = vec![libc::pollfd {
@@ -126,6 +126,14 @@ impl Agent {
                 descriptors.push(libc::pollfd {
                     fd,
                     events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+            // Queued input needs the loop to wake when the child's pipe drains.
+            if let Some(fd) = self.runtime.as_ref().and_then(Runtime::input_fd) {
+                descriptors.push(libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
                     revents: 0,
                 });
             }
@@ -148,16 +156,29 @@ impl Agent {
             if ready == 0 || descriptors[0].revents == 0 {
                 continue;
             }
-            let Some(frames) = read_serial_frames(input_fd, &mut buffer, output)? else {
-                // The control channel closed. Terminate any live workload so
-                // the cleanup barrier runs before the guest powers off.
-                self.shutdown_runtime(output)?;
-                return Ok(());
-            };
-            for frame in frames {
-                require_version(frame.protocol_version)?;
-                self.last_command_id = frame.command_id;
-                if !self.dispatch(frame.command_id, frame.command, output)? {
+            match read_serial_frames(input_fd, &mut buffer, output)? {
+                Some(frames) => {
+                    for frame in frames {
+                        require_version(frame.protocol_version)?;
+                        self.last_command_id = frame.command_id;
+                        if !self.dispatch(frame.command_id, frame.command, output)? {
+                            return Ok(());
+                        }
+                    }
+                }
+                None => {
+                    // Terminate any live workload so the cleanup barrier runs
+                    // before the guest powers off, but an unexpected closure
+                    // while a workload is live is an infrastructure failure
+                    // rather than a clean shutdown.
+                    let active = self.runtime.as_ref().is_some_and(Runtime::is_active);
+                    self.shutdown_runtime(output)?;
+                    if active {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "the control channel closed while an invocation was active",
+                        ));
+                    }
                     return Ok(());
                 }
             }
@@ -388,17 +409,46 @@ impl Agent {
         } else {
             write_frame(output, &frame)?;
         }
-        self.events.push(frame);
+        // Only the network fixture's events feed the legacy assertion history.
+        // Process and output events carry exact output bytes and launch
+        // environments, are streamed to the host once, and must not accumulate
+        // for the lifetime of the guest.
+        if is_assertion_event(&frame.event) {
+            self.events.push(frame);
+        }
         Ok(())
     }
 }
 
-/// Read whatever control bytes are available, acknowledge every one, and
-/// return any complete line-delimited command frames. `None` reports end of
-/// file on the control channel.
+/// Whether an event participates in the legacy network assertion report.
+fn is_assertion_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::NetworkConfigured { .. }
+            | Event::OutageActivated { .. }
+            | Event::NetworkRestored { .. }
+            | Event::RequestAttempted { .. }
+            | Event::RequestSucceeded { .. }
+            | Event::RequestUnavailable { .. }
+            | Event::AssertionsEvaluated { .. }
+    )
+}
+
+/// Accumulates line-delimited control frames without rescanning bytes it has
+/// already inspected. The host writes one byte and waits for its
+/// acknowledgement, so a full rescan per read would be quadratic.
+#[derive(Default)]
+struct SerialBuffer {
+    bytes: Vec<u8>,
+    scanned: usize,
+}
+
+/// Read whatever control bytes are available, acknowledge every one, and return
+/// any complete line-delimited command frames. `None` reports a clean end of the
+/// control channel; a partial trailing frame or an oversized line is an error.
 fn read_serial_frames(
     fd: RawFd,
-    buffer: &mut Vec<u8>,
+    buffer: &mut SerialBuffer,
     output: &mut impl Write,
 ) -> io::Result<Option<Vec<CommandFrame>>> {
     let mut chunk = [0_u8; 4096];
@@ -413,6 +463,14 @@ fn read_serial_frames(
         return Err(error);
     }
     if read == 0 {
+        // A partial trailing frame is a truncated control message, not a clean
+        // end of the channel.
+        if !buffer.bytes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the control channel closed inside a frame",
+            ));
+        }
         return Ok(None);
     }
     let bytes = &chunk[..read as usize];
@@ -420,20 +478,37 @@ fn read_serial_frames(
         output.write_all(&[SERIAL_ACK])?;
     }
     output.flush()?;
-    buffer.extend_from_slice(bytes);
+    buffer.bytes.extend_from_slice(bytes);
     let mut frames = Vec::new();
-    while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
-        let line: Vec<u8> = buffer.drain(..=index).collect();
+    loop {
+        let Some(offset) = buffer.bytes[buffer.scanned..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        else {
+            buffer.scanned = buffer.bytes.len();
+            break;
+        };
+        let index = buffer.scanned + offset;
+        let line: Vec<u8> = buffer.bytes.drain(..=index).collect();
+        buffer.scanned = 0;
         let body = &line[..line.len() - 1];
         if body.is_empty() {
             continue;
+        }
+        // A complete line that crosses the limit is rejected before it is
+        // parsed, not only when it is still incomplete.
+        if body.len() > crate::protocol::MAX_FRAME_LENGTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame exceeds maximum length",
+            ));
         }
         frames.push(
             serde_json::from_slice(body)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
         );
     }
-    if buffer.len() > crate::protocol::MAX_FRAME_LENGTH {
+    if buffer.bytes.len() > crate::protocol::MAX_FRAME_LENGTH {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "frame exceeds maximum length",
@@ -565,13 +640,16 @@ mod tests {
                 &mut output,
             )
             .unwrap();
+        let frame: EventFrame = read_frame(&mut output.as_slice()).unwrap().unwrap();
         assert!(matches!(
-            &agent.events[0].event,
+            frame.event,
             Event::LaunchFailed {
                 failure: LaunchFailure::NoRuntime,
                 ..
             }
         ));
+        // The event is streamed to the host but not retained locally.
+        assert!(agent.events.is_empty());
     }
 
     #[test]
@@ -584,8 +662,8 @@ mod tests {
         let mut input = serde_json::to_vec(&frame).unwrap();
         input.push(b'\n');
         let mut output = Vec::new();
-        let mut buffer = Vec::new();
-        // A pipe is required to read the bytes; use a temporary file instead.
+        let mut buffer = SerialBuffer::default();
+        // A file supplies the bytes without blocking on a pipe.
         let path = std::env::temp_dir().join(format!(
             "simferret-agent-frame-{}-{}",
             std::process::id(),
@@ -599,7 +677,166 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(frames, vec![frame]);
         assert_eq!(output, vec![SERIAL_ACK; input.len()]);
-        assert!(buffer.is_empty());
+        assert!(buffer.bytes.is_empty());
+    }
+
+    #[test]
+    fn a_frame_split_across_reads_is_reassembled() {
+        let frame = CommandFrame {
+            protocol_version: PROTOCOL_VERSION,
+            command_id: 3,
+            command: Command::StdinEof { invocation: 1 },
+        };
+        let mut body = serde_json::to_vec(&frame).unwrap();
+        body.push(b'\n');
+        let split = body.len() / 2;
+        let (read_fd, write_fd) = test_pipe();
+        test_write(write_fd, &body[..split]);
+        let mut buffer = SerialBuffer::default();
+        let mut output = Vec::new();
+        let frames = read_serial_frames(read_fd, &mut buffer, &mut output)
+            .unwrap()
+            .unwrap();
+        assert!(frames.is_empty());
+        // The already-scanned prefix is not rescanned on the next read.
+        assert_eq!(buffer.scanned, buffer.bytes.len());
+        test_write(write_fd, &body[split..]);
+        let frames = read_serial_frames(read_fd, &mut buffer, &mut output)
+            .unwrap()
+            .unwrap();
+        assert_eq!(frames, vec![frame]);
+        assert!(buffer.bytes.is_empty());
+        test_close(read_fd);
+        test_close(write_fd);
+    }
+
+    #[test]
+    fn a_truncated_control_frame_is_rejected() {
+        let (read_fd, write_fd) = test_pipe();
+        test_write(write_fd, b"{\"protocol_version\":");
+        test_close(write_fd);
+        let mut buffer = SerialBuffer::default();
+        let mut output = Vec::new();
+        let frames = read_serial_frames(read_fd, &mut buffer, &mut output)
+            .unwrap()
+            .unwrap();
+        assert!(frames.is_empty());
+        let error = read_serial_frames(read_fd, &mut buffer, &mut output).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        test_close(read_fd);
+    }
+
+    #[test]
+    fn an_oversized_control_line_is_rejected() {
+        let path = std::env::temp_dir().join(format!(
+            "simferret-agent-oversized-{}-{}",
+            std::process::id(),
+            agent_test_counter()
+        ));
+        let mut line = vec![b'a'; crate::protocol::MAX_FRAME_LENGTH + 1];
+        line.push(b'\n');
+        std::fs::write(&path, &line).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mut buffer = SerialBuffer::default();
+        let mut output = Vec::new();
+        let mut error = None;
+        for _ in 0..4096 {
+            match read_serial_frames(file.as_raw_fd(), &mut buffer, &mut output) {
+                Ok(Some(frames)) => assert!(frames.is_empty()),
+                Ok(None) => break,
+                Err(found) => {
+                    error = Some(found);
+                    break;
+                }
+            }
+        }
+        std::fs::remove_file(&path).unwrap();
+        let error = error.expect("an oversized line must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn only_network_events_are_retained_for_assertions() {
+        use crate::protocol::{LaunchFailure, OutputStream, ProcessExit, RequestPhase};
+        use crate::workload::LaunchIdentity;
+
+        assert!(is_assertion_event(&Event::NetworkConfigured {
+            interface: "eth0".into(),
+            guest_cidr: "10.0.2.15/24".into(),
+            gateway: "10.0.2.2".into(),
+        }));
+        assert!(is_assertion_event(&Event::RequestAttempted {
+            request_id: "request-0001".into(),
+            payload: "payload".into(),
+            phase: RequestPhase::PreOutage,
+        }));
+        // Process and output events carry exact bytes or launch environments
+        // and must not accumulate for the lifetime of the guest.
+        assert!(!is_assertion_event(&Event::WorkloadStarted {
+            invocation: 1,
+            launch: LaunchIdentity {
+                executable: "/bin/app".into(),
+                arguments: vec!["/bin/app".into()],
+                environment: vec!["SECRET=value".into()],
+                working_directory: "/".into(),
+                uid: 65534,
+                gid: 65534,
+            },
+        }));
+        assert!(!is_assertion_event(&Event::WorkloadOutput {
+            invocation: 1,
+            stream: OutputStream::Stdout,
+            offset: 0,
+            sequence: 1,
+            bytes: "00".into(),
+        }));
+        assert!(!is_assertion_event(&Event::InputAccepted {
+            invocation: 1,
+            offset: 1,
+            bytes: 1,
+            eof: false,
+        }));
+        assert!(!is_assertion_event(&Event::WorkloadExited {
+            invocation: 1,
+            exit: ProcessExit::Exited { code: 0 },
+            stdout_bytes: 0,
+            stdout_sha256: "0".repeat(64),
+            stderr_bytes: 0,
+            stderr_sha256: "0".repeat(64),
+            frames: 0,
+        }));
+        assert!(!is_assertion_event(&Event::LaunchFailed {
+            invocation: 1,
+            failure: LaunchFailure::Setup,
+            detail: "detail".into(),
+        }));
+        assert!(!is_assertion_event(&Event::CleanupComplete {
+            invocation: 1,
+            reaped: 1,
+        }));
+    }
+
+    fn test_pipe() -> (RawFd, RawFd) {
+        let mut descriptors = [0_i32; 2];
+        // SAFETY: `descriptors` is a writable two-element array.
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        (descriptors[0], descriptors[1])
+    }
+
+    fn test_write(fd: RawFd, bytes: &[u8]) {
+        let mut written = 0;
+        while written < bytes.len() {
+            // SAFETY: `bytes` is live and `fd` is a test pipe write end.
+            let result =
+                unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+            assert!(result > 0, "test pipe write failed");
+            written += result as usize;
+        }
+    }
+
+    fn test_close(fd: RawFd) {
+        // SAFETY: `fd` is an owned test descriptor closed exactly once.
+        unsafe { libc::close(fd) };
     }
 
     fn agent_test_counter() -> u64 {

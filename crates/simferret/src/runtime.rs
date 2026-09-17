@@ -60,6 +60,11 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// `PF_KTHREAD`. Kernel threads appear in the guest process table but cannot be
 /// signalled or reaped, so they are never invocation members.
 const KERNEL_THREAD_FLAG: u64 = 0x0020_0000;
+/// Bound one output service batch. A continuously ready stream must not
+/// monopolize the control loop or allocate an unbounded event vector, and both
+/// streams are serviced fairly within the batch.
+const MAX_SERVICE_FRAMES: u64 = 64;
+const MAX_SERVICE_BYTES: usize = 64 * 1024;
 
 /// Child setup result codes. The child writes one byte to a close-on-exec error
 /// pipe before `execve`, so a successful exec is an unreadable pipe and a setup
@@ -197,11 +202,57 @@ struct Invocation {
     stderr_state: StreamState,
     input_offset: u64,
     input_bytes: u64,
+    /// Input accepted into the bounded queue but not yet written to the child.
+    /// It exists so a child that stops reading cannot block the control loop.
+    pending_input: Vec<u8>,
+    eof_requested: bool,
     sequence: u64,
     frames: u64,
     exit: Option<ProcessExit>,
     reaped: u64,
     cleanup_complete: bool,
+}
+
+impl Invocation {
+    /// Write as much queued input as the pipe accepts, and close the child's
+    /// standard input once the queue is empty and end of input was requested.
+    fn flush_input(&mut self) -> io::Result<()> {
+        let Some(raw) = self.stdin.as_ref().map(AsRawFd::as_raw_fd) else {
+            return Ok(());
+        };
+        while !self.pending_input.is_empty() {
+            // SAFETY: `pending_input` is a live buffer and `raw` is the
+            // invocation's non-blocking stdin write end.
+            let written = unsafe {
+                libc::write(
+                    raw,
+                    self.pending_input.as_ptr().cast(),
+                    self.pending_input.len(),
+                )
+            };
+            if written < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            if written == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "workload input pipe closed",
+                ));
+            }
+            self.pending_input.drain(..written as usize);
+        }
+        if self.eof_requested {
+            self.stdin = None;
+        }
+        Ok(())
+    }
 }
 
 /// One guest process runtime. It owns at most one active invocation.
@@ -251,6 +302,16 @@ impl Runtime {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The stdin write descriptor while queued input still needs the pipe to
+    /// drain, so the agent can poll it for writability.
+    pub fn input_fd(&self) -> Option<RawFd> {
+        let active = self.active.as_ref()?;
+        if active.pending_input.is_empty() {
+            return None;
+        }
+        active.stdin.as_ref().map(AsRawFd::as_raw_fd)
     }
 
     pub fn limits(&self) -> &RuntimeLimits {
@@ -334,6 +395,8 @@ impl Runtime {
             stderr_state: StreamState::new(),
             input_offset: 0,
             input_bytes: 0,
+            pending_input: Vec::new(),
+            eof_requested: false,
             sequence: 0,
             frames: 0,
             exit: None,
@@ -346,7 +409,13 @@ impl Runtime {
         })
     }
 
-    /// Accept one bounded, strictly contiguous stdin frame.
+    /// Accept one bounded, strictly contiguous stdin frame into the invocation's
+    /// queue, then write whatever the child's pipe accepts.
+    ///
+    /// A child that stops reading can fill its pipe. The frame is queued rather
+    /// than written synchronously, so the control loop keeps draining output and
+    /// can still process `terminate`; the queue is bounded by the invocation's
+    /// input limit and overflow is fatal.
     pub fn stdin_write(
         &mut self,
         invocation: u64,
@@ -355,11 +424,30 @@ impl Runtime {
     ) -> io::Result<Vec<Event>> {
         let data = crate::protocol::decode_bytes(bytes, self.config.limits.input_frame_bytes)
             .map_err(|error| self.fatal(invocation, error))?;
+        if data.is_empty() {
+            return Err(self.fatal(
+                invocation,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "a stdin frame must not be empty",
+                ),
+            ));
+        }
         let limits = self.config.limits;
-        let (current_offset, current_bytes) = {
+        let (current_offset, current_bytes, closed) = {
             let active = self.invocation_mut(invocation)?;
-            (active.input_offset, active.input_bytes)
+            (
+                active.input_offset,
+                active.input_bytes,
+                active.eof_requested || active.stdin.is_none(),
+            )
         };
+        if closed {
+            return Err(self.fatal(
+                invocation,
+                io::Error::new(io::ErrorKind::InvalidInput, "workload stdin is closed"),
+            ));
+        }
         if current_offset != offset {
             return Err(self.fatal(
                 invocation,
@@ -378,13 +466,13 @@ impl Runtime {
                 ),
             ));
         }
-        let fd = self
-            .invocation_mut(invocation)?
-            .stdin
-            .as_ref()
-            .map(AsRawFd::as_raw_fd)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "workload stdin is closed"))?;
-        if let Err(error) = write_all(fd, &data) {
+        let active = self.invocation_mut(invocation)?;
+        active.input_offset += data.len() as u64;
+        active.input_bytes += data.len() as u64;
+        active.pending_input.extend_from_slice(&data);
+        let flushed = active.flush_input();
+        let accepted_offset = active.input_offset;
+        if let Err(error) = flushed {
             return Err(self.fatal(
                 invocation,
                 io::Error::new(
@@ -393,24 +481,41 @@ impl Runtime {
                 ),
             ));
         }
-        let active = self.invocation_mut(invocation)?;
-        active.input_offset += data.len() as u64;
-        active.input_bytes += data.len() as u64;
         Ok(vec![Event::InputAccepted {
             invocation,
-            offset: active.input_offset,
+            offset: accepted_offset,
             bytes: data.len() as u64,
             eof: false,
         }])
     }
 
-    /// Close the workload's standard input.
+    /// Request end of input. The queue is flushed first, and the child's
+    /// standard input closes only once the queue is empty.
     pub fn stdin_eof(&mut self, invocation: u64) -> io::Result<Vec<Event>> {
-        let active = self.invocation_mut(invocation)?;
-        active.stdin = None;
+        let (offset, flushed) = {
+            let active = self.invocation_mut(invocation)?;
+            if active.eof_requested {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "end of input was already requested",
+                ));
+            }
+            active.eof_requested = true;
+            let flushed = active.flush_input();
+            (active.input_offset, flushed)
+        };
+        if let Err(error) = flushed {
+            return Err(self.fatal(
+                invocation,
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot flush workload input: {error}"),
+                ),
+            ));
+        }
         Ok(vec![Event::InputAccepted {
             invocation,
-            offset: active.input_offset,
+            offset,
             bytes: 0,
             eof: true,
         }])
@@ -441,6 +546,7 @@ impl Runtime {
         };
         let mut events = Vec::new();
         if active.exit.is_none() {
+            active.flush_input()?;
             drain_ready(active, &self.config.limits, timeout, &mut events)?;
             active.reaped += reap_children(active);
         }
@@ -927,8 +1033,16 @@ fn spawn(
     let uid = launch.uid;
     let gid = launch.gid;
 
-    // Configure the parent's read ends before forking, so no fallible
-    // parent-side operation remains once the child exists.
+    // Configure the parent's pipe ends before forking, so no fallible
+    // parent-side operation remains once the child exists. The stdin write end
+    // is non-blocking so a child that stops reading cannot block the control
+    // loop.
+    set_nonblocking(stdin.write.as_raw_fd()).map_err(|error| {
+        (
+            LaunchFailure::Pipe,
+            format!("cannot configure the workload input pipe: {error}"),
+        )
+    })?;
     set_nonblocking(stdout.read.as_raw_fd()).map_err(|error| {
         (
             LaunchFailure::Pipe,
@@ -1132,7 +1246,7 @@ fn await_setup(error_read: OwnedFd) -> SetupOutcome {
     }
 }
 
-/// Poll the live output pipes once and drain whatever is ready.
+/// Poll the live output pipes once and drain a bounded, fair batch.
 fn drain_ready(
     active: &mut Invocation,
     limits: &RuntimeLimits,
@@ -1140,16 +1254,46 @@ fn drain_ready(
     events: &mut Vec<Event>,
 ) -> io::Result<()> {
     let descriptors = poll_descriptors(active);
-    if descriptors.is_empty() {
+    if !descriptors.is_empty() && !poll_once(&descriptors, timeout)? {
         return Ok(());
     }
-    let ready = poll_once(&descriptors, timeout)?;
-    if !ready {
-        return Ok(());
+    drain_batch(active, limits, events)
+}
+
+/// Drain both streams fairly within one bounded batch.
+///
+/// The bounds keep a continuously ready stream from monopolizing the control
+/// loop or allocating an unbounded event vector, and alternating the streams
+/// keeps one from starving the other.
+fn drain_batch(
+    active: &mut Invocation,
+    limits: &RuntimeLimits,
+    events: &mut Vec<Event>,
+) -> io::Result<()> {
+    let mut frames = 0_u64;
+    let mut bytes = 0_usize;
+    loop {
+        let mut progress = false;
+        for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+            if frames >= MAX_SERVICE_FRAMES || bytes >= MAX_SERVICE_BYTES {
+                return Ok(());
+            }
+            let (drained, size) = drain_stream(
+                active,
+                stream,
+                limits,
+                MAX_SERVICE_FRAMES - frames,
+                MAX_SERVICE_BYTES - bytes,
+                events,
+            )?;
+            frames += drained;
+            bytes += size;
+            progress |= drained > 0;
+        }
+        if !progress {
+            return Ok(());
+        }
     }
-    drain_stream(active, OutputStream::Stdout, limits, events)?;
-    drain_stream(active, OutputStream::Stderr, limits, events)?;
-    Ok(())
 }
 
 fn poll_descriptors(active: &Invocation) -> Vec<libc::pollfd> {
@@ -1195,12 +1339,16 @@ fn poll_once(descriptors: &[libc::pollfd], timeout: Duration) -> io::Result<bool
     Ok(ready > 0)
 }
 
+/// Drain one stream up to `max_frames` frames and `max_bytes` bytes, returning
+/// what was drained so the caller can keep the batch fair and bounded.
 fn drain_stream(
     active: &mut Invocation,
     stream: OutputStream,
     limits: &RuntimeLimits,
+    max_frames: u64,
+    max_bytes: usize,
     events: &mut Vec<Event>,
-) -> io::Result<()> {
+) -> io::Result<(u64, usize)> {
     let Invocation {
         stdout_state,
         stdout,
@@ -1216,15 +1364,21 @@ fn drain_stream(
         OutputStream::Stderr => (stderr_state, stderr),
     };
     if state.eof {
-        return Ok(());
+        return Ok((0, 0));
     }
     let Some(fd) = fd.as_ref() else {
         state.eof = true;
-        return Ok(());
+        return Ok((0, 0));
     };
     let raw = fd.as_raw_fd();
-    loop {
-        let mut buffer = vec![0_u8; limits.output_frame_bytes];
+    let mut drained = 0_u64;
+    let mut size = 0_usize;
+    while drained < max_frames && size < max_bytes {
+        let chunk = limits.output_frame_bytes.min(max_bytes - size);
+        if chunk == 0 {
+            break;
+        }
+        let mut buffer = vec![0_u8; chunk];
         // SAFETY: `buffer` is a writable buffer of its own length and `raw` is
         // a live non-blocking pipe read end.
         let read = unsafe { libc::read(raw, buffer.as_mut_ptr().cast(), buffer.len()) };
@@ -1234,13 +1388,13 @@ fn drain_stream(
                 continue;
             }
             if error.kind() == io::ErrorKind::WouldBlock {
-                return Ok(());
+                return Ok((drained, size));
             }
             return Err(error);
         }
         if read == 0 {
             state.eof = true;
-            return Ok(());
+            return Ok((drained, size));
         }
         buffer.truncate(read as usize);
         if state.bytes.saturating_add(buffer.len() as u64) > limits.output_bytes as u64 {
@@ -1262,7 +1416,10 @@ fn drain_stream(
             sequence: *sequence,
             bytes: crate::protocol::encode_bytes(&buffer),
         });
+        drained += 1;
+        size += buffer.len();
     }
+    Ok((drained, size))
 }
 
 /// Record one reaped child. The primary's real status is preserved, so a
@@ -1323,8 +1480,7 @@ fn cleanup(
     loop {
         signal_members(active.pid, scope, TERMINATION_SIGNAL)?;
         active.reaped += reap_children(active);
-        drain_stream(active, OutputStream::Stdout, limits, events)?;
-        drain_stream(active, OutputStream::Stderr, limits, events)?;
+        drain_batch(active, limits, events)?;
         let members = members_remain(scope, active.pid)?;
         let drained = active.stdout_state.eof && active.stderr_state.eof;
         if !members && drained {
@@ -1645,30 +1801,6 @@ fn mknod_device(path: &Path, major: u32, minor: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn write_all(fd: RawFd, data: &[u8]) -> io::Result<()> {
-    let mut written = 0;
-    while written < data.len() {
-        // SAFETY: `data` is live and `fd` is the invocation's stdin write end.
-        let result =
-            unsafe { libc::write(fd, data[written..].as_ptr().cast(), data.len() - written) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if result == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "workload input pipe closed",
-            ));
-        }
-        written += result as usize;
-    }
-    Ok(())
-}
-
 fn path_cstring(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes())
         .map_err(|_| invalid(format!("path {} contains a NUL byte", path.display())))
@@ -1696,6 +1828,8 @@ mod tests {
                 std::process::id(),
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
+            // A previous run in the same PID namespace can leave this path.
+            let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
         }
