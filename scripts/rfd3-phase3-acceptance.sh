@@ -213,23 +213,30 @@ exercise() {
 
   # Each invocation must witness a fresh root twice over: the /tmp marker proves
   # the writable overlay was recreated, and the executable mode proves the
-  # immutable workload root was re-materialized as well.
+  # immutable workload root was re-materialized as well. The frames are
+  # concatenated per invocation before they are split into lines, exactly as the
+  # host checker reconstructs the streams, so a line split across frames counts.
   local fresh_witnesses
   fresh_witnesses="$("$python" - "$run_dir/events.jsonl" <<'PY'
 import json, sys
-count = 0
+streams = {}
 with open(sys.argv[1], encoding="utf-8") as handle:
     for line in handle:
         event = json.loads(line)["event"]
         if event["type"] == "workload_output" and event["stream"] == "stdout":
-            text = bytes.fromhex(event["bytes"]).decode("utf-8", "replace")
-            if text.strip() == "state value=fresh root=fresh":
-                count += 1
-print(count)
+            streams.setdefault(event["invocation"], bytearray()).extend(
+                bytes.fromhex(event["bytes"])
+            )
+fresh = 0
+for data in streams.values():
+    for line in bytes(data).split(b"\n"):
+        if line == b"state value=fresh root=fresh":
+            fresh += 1
+print(f"{len(streams)}:{fresh}")
 PY
 )"
-  if [[ "$fresh_witnesses" != "2" ]]; then
-    echo "expected two fresh-root witnesses, observed $fresh_witnesses" >&2
+  if [[ "$fresh_witnesses" != "2:2" ]]; then
+    echo "expected two invocations with two fresh-root witnesses, observed $fresh_witnesses" >&2
     exit 1
   fi
 
