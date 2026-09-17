@@ -554,3 +554,428 @@ cached tree all fail materialization; a symbolic-link source is rejected; a
 whiteout whose parent the same layer replaces with a symbolic link is accepted
 while a marker inside a lower-layer symbolic link is refused; and every
 unsupported construct is refused without partial output.
+
+== Phase 1 typed specification and canonical assembler
+
+Phase 1 replaces the Python prototype with `crates/simferret/src/workload/`: a
+strict TOML specification, a bounded beneath-root reader, an OCI image-layout
+normalizer, a canonical tree and identity, and a raw closure plus derived cache
+store. It selects the Rust primitives the Phase 0 spike recommended: `serde` and
+`serde_json` for JSON, `sha2` for digests, `flate2` with `rust_backend` for
+gzip, `tar` 0.4 for layer records, and `rustix` 1.1 for `openat`-style access
+with `O_NOFOLLOW`, `O_NONBLOCK`, and directory descriptors. The prototype is no
+longer on any execution path.
+
+=== Resolved Phase 0 deviations
+
+* GNU `longname` and `longlink` records, PAX `x` and `g` records, hard links,
+  devices, FIFOs, sockets, sparse files, setuid and setgid modes, and unknown
+  tar type bytes are each rejected by inspecting the physical record type with
+  raw iteration. The prototype accepted GNU long names because Python's
+  `tarfile` resolved them transparently.
+* Selected descriptors that declare `urls` or embedded `data` are rejected
+  before the referenced content is opened. Unselected descriptors are still
+  ignored whatever they contain, so forward compatibility is preserved.
+* The derived entry names its complete raw closure. `derived/<canonical>/lock.json`
+  records the closure digest, the canonical digest, and the tree and template
+  digests, and verification refuses a derived entry that does not name the
+  closure being replayed. The Phase 0 record-direction question is resolved in
+  favor of the RFD's "each derived entry names its complete raw closure".
+
+=== Bounded profile
+
+The Phase 0 prototype's limits are adopted as fixed constants: 1 MiB
+specification, layout, manifest, and config; 4 MiB index; 64 MiB stored layer;
+256 MiB expanded layer and canonical expanded bytes; 16 MiB file; 4,096 entries
+per layer; 16 layers; 1,024-byte path; 4,096-byte link target; 40 link
+expansions; 64 raw closure objects; 32,768 canonical entries; 4 MiB cache
+metadata; 256 arguments and environment entries; 4 KiB per argument and
+environment entry; and 64 KiB total environment. Every bound is recorded in the
+raw closure, so changing one changes the workload identity and a recording made
+under other limits fails verification rather than being reinterpreted.
+
+Two further profile decisions are recorded here. Modification times are limited
+to the unsigned 32-bit whole-second range because the guest template is a `newc`
+CPIO archive, and a timestamp the template cannot encode is rejected rather than
+truncated. A standalone binary installs at the one fixed canonical path
+`/bin/simferret-workload`; binary specifications therefore carry no install path
+and no auxiliary file tree.
+
+The Phase 1 store holds exactly one workload closure and refuses to replace it
+with a different one, so the derived entry can name its closure unambiguously.
+Reusing a shared store across different workloads is deferred to the Phase 3 run
+integration, which will name closures by digest.
+
+=== Checked-in evidence command
+
+[source,shell]
+----
+.agents/dev ./scripts/rfd3-phase1-evidence.sh
+----
+
+It compiles `poc/rfd3-workload/main.c` with the pinned static compiler, builds a
+converging local OCI image layout, assembles the same fixture as a binary source
+and as an OCI source, verifies both stores, and requires one canonical identity,
+one template identity, owner-only store permissions, and a reproduced closure.
+Every digest it compares is first checked to be a 64-character hexadecimal
+SHA-256 value, and a missing summary field is a failure rather than an empty
+comparison: every reported field is read into a variable where a failing
+substitution aborts the script, instead of inside the report block where `echo`
+would mask it, and the script injects a reader that emits a usable field and then
+fails to prove that partial output is rejected. The two independently derived
+`derived/<canonical>/template.cpio` artifacts are compared byte-for-byte with
+`cmp`, both stores must verify to the canonical digest their assembly reported,
+and a re-assembly must reproduce both the closure identity and the complete
+summary. Every directory and file in both stores is scanned and must be mode
+`0700` or `0600` respectively, so a regression in any single artifact fails the
+run rather than only the two paths sampled before.
+A representative run produced:
+
+[cols="2,3",options="header"]
+|===
+| Measurement | Value
+
+| Fixture source SHA-256
+| `c7958b06...37d1c2305`
+
+| Static executable
+| 70,760 bytes, `d54d4b2a...f7d95b6e5c`
+
+| OCI layout
+| 82,854 bytes, selected manifest `sha256:69aa8d92...4773d34186f`
+
+| Binary canonical / tree / template
+| `2fce0cfb...0a3c8faead` / `8b2c67a9...7c47d07f` / `10885d3e...da153c83`
+
+| OCI canonical / tree / template
+| identical to the binary source
+
+| Binary closure
+| `5c9368fe...00a4336635` (2 raw objects)
+
+| OCI closure
+| `52bf3413...6d98b8bc` (5 raw objects)
+
+| Canonical entries / expanded bytes
+| 3 / 70,760 for both sources
+
+| Assembly duration (both sources)
+| 30.2 ms warm, 979 ms cold; durations move with host scheduling
+
+| Store bytes (binary / OCI)
+| 144,106 / 156,685
+
+| Re-assembly
+| byte-identical summary and closure
+|===
+
+The static executable digest and the fixture source digest are unchanged from
+the entry gate, so Phase 1 consumes the same representative artifact. The two
+source closures differ, as the RFD requires, while the canonical and template
+identities converge before the runtime boundary.
+
+=== Phase 1 regression tests
+
+[source,shell]
+----
+.agents/dev cargo test --locked --workspace --all-targets --all-features
+----
+
+`tests/rfd3_phase1.rs` builds standalone binary and local OCI image-layout
+sources and covers, before any output is published: static-ELF, architecture,
+endianness, malformed, relocated (static PIE), symlinked, escaping, and oversized
+binary inputs; absolute
+and escaping layer paths, hard links, devices, setuid modes, per-layer duplicate
+paths, PAX and GNU extension records, symlink traversal, unsupported layer media
+types, wrong or ambiguous or platform-less or remote selection, DiffID mismatch,
+unsupported rootfs type, corrupt and missing selected blobs, nonempty whiteout
+markers, markers that traverse a lower symlink, chained symlink escapes,
+non-basename markers, volumes, stop signals, `ArgsEscaped`, root and named
+credentials, duplicate environment names, relative and missing executables,
+non-executable modes, relative and missing working directories, config platform
+extensions, non-array launch vectors, and empty layer lists. It verifies that
+binary and OCI sources converge, that layer semantics are order independent and
+legally replace lower entries, that root opacity keeps only same-layer
+additions, that the template reproduces canonical metadata, and that every
+launch identity class changes the closure. It tampers each raw and derived
+identity class independently, proves a self-consistent manifest and stored-layer
+change still fails against the unchanged relationships, proves a self-consistent
+configuration change still fails against the derived lock, proves a derived
+entry alone is insufficient when raw content is missing, proves a special file
+in the store is refused, proves a second closure cannot replace a verified store
+entry, proves a closure whose derived lock names a different closure is refused,
+and runs four concurrent assemblies that publish one verified entry. It also
+proves the reserved owner identifier is refused in a binary specification, in
+the OCI configuration, in a layer entry's owner and group, and in a retained
+canonical specification during replay; that a self-consistent recording which
+moves the binary install path is refused by the profile invariant; that a
+pre-existing store root, internal directory, populated raw object directory,
+raw object, or derived entry with group or other access is not adopted; that a
+directory or symbolic link declaring a nonzero size, and a layer whose
+end-of-archive marker is missing or followed by a hidden member, are refused
+before publication; and that the unconfigured forms of the unsupported launch
+extensions are accepted while their wrong JSON types are not.
+
+Unit tests cover canonical identity order independence and field coverage, the
+encoded template, bounded symlink resolution, layer-path normalization, and the
+whiteout, opaque, replacement, duplicate, and marker-traversal rules directly.
+
+=== Review hardening
+
+A pre-merge review of the Phase 1 implementation found and fixed nine issues.
+Each fix carries a regression test:
+
+* The guest template now emits the root entry first and requires the canonical
+  root to be a directory. Initramfs extraction does not create missing parents,
+  so a path such as `!early`, which sorts before the `.` root sentinel, would
+  otherwise have been dropped during extraction. Covered by
+  `template_emits_the_root_before_paths_that_sort_before_it`,
+  `template_emits_the_root_first_with_canonical_metadata`,
+  `a_non_directory_root_is_rejected`, and `a_non_directory_root_has_no_template`.
+* `Root::sha256_file` validates the file type and size on the same descriptor it
+  hashes, so a FIFO or device in the derived entry is refused instead of read.
+  Covered by `a_fifo_in_the_store_is_rejected`.
+* Source locators are traversed component-wise through the specification
+  directory descriptor, so a symlinked layout component is refused, and the
+  specification open is non-blocking and type-checked. Covered by
+  `a_symlinked_layout_locator_is_rejected` and
+  `a_fifo_specification_does_not_block`.
+* Store directories are created mode `0700` and store files mode `0600`, as the
+  RFD requires for private artifacts, independently of the ambient umask.
+  Covered by `store_artifacts_are_owner_only`; the evidence script asserts the
+  same under `umask 022`.
+* Canonical entry and expanded-byte bounds are enforced after every applied
+  layer and on replay, not only at publication, so a hostile multi-layer image
+  cannot accumulate an unbounded intermediate tree. Covered by
+  `an_over_entry_limit_tree_is_rejected_during_construction`,
+  `an_expanded_layer_beyond_the_limit_is_rejected`, and
+  `canonical_tree_bounds_are_enforced`.
+* The ELF validator uses checked range arithmetic, requires an executable
+  `e_type`, bounds the program table and each loadable segment, requires at least
+  one loadable segment, and requires the native program-header size and a program
+  table within the guest loader's 64 KiB limit. Covered by the extended
+  `unsupported_binary_inputs_are_rejected` cases, including
+  `wrong-program-header-size` and `oversized-program-table`.
+* The combined OCI `Entrypoint` and `Cmd` vector is validated against the shared
+  argument bounds, and `Env: null` is treated as empty. Covered by
+  `oci_launch_arguments_are_bounded` and `a_null_environment_is_treated_as_empty`.
+* The raw closure is published last, after the derived entry it names, and an
+  existing different closure is rejected before anything is written, so a
+  failure cannot commit a closure without its derived entry. Covered by
+  `a_failed_derived_publication_leaves_no_closure`; `write_file_atomic` also
+  removes its staging file when the final rename fails.
+* An opaque marker's own target directory is included in the lower-layer symlink
+  traversal check. Covered by
+  `an_opaque_marker_may_not_traverse_a_lower_symlink`.
+
+The regression suite also gained a decoded `newc` assertion of template names,
+order, modes, owners, timestamps, contents, and link targets; a self-consistent
+raw subgraph change that must still fail against the unchanged manifest
+relationship and derived lock; a self-contained-store check that mutating or
+removing the live source cannot affect replay; and a working-directory launch
+identity class.
+
+A second pre-merge review found four further issues. Each fix carries a
+regression test:
+
+* Publication order now verifies the derived entry it just wrote *before*
+  committing the raw closure, so a conflicting concurrent builder can no longer
+  leave a store whose closure names a derived entry that does not match it. An
+  existing different closure is still rejected before anything is written.
+  Covered by `a_conflicting_builder_cannot_commit_an_unusable_store` and
+  `a_valid_closure_with_the_wrong_lock_is_rejected`.
+* The owner identifier `u32::MAX` is reserved and refused in every input class
+  that can carry ownership: a binary specification, the OCI launch credentials,
+  and each layer entry. Without the check, the sentinel could collide with an
+  in-band "unknown owner" encoding. Covered by
+  `the_reserved_owner_identifier_is_rejected`.
+* `Entrypoint` and `Cmd` are now parsed as strict string lists: only absence or
+  `null` means "absent", and any other non-array value such as `false`, `0`, or
+  `{}` is refused instead of being treated as empty. Covered by the extended
+  `unsupported_oci_constructs_are_rejected_before_publication` cases
+  `entrypoint-wrong-type` and `cmd-wrong-type`.
+* The ELF loadable-segment check uses the full checked range comparison, so a
+  segment whose offset is at end of file or whose offset plus file size
+  overflows is refused. Covered by the extended
+  `unsupported_binary_inputs_are_rejected` cases `loadable-segment-past-file`
+  and `loadable-segment-offset-overflow`.
+
+The entry and expanded-byte bounds are enforced by the same
+`validate_canonical_tree` call during construction and during replay, so the
+byte-bound analogue of the entry-bound test is that shared replay path rather
+than a separate case; the over-limit construction tests assert against
+`MAX_VIEW_ENTRIES` directly and the shared unit test covers the expanded-byte
+half of the same function.
+`a_fifo_in_the_store_is_rejected` asserts the "is not a regular file" diagnostic
+so the refusal is attributed to the type check rather than to a read error.
+
+A third pre-merge review found five further issues. Each fix carries a
+regression test:
+
+* `Volumes`, `StopSignal`, and `ArgsEscaped` are validated per field instead of
+  through a shared "truthy" test, so a wrong JSON type such as `false`, `0`, or
+  `{}` is malformed rather than silently unconfigured. Each field keeps its own
+  unconfigured form: an empty object, an empty string, and `false`. Covered by
+  the `volumes-wrong-type`, `stop-signal-wrong-type`, and
+  `args-escaped-wrong-type` cases in
+  `unsupported_oci_constructs_are_rejected_before_publication` and by
+  `empty_launch_extension_fields_are_treated_as_unconfigured`.
+* Reused store paths must already satisfy the private-store contract. The store
+  root, every directory reopened beneath it, every reused raw object, the reused
+  closure, and every reused derived entry are checked for owner and mode, so
+  assembly can no longer succeed while leaving a world-writable store behind.
+  Covered by `a_reused_store_path_must_already_be_owner_only`. Verification is
+  read-only and re-derives every artifact from the closure, so it does not
+  re-impose modes on a store it did not write.
+* Replay enforces the fixed binary install path. The canonical specification
+  retained in a closure is re-validated by the same
+  `binary_tree_and_launch` path that assembly uses, so a self-consistent
+  recording that moves the install path is refused by the profile invariant
+  rather than accepted. Covered by
+  `a_retained_specification_with_a_moved_install_path_is_rejected_on_replay`.
+* The evidence script is fail-closed: every reported field is hoisted out of the
+  report block so a missing field aborts, every compared identity is validated
+  as a digest and every count as a number, both verification outputs are compared
+  with their assembly, and every directory and file in both stores is checked
+  rather than two sampled paths.
+* The replay-time reserved-owner guard has its own regression. The numeric owner
+  in a retained canonical specification never passes through the specification
+  parser, so it is now exercised directly, and the layer case covers both the
+  owner and group fields. Covered by
+  `a_retained_specification_with_a_reserved_owner_is_rejected_on_replay`.
+
+A fourth review round closed three remaining gaps:
+
+* A populated `raw/sha256` directory is validated before objects are written or
+  reused. A reused object is read without reopening its parent, so the earlier
+  per-artifact check did not cover a weakened object directory in an
+  already-populated store. Covered by an added case in
+  `a_reused_store_path_must_already_be_owner_only`.
+* A metadata-only USTAR member that declares a data record is rejected. The raw
+  iterator advances by the declared size, so a directory or symbolic link with a
+  nonzero size would have silently dropped physical bytes while the parsed tree
+  stayed valid. Covered by
+  `a_metadata_only_member_with_a_data_record_is_rejected`.
+* The evidence script's store inventory is written to a private file and `find`'s
+  own status is checked, so a failed or partial enumeration can no longer pass
+  silently, and the remaining source, executable, layout, and store-size
+  measurements are hoisted out of the report block.
+
+The moved-install-path regression was also corrected: the retained install path
+is relative (`bin/simferret-workload`), so the test now moves it to `opt/app`.
+The earlier fixture used an absolute path, which the pre-existing layer-path
+normalizer already rejects, so it did not reach the profile invariant. With the
+guard removed the recording is still rejected, but later, by the launch-identity
+comparison; the test's diagnostic assertion is what pins the profile invariant.
+
+A fifth review round closed two more gaps:
+
+* The evidence script's field reader propagates a failing reader status
+  explicitly, because `errexit` is disabled inside a command substitution, so a
+  reader that emits a usable field and then fails would otherwise be accepted.
+  The script now injects exactly that fault on every run and requires it to
+  abort.
+* Layer archives must end with the two zero blocks POSIX requires after the last
+  member. The pinned raw iterator stops at the first zero block or at end of
+  input, so a truncated archive, or a member hidden behind a single zero block,
+  would have been parsed as a shorter valid archive. Covered by
+  `a_layer_without_a_valid_end_of_archive_marker_is_rejected`.
+
+Two profile notes are recorded rather than fixed. A nonzero directory size is a
+permitted USTAR directory-allocation hint, but this profile refuses it because
+the pinned iterator cannot distinguish it from a payload; supporting it later
+requires correct header-only framing. And publication is atomic with respect to
+process failure, not to power loss: staging files are synced, but the store
+directories are not, so durable crash recovery remains follow-up work.
+
+A sixth review round closed one more malformed-input acceptance. The ELF
+validator now requires the native 56-byte program-header size and a program table
+no larger than the guest loader's 64 KiB limit, instead of only rejecting a
+header smaller than the native size. Covered by the
+`wrong-program-header-size` and `oversized-program-table` cases in
+`unsupported_binary_inputs_are_rejected`; both inputs were confirmed to be
+accepted before the fix.
+
+A seventh review round extended the same validator with the guest's mapping
+contract:
+
+* A file-backed loadable segment's file offset and virtual address must share a
+  page offset, because the guest maps it from `address - (address % page)`; a
+  mismatch fails only after the process image has already been replaced.
+* A loadable segment's virtual address range, and the entry point, must stay
+  below the guest's 47-bit user address-space limit, matching the loader's own
+  address checks.
+
+The test ELF fixture now places its payload at a page-congruent address and
+declares an entry point, so each negative case violates one invariant instead of
+passing for an incidental reason. Covered by the `misaligned-loadable-segment`,
+`loadable-segment-outside-address-space`, and `entry-outside-address-space` cases
+in `unsupported_binary_inputs_are_rejected`, and by
+`a_program_table_at_the_loader_limit_is_accepted`, which pins the 65,520-byte
+boundary so the table limit cannot drift to `>=`. The compiled acceptance fixture
+was rechecked against the new rules: its eight program headers, 448-byte table,
+entry point, and four page-congruent loadable segments all satisfy them.
+
+An eighth review round corrected the address-space comparison and closed two
+further loader-refused inputs:
+
+* A loadable segment's exclusive end may equal the guest's user address-space
+  limit; only a larger end is refused. The limit is the four-level value because
+  the pinned guest CPU model does not expose five-level paging, and the entry
+  bound is an assembly-time necessary condition rather than a guarantee for a
+  relocated image, whose final entry also depends on the runtime load bias.
+* A fixed-address executable may not map below the guest's minimum mapping
+  address, which the pinned kernel keeps at its default and the unprivileged
+  workload cannot lower. Relocated images may legitimately map at zero, so the
+  rule applies to fixed-address executables only.
+* A relocated image must have a nonzero aggregate mapping span, computed from its
+  first loadable segment's page start to its last segment's end, as the loader
+  computes it.
+
+Covered by the `fixed-segment-below-minimum-mapping` and
+`relocated-image-without-mapping-span` cases in
+`unsupported_binary_inputs_are_rejected` and by
+`elf_address_space_boundaries_are_enforced_exactly`, which accepts a segment end
+exactly at the limit, a fixed mapping exactly at the minimum mapping address, and
+a relocated image with a mapping span, and refuses one page past the limit.
+
+A ninth review round replaced the header-order mapping-span rule with the
+loader's actual requirement, after checking the pinned kernel's loader source:
+
+* A relocated image must begin with a file-backed loadable segment, because that
+  is the mapping the loader uses to choose its load base. A first segment with no
+  file content is instead mapped anonymously at the base the loader has not
+  chosen yet, which the unprivileged guest refuses. A file-backed first segment
+  also makes the aggregate mapping span nonzero, which the loader requires before
+  it relocates anything, so the separate span test is subsumed and was removed.
+  The earlier header-order endpoint comparison could additionally reject a layout
+  the loader accepts, because the loader measures the span from the lowest page
+  start to the highest segment end.
+* A relocated image may not request a power-of-two alignment at least as large as
+  the user address space, because the loader then rounds its chosen base to zero
+  and retries at a fixed address the guest refuses. Non-power-of-two alignments
+  are ignored rather than rejected.
+* A fixed-address segment with no memory content requests no mapping, so it is
+  exempt from the minimum mapping address.
+
+The first two rules above applied only to relocated images and were removed when
+the profile was narrowed to fixed-address executables in the next round; only the
+no-op-load exemption remains.
+
+A tenth review round then closed the increment by narrowing the profile instead
+of extending that model. Simulating `ET_DYN` relocation was proving unbounded:
+each round produced another source-provable way for the loader to refuse an image
+that assembly had accepted, most recently a relocated image whose single
+reservation covered the whole user address space. The standalone binary profile
+now accepts only a fixed-address (`ET_EXEC`) image, because a relocated image's
+load base, entry address, and mapping alignment are chosen by the guest loader at
+exec time, so assembly cannot establish that it would load. A static PIE is
+refused with the diagnostic "binary workload must be a fixed-address executable
+ELF file, not a relocatable, core, or static-PIE image", and the same bytes are
+still accepted from an OCI source, where loading is left to the guest. Covered by
+`a_relocated_binary_is_refused_with_a_profile_diagnostic` and
+`the_same_relocated_executable_is_accepted_from_an_oci_source`; the `ET_EXEC`
+boundary, no-op-load, and address-space cases remain as they were.
+
+Each of these tests was confirmed to fail when its fix is reverted, so none of
+them asserts a merely incidental error.

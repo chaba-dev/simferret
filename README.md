@@ -184,6 +184,85 @@ The suite also runs the guest supervisor's cleanup path as PID 1 of a private PI
 namespace, which needs unprivileged user namespaces or passwordless `sudo`; the
 test reports which one it used and fails if neither is available.
 
+## RFD 3 workload specification and canonical assembler
+
+The RFD 3 Phase 1 assembler replaces the Phase 0 prototype with a typed,
+versioned workload specification and a bounded canonical normalizer. A workload
+is one of two tagged source forms:
+
+```toml
+version = 1
+kind = "binary"
+path = "bin/example-server"
+args = ["--listen", "0.0.0.0:8080"]
+env = ["MODE=acceptance"]
+working_directory = "/"
+user = "1000:1000"
+```
+
+```toml
+version = 1
+kind = "oci"
+layout = "images/example"
+manifest_digest = "sha256:<digest>"
+```
+
+Source locators resolve relative to the specification and are operational only,
+and every locator component is traversed through one opened specification
+directory descriptor, so a symlinked component is refused. A binary source must
+be a fixed-address static executable: a relocated (static PIE) image is refused,
+because its load base, entry address, and mapping alignment are chosen by the
+guest loader, so link with `-no-pie` or package the same bytes as an OCI source.
+Both forms produce
+one canonical filesystem tree, one normalized launch identity, one raw
+content-addressed replay closure, and one encoded immutable guest template
+rooted at `/workload`. The OCI profile selects exactly one direct `linux/amd64`
+image manifest, validates every selected descriptor size and SHA-256 digest
+before parsing, applies plain or gzip layers beneath the opened layout directory
+with OCI whiteout and opaque-directory semantics, and rejects unsupported media
+types, hard links, devices, setuid modes, absolute or escaping paths, unsafe
+links, and every configured limit overflow before any output is published. The
+template emits the root directory first, because initramfs extraction does not
+create missing parents.
+
+```shell
+.agents/dev ./target/x86_64-unknown-linux-musl/release/simferret workload assemble \
+  --specification workloads/example-binary.toml --store stores/example
+.agents/dev ./target/x86_64-unknown-linux-musl/release/simferret workload verify \
+  stores/example
+```
+
+Assembly writes raw objects and the derived tree, template, and lock through
+private staging, creates store directories and files owner-only, and publishes
+the raw closure last so a failure never commits a closure without the derived
+entry it names. A store path that already exists with group or other access, or
+that belongs to another user, is refused instead of reused, so assembly never
+adopts a directory other users can write to. Verification re-derives the
+canonical tree from the verified raw closure, re-enforces the canonical bounds,
+and rechecks the derived entry, so a derived cache entry alone never satisfies a
+replay. A store holds one workload closure; assemble it into a separate store
+per workload.
+
+The checked-in evidence command builds the repository fixture as a static
+executable and as a local OCI layout, assembles both, and requires one canonical
+identity, one template identity, and a reproducible closure:
+
+```shell
+.agents/dev ./scripts/rfd3-phase1-evidence.sh
+```
+
+Each invocation writes a fresh run directory under `.poc/rfd3-phase1-evidence/`
+with the assembly summaries and an `evidence.txt` measurement summary. The
+focused regression command is the workspace test suite, which includes the
+Phase 1 acceptance tests:
+
+```shell
+.agents/dev cargo test --locked --workspace --all-targets --all-features
+```
+
+The guest process runtime, the scenario integration, and the recorded
+input/output protocol remain Phase 2 and Phase 3 work.
+
 ## Development
 
 The Nix flake provides the pinned Rust toolchain and Jujutsu. On an x86-64 Linux

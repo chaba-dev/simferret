@@ -59,6 +59,7 @@ jobs:
       - run: nix develop --command ./scripts/qemu-network-replay-smoke-test.sh
       - run: nix develop --command ./scripts/time-model-probe-test.sh
       - run: nix develop --command ./scripts/rfd3-phase0-spike-test.sh
+      - run: nix develop --command ./scripts/rfd3-phase1-evidence.sh
       - run: nix develop --command ./scripts/phase4-acceptance-test.sh
       - run: nix develop --command ./scripts/qemu-replay-smoke.sh
       - run: nix develop --command ./scripts/qemu-network-replay-smoke.sh
@@ -71,4 +72,5 @@ jobs:
             .poc/qemu-replay-smoke/
             .poc/qemu-network-replay-smoke/
             .poc/phase4-acceptance/
+            .poc/rfd3-phase1-evidence/
           if-no-files-found: ignore
