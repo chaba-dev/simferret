@@ -97,8 +97,10 @@ content-addressed guest workload, and preserve exact passive replay.
 - [X] Treat every non-agent guest process as invocation membership, kill and
   reap through a process-table-and-pipe-EOF cleanup barrier, and refuse restart
   before cleanup completes.
-- [X] Prove an escaped double-fork descendant retaining an output descriptor and
-  first-invocation root mutations cannot satisfy later recovery.
+- [X] Prove an escaped descendant that retains an output descriptor is killed and
+  reaped by the guest-wide barrier, and that a first invocation's root mutations
+  are absent from a second invocation. Whether those facts are enough to satisfy a
+  later recovery assertion is evaluated with the Phase 3 scenario checker.
 - [X] Keep application protocol interpretation and assertions in the host
   scenario checker; limit the guest agent to generic process and byte facts.
 
@@ -129,6 +131,10 @@ content-addressed guest workload, and preserve exact passive replay.
   reusing that entry.
 - [ ] Preserve intentional output corruption as a failing safety assertion and
   nonzero CLI result for both source forms.
+- [ ] Enforce runtime overlay compatibility during assembly and replay, so a
+  package entry that collides with the overlay, or a launch path that overlay
+  replacement invalidates, is refused before a template is published instead of
+  at the runtime boundary.
 - [ ] Separate owner-only replay closure and optional bounded output bytes from
   default shareable failure metadata, which contains no environment values or
   stream bytes. The Phase 1 store already publishes owner-only objects, but the
