@@ -49,8 +49,6 @@ const OVERLAY_DIRECTORY_MODE: u32 = 0o755;
 const OVERLAY_TMP_MODE: u32 = 0o1777;
 const OVERLAY_DEVICE_MODE: u32 = 0o666;
 
-/// Bounds the descriptor scan during the cleanup barrier.
-const MAX_DESCRIPTOR_SCAN: u64 = 1 << 16;
 /// The bounded wait for the child's setup result before exec.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// The bounded time the cleanup barrier may take to signal and reap every
@@ -79,6 +77,7 @@ mod child_status {
     pub const EXEC: u8 = 7;
     pub const GROUP: u8 = 8;
     pub const SIGNALS: u8 = 9;
+    pub const DESCRIPTORS: u8 = 10;
 
     pub fn failure(code: u8) -> (&'static str, &'static str) {
         match code {
@@ -94,6 +93,10 @@ mod child_status {
             EXEC => ("executable", "could not execute the workload"),
             GROUP => ("setup", "could not isolate the workload process group"),
             SIGNALS => ("setup", "could not reset the workload signal dispositions"),
+            DESCRIPTORS => (
+                "setup",
+                "could not close every inherited workload descriptor",
+            ),
             _ => ("setup", "unknown workload setup failure"),
         }
     }
@@ -181,22 +184,48 @@ impl StreamState {
 /// including on every failed-start path.
 struct RootGuard {
     path: PathBuf,
+    /// Set once the caller has been given a removal result, so `Drop` does not
+    /// retry a removal that was already reported.
+    removed: bool,
 }
 
 impl RootGuard {
     fn create(path: PathBuf) -> io::Result<Self> {
         std::fs::create_dir(&path)?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            removed: false,
+        })
     }
 
     fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Remove the root and report the result.
+    ///
+    /// Ownership is released either way, so `Drop` never retries a removal the
+    /// caller was already told about, and a caller that reports the failure can
+    /// rely on the fact being surfaced exactly once.
+    fn remove(&mut self) -> io::Result<()> {
+        let result = std::fs::remove_dir_all(&self.path);
+        self.removed = true;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(invalid(format!(
+                "cannot remove the invocation root {}: {error}",
+                self.path.display()
+            ))),
+        }
+    }
 }
 
 impl Drop for RootGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        if !self.removed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -216,6 +245,11 @@ struct Invocation {
     /// It exists so a child that stops reading cannot block the control loop.
     pending_input: Vec<u8>,
     eof_requested: bool,
+    /// Set once termination is requested. The workload is being killed, so no
+    /// further input is accepted and the queued input is discarded: writing to
+    /// a pipe whose readers are already gone would otherwise be reported as an
+    /// infrastructure failure.
+    terminating: bool,
     sequence: u64,
     frames: u64,
     exit: Option<ProcessExit>,
@@ -263,6 +297,12 @@ impl Invocation {
         }
         Ok(())
     }
+
+    /// Remove the invocation root and report the result. Removal is explicit so
+    /// a failure is never mistaken for a completed barrier.
+    fn release_root(&mut self) -> io::Result<()> {
+        self._root.remove()
+    }
 }
 
 /// One guest process runtime. It owns at most one active invocation.
@@ -272,6 +312,9 @@ pub struct Runtime {
     /// The greatest invocation identifier ever accepted. Identifiers must be
     /// strictly increasing, so a completed invocation can never be reused.
     last_invocation: Option<u64>,
+    /// A failed start whose root could not be removed. While the path is still
+    /// on disk, a new invocation is refused instead of starting on top of it.
+    pending_removal: Option<PathBuf>,
 }
 
 impl Runtime {
@@ -293,6 +336,7 @@ impl Runtime {
             config,
             active: None,
             last_invocation: None,
+            pending_removal: None,
         })
     }
 
@@ -347,6 +391,26 @@ impl Runtime {
         invocation: u64,
         launch: &LaunchIdentity,
     ) -> Result<Event, (LaunchFailure, String)> {
+        // A failed start whose root could not be removed leaves the path on
+        // disk. Retry the removal instead of starting on top of it, and refuse
+        // the start while the path survives.
+        if let Some(path) = self.pending_removal.clone() {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => self.pending_removal = None,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.pending_removal = None;
+                }
+                Err(error) => {
+                    return Err((
+                        LaunchFailure::Materialization,
+                        format!(
+                            "the previous invocation root {} could not be removed: {error}",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+        }
         if self.active.is_some() {
             return Err((
                 LaunchFailure::InvocationActive,
@@ -388,10 +452,24 @@ impl Runtime {
         // below leaves no partially materialized root behind.
         let root = RootGuard::create(path)
             .map_err(|error| (LaunchFailure::Materialization, error.to_string()))?;
-        materialize_into(&self.config.template_root, root.path(), &self.config.limits)
-            .map_err(|error| (LaunchFailure::Materialization, error.to_string()))?;
-        verify_launch_target(root.path(), launch)?;
-        let spawned = spawn(root.path(), launch, self.config.scope)?;
+        if let Err(error) =
+            materialize_into(&self.config.template_root, root.path(), &self.config.limits)
+        {
+            return Err(self.discard_failed_root(
+                root,
+                LaunchFailure::Materialization,
+                error.to_string(),
+            ));
+        }
+        if let Err((failure, detail)) = verify_launch_target(root.path(), launch) {
+            return Err(self.discard_failed_root(root, failure, detail));
+        }
+        let spawned = match spawn(root.path(), launch, self.config.scope) {
+            Ok(spawned) => spawned,
+            Err((failure, detail)) => {
+                return Err(self.discard_failed_root(root, failure, detail));
+            }
+        };
         self.active = Some(Invocation {
             id: invocation,
             _root: root,
@@ -405,6 +483,7 @@ impl Runtime {
             input_bytes: 0,
             pending_input: Vec::new(),
             eof_requested: false,
+            terminating: false,
             sequence: 0,
             frames: 0,
             exit: None,
@@ -447,7 +526,7 @@ impl Runtime {
             (
                 active.input_offset,
                 active.input_bytes,
-                active.eof_requested || active.stdin.is_none(),
+                active.terminating || active.eof_requested || active.stdin.is_none(),
             )
         };
         if closed {
@@ -502,6 +581,12 @@ impl Runtime {
     pub fn stdin_eof(&mut self, invocation: u64) -> io::Result<Vec<Event>> {
         let (offset, flushed) = {
             let active = self.invocation_mut(invocation)?;
+            if active.terminating {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the invocation is being terminated",
+                ));
+            }
             if active.eof_requested {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -538,6 +623,14 @@ impl Runtime {
                 "the invocation has already exited",
             ));
         }
+        // The workload is being killed, so the queued input can no longer be
+        // delivered. Dropping it and closing the child's standard input before
+        // signalling keeps a later poll from writing to a pipe whose readers
+        // are already gone, which would be reported as an infrastructure
+        // failure instead of the requested termination.
+        active.terminating = true;
+        active.pending_input.clear();
+        active.stdin = None;
         signal_members(active.pid, self.config.scope, TERMINATION_SIGNAL)?;
         Ok(vec![Event::TerminationRequested {
             invocation,
@@ -554,6 +647,13 @@ impl Runtime {
         };
         let mut events = Vec::new();
         if active.exit.is_none() {
+            // Reap before servicing input: an already-exited primary then
+            // transitions straight into the cleanup barrier, so a write to a
+            // pipe whose readers have exited can never be mistaken for an
+            // infrastructure failure.
+            active.reaped += reap_children(active, self.config.scope);
+        }
+        if active.exit.is_none() {
             active.flush_input()?;
             drain_ready(active, &self.config.limits, timeout, &mut events)?;
             active.reaped += reap_children(active, self.config.scope);
@@ -562,9 +662,11 @@ impl Runtime {
             cleanup(active, self.config.scope, &self.config.limits, &mut events)?;
         }
         // A completed barrier releases the single-workload slot so the next
-        // start is accepted only after cleanup.
-        let finished = active.cleanup_complete;
-        if finished {
+        // start is accepted only after cleanup. Root removal is explicit and
+        // fallible, and the slot stays occupied while it fails, so a later
+        // invocation can never start on top of a root that is still on disk.
+        if active.cleanup_complete {
+            active.release_root()?;
             self.active = None;
         }
         Ok(events)
@@ -580,8 +682,29 @@ impl Runtime {
         }
         let mut events = Vec::new();
         cleanup(active, self.config.scope, &self.config.limits, &mut events)?;
+        active.release_root()?;
         self.active = None;
         Ok(events)
+    }
+
+    /// Remove the root of a failed start and report both the launch failure and
+    /// a cleanup failure. A root that could not be removed is remembered, so a
+    /// later start is refused while it is still on disk instead of reusing the
+    /// same filesystem space.
+    fn discard_failed_root(
+        &mut self,
+        mut root: RootGuard,
+        failure: LaunchFailure,
+        detail: String,
+    ) -> (LaunchFailure, String) {
+        let path = root.path().to_path_buf();
+        match root.remove() {
+            Ok(()) => (failure, detail),
+            Err(error) => {
+                self.pending_removal = Some(path);
+                (failure, format!("{detail}; {error}"))
+            }
+        }
     }
 
     fn invocation_mut(&mut self, invocation: u64) -> io::Result<&mut Invocation> {
@@ -671,7 +794,10 @@ fn validate_limits(limits: &RuntimeLimits) -> io::Result<()> {
 /// `/tmp` and `/dev` must be directories when the package provides them, and
 /// every package entry below those paths must be a directory: the overlay
 /// replaces their metadata and content, so anything else collides.
-pub fn validate_template(template: &Path, limits: &RuntimeLimits) -> io::Result<()> {
+///
+/// This is an internal step of [`Runtime::new`], not part of the public surface,
+/// so the non-Linux stub does not have to mirror it.
+fn validate_template(template: &Path, limits: &RuntimeLimits) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(template)
         .map_err(|error| invalid(format!("cannot inspect the workload template: {error}")))?;
     if !metadata.is_dir() {
@@ -1190,7 +1316,9 @@ unsafe fn child_exec(
                 fail_child(error_write, child_status::DUP);
             }
         }
-        close_inherited_descriptors(error_write);
+        if !close_inherited_descriptors(error_write) {
+            fail_child(error_write, child_status::DESCRIPTORS);
+        }
         // Rust ignores `SIGPIPE` process-wide, and an ignored disposition
         // survives `execve`, so the workload would otherwise start with a
         // signal disposition it never asked for.
@@ -1229,17 +1357,19 @@ unsafe fn fail_child(error_write: RawFd, code: u8) -> ! {
 
 /// Close every inherited descriptor except `preserve`.
 ///
-/// `close_range` covers the whole descriptor table in two syscalls, so a
-/// descriptor above any scan cap cannot leak into the workload. The kernel
-/// fallback scans the table bounded by the descriptor limit; the arbitrary cap
-/// the scan used before would have leaked every descriptor above it.
-unsafe fn close_inherited_descriptors(preserve: RawFd) {
+/// `close_range` covers the whole descriptor table in two syscalls. A scan of
+/// the table cannot be made equivalent: the descriptor limit is not the extent
+/// of the table, because lowering `RLIMIT_NOFILE` does not close descriptors
+/// that are already open, so a scan would leak every descriptor above the
+/// current limit. Setup therefore fails rather than continuing with a
+/// descriptor that might reach the workload.
+unsafe fn close_inherited_descriptors(preserve: RawFd) -> bool {
     let preserve = preserve as libc::c_uint;
-    let mut ranged = true;
+    let mut closed = true;
     if preserve > 3 {
         // SAFETY: `close_range` only closes descriptors, and the ranges bracket
         // the setup pipe write end, which must survive until `execve`.
-        ranged &= unsafe {
+        closed &= unsafe {
             libc::syscall(
                 libc::SYS_close_range,
                 3 as libc::c_uint,
@@ -1249,7 +1379,7 @@ unsafe fn close_inherited_descriptors(preserve: RawFd) {
         } == 0;
     }
     // SAFETY: see above.
-    ranged &= unsafe {
+    closed &= unsafe {
         libc::syscall(
             libc::SYS_close_range,
             preserve.saturating_add(1).max(3),
@@ -1257,30 +1387,7 @@ unsafe fn close_inherited_descriptors(preserve: RawFd) {
             0 as libc::c_uint,
         )
     } == 0;
-    if ranged {
-        return;
-    }
-
-    // Fallback for a kernel without `close_range`.
-    let mut limit = MAX_DESCRIPTOR_SCAN;
-    let mut rlimit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `rlimit` is writable and the call has no other effects.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlimit) } == 0
-        && rlimit.rlim_cur != libc::RLIM_INFINITY
-        && rlimit.rlim_cur > 0
-    {
-        limit = rlimit.rlim_cur;
-    }
-    for fd in 3..limit as RawFd {
-        if fd != preserve as RawFd {
-            // SAFETY: closing an unused descriptor is harmless; EBADF is
-            // ignored because most descriptors in the range are unused.
-            unsafe { libc::close(fd) };
-        }
-    }
+    closed
 }
 
 fn await_setup(error_read: OwnedFd) -> SetupOutcome {
@@ -1349,17 +1456,23 @@ fn drain_batch(
     loop {
         let mut progress = false;
         for stream in [OutputStream::Stdout, OutputStream::Stderr] {
-            if frames >= MAX_SERVICE_FRAMES || bytes >= MAX_SERVICE_BYTES {
+            let remaining_frames = MAX_SERVICE_FRAMES.saturating_sub(frames);
+            let remaining_bytes = MAX_SERVICE_BYTES.saturating_sub(bytes);
+            if remaining_frames == 0 || remaining_bytes == 0 {
                 return Ok(());
             }
-            let (drained, size) = drain_stream(
-                active,
-                stream,
-                limits,
-                MAX_SERVICE_FRAMES - frames,
-                MAX_SERVICE_BYTES - bytes,
-                events,
-            )?;
+            // Each stream is offered at most half of what is left, recomputed
+            // before every call. A stream that is continuously readable would
+            // otherwise consume the whole batch before the other was serviced,
+            // and every later batch would start with it again, so the other
+            // stream could be starved until the invocation failed. A single
+            // ready stream still drains the whole budget across the loop's
+            // iterations, and the allowance is always clamped to what is
+            // actually left, so a rounded-up share can never exceed the budget.
+            let share_frames = remaining_frames.div_ceil(2);
+            let share_bytes = remaining_bytes.div_ceil(2);
+            let (drained, size) =
+                drain_stream(active, stream, limits, share_frames, share_bytes, events)?;
             frames += drained;
             bytes += size;
             progress |= drained > 0;
@@ -1714,7 +1827,16 @@ fn guest_process_table() -> io::Result<Vec<u32>> {
 fn is_kernel_thread(pid: u32) -> io::Result<Option<bool>> {
     match std::fs::read(format!("/proc/{pid}/stat")) {
         Ok(stat) => Ok(Some(stat_flags(&stat)? & KERNEL_THREAD_FLAG != 0)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        // A process that exited between the directory listing and this read is
+        // an ordinary disappearance. The proc handler reports `ENOENT` for a
+        // vanished task and `ESRCH` when it is reaped during the read, and both
+        // mean the same thing here.
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(None)
+        }
         Err(error) => Err(io::Error::new(
             error.kind(),
             format!("cannot read the state of guest pid {pid}: {error}"),
@@ -1726,16 +1848,22 @@ fn is_kernel_thread(pid: u32) -> io::Result<Option<bool>> {
 /// parenthesized and may contain spaces and parentheses, so only the fields
 /// after the last `)` are counted positionally: state is 0 and flags is 6.
 fn stat_flags(stat: &[u8]) -> io::Result<u64> {
-    let text = std::str::from_utf8(stat)
-        .map_err(|_| invalid("a guest process state record is not UTF-8"))?;
-    let rest = text
-        .rsplit_once(')')
-        .map(|(_, rest)| rest)
+    // The command name is arbitrary bytes: a workload can install a non-UTF-8
+    // name with `prctl(PR_SET_NAME)`, and Linux writes it into the record
+    // unescaped. Only the fields after the last `)` are parsed, and they are
+    // ASCII, so the record is never required to be valid UTF-8.
+    let terminator = stat
+        .iter()
+        .rposition(|byte| *byte == b')')
         .ok_or_else(|| invalid("a guest process state record has no command terminator"))?;
+    let rest = &stat[terminator + 1..];
     let flags = rest
-        .split_whitespace()
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
         .nth(6)
         .ok_or_else(|| invalid("a guest process state record has no flags field"))?;
+    let flags = std::str::from_utf8(flags)
+        .map_err(|_| invalid("a guest process state record has an invalid flags field"))?;
     flags
         .parse()
         .map_err(|_| invalid("a guest process state record has an invalid flags field"))
@@ -2084,6 +2212,131 @@ mod tests {
         assert!(stat_flags(b"1 no-command-terminator").is_err());
         assert!(stat_flags(b"1 (short) S 0").is_err());
         assert!(stat_flags(b"1 (short) S 0 1 1 0 -1 not-a-number 0").is_err());
+    }
+
+    /// A workload can install an arbitrary byte string as its command name with
+    /// `prctl(PR_SET_NAME)`, and Linux writes it into the record unescaped, so
+    /// the record must not be required to be valid UTF-8.
+    #[test]
+    fn stat_flags_accepts_a_non_utf8_command_name() {
+        let userspace = b"7 (\xff\xfe weird) S 0 7 7 0 -1 4194304 0 0 0";
+        assert_eq!(stat_flags(userspace).unwrap() & KERNEL_THREAD_FLAG, 0);
+        let kernel_thread = b"2 (\xff) S 0 2 0 0 -1 2097152 0 0 0";
+        assert_eq!(
+            stat_flags(kernel_thread).unwrap() & KERNEL_THREAD_FLAG,
+            KERNEL_THREAD_FLAG
+        );
+    }
+
+    /// A root that cannot be removed must be reported, not swallowed: the
+    /// invocation slot stays occupied so the next start cannot reuse the path.
+    #[test]
+    fn a_root_removal_failure_is_reported_instead_of_swallowed() {
+        let directory = TempDir::new();
+        let path = directory.0.join("root");
+        let mut guard = RootGuard::create(path.clone()).unwrap();
+        // Replace the root with a regular file, which cannot be removed as a
+        // directory.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"occupied").unwrap();
+        let error = guard.remove().unwrap_err();
+        assert!(error.to_string().contains("invocation root"), "{error}");
+    }
+
+    /// Build an invocation whose pipes are already full, so a batch cannot rely
+    /// on a producer refilling them. The write ends are dropped, so each read
+    /// end also reaches end of file once drained.
+    fn invocation_with_prefilled_pipes(directory: &TempDir) -> (Invocation, usize) {
+        let root = RootGuard::create(directory.0.join("invocation")).unwrap();
+        let stdout = create_pipe().unwrap();
+        let stderr = create_pipe().unwrap();
+        for pipe in [&stdout, &stderr] {
+            set_nonblocking(pipe.write.as_raw_fd()).unwrap();
+            set_nonblocking(pipe.read.as_raw_fd()).unwrap();
+        }
+        let mut filled = 0;
+        let mut buffer = vec![b'x'; 4096];
+        loop {
+            // SAFETY: `buffer` is a live buffer and the write end is a live
+            // non-blocking pipe.
+            let written = unsafe {
+                libc::write(
+                    stdout.write.as_raw_fd(),
+                    buffer.as_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if written <= 0 {
+                break;
+            }
+            filled += written as usize;
+            buffer.clear();
+            buffer.resize(4096, b'x');
+        }
+        // SAFETY: the stderr write end is a live pipe.
+        assert_eq!(
+            unsafe { libc::write(stderr.write.as_raw_fd(), b"err\n".as_ptr().cast(), 4) },
+            4
+        );
+        let active = Invocation {
+            id: 1,
+            _root: root,
+            pid: 0,
+            stdin: None,
+            stdout: Some(stdout.read),
+            stderr: Some(stderr.read),
+            stdout_state: StreamState::new(),
+            stderr_state: StreamState::new(),
+            input_offset: 0,
+            input_bytes: 0,
+            pending_input: Vec::new(),
+            eof_requested: false,
+            terminating: false,
+            sequence: 0,
+            frames: 0,
+            exit: None,
+            reaped: 0,
+            cleanup_complete: false,
+        };
+        drop(stdout.write);
+        drop(stderr.write);
+        (active, filled)
+    }
+
+    /// One batch must reach the other stream before it spends its budget on a
+    /// stream that already has a whole batch of data waiting.
+    #[test]
+    fn a_batch_services_the_other_stream_before_the_budget_is_spent() {
+        let directory = TempDir::new();
+        let (mut active, filled) = invocation_with_prefilled_pipes(&directory);
+        assert!(
+            filled >= MAX_SERVICE_BYTES,
+            "the fixture must prefill at least one whole batch, filled {filled}"
+        );
+        let limits = RuntimeLimits {
+            output_frame_bytes: 4096,
+            ..RuntimeLimits::default()
+        };
+        let mut events = Vec::new();
+        drain_batch(&mut active, &limits, &mut events).unwrap();
+        let frames = events
+            .iter()
+            .filter(|event| matches!(event, Event::WorkloadOutput { .. }))
+            .count();
+        assert!(
+            frames as u64 <= MAX_SERVICE_FRAMES,
+            "a batch must not exceed its frame bound"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::WorkloadOutput {
+                    stream: OutputStream::Stderr,
+                    ..
+                }
+            )),
+            "the batch starved standard error: {frames} frames"
+        );
     }
 
     #[test]

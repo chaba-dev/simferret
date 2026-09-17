@@ -1007,8 +1007,18 @@ The runtime enforces the RFD's launch and lifecycle rules:
   entry anywhere below those paths is rejected as an overlay collision. Special
   files, entries beyond the canonical view bound, and paths beyond the canonical
   path bound are rejected before any root is created. The runtime reuses the
-  assembler's constants and counts the template root the same way, so it never
-  rejects a template the assembler accepted.
+  assembler's constants and counts the template root the same way, so the two
+  phases agree on the template bounds and the runtime never rejects a template
+  for exceeding a bound the assembler allowed.
+
+  Overlay compatibility is a separate rule and is enforced only at the runtime
+  boundary: the assembler does not yet reject a package entry that collides with
+  the overlay, nor a launch path that overlay replacement invalidates. A template
+  whose package entry collides is refused when the runtime is constructed, so the
+  agent reports an infrastructure error rather than a `launch-failed` event; a
+  launch path that overlay replacement invalidates is refused per invocation as a
+  typed `launch-failed` event. Moving both checks into assembly is listed for
+  Phase 3.
 * Each invocation copies the template bytes and canonical metadata into a new
   root, skipping the `/tmp` and `/dev` subtrees so the overlay replaces them
   instead of merging with them, then synthesizes `/tmp` as a root-owned
@@ -1019,38 +1029,62 @@ The runtime enforces the RFD's launch and lifecycle rules:
   barrier, so no invocation can observe a previous one.
 * The child receives only fresh standard pipes; every other inherited descriptor
   is closed, covering the whole descriptor table in two `close_range` calls so a
-  descriptor above any scan cap cannot leak. The close-on-exec flag is cleared
-  explicitly on the standard descriptors, because `dup2` leaves it alone when
-  both descriptors are equal. The child then restores the default `SIGPIPE`
-  disposition that Rust installs for itself, changes root, changes to the
-  normalized working directory, clears supplementary groups, sets
+  descriptor above any scan cap cannot leak. A table scan is not an equivalent
+  fallback, because lowering `RLIMIT_NOFILE` does not close descriptors that are
+  already open; setup therefore fails with a typed `launch-failed` event rather
+  than continuing with a descriptor that might reach the workload. The
+  close-on-exec flag is cleared explicitly on the standard descriptors, because
+  `dup2` leaves it alone when both descriptors are equal. The child then restores
+  the default `SIGPIPE` disposition that Rust installs for itself, changes root,
+  changes to the normalized working directory, clears supplementary groups, sets
   `no_new_privs`, applies the nonzero GID and UID, and executes the exact
   argument vector without a shell. Setup failures are reported through a
   close-on-exec pipe as typed `launch-failed` events, so a successful `execve` is
   unambiguous.
-* Launch validation is one shared rule set: the executable and the working
-  directory must be absolute in-root paths, the first argument must name an
-  absolute in-root path without being required to equal the executed path, and
-  the argument and environment vectors are bounded. Diagnostics name the field
-  and never echo a caller-supplied argument or environment value.
+* Launch validation is one shared rule set, applied both when the assembler
+  normalizes a binary or OCI source and again when the runtime accepts an
+  invocation: the executable and the working directory must be absolute in-root
+  paths, the first argument must name an absolute in-root path without being
+  required to equal the executed path, and the argument and environment vectors
+  are bounded. Diagnostics name the field and never echo a caller-supplied
+  argument or environment value.
 * The versioned process commands are `start`, `stdin-write`, `stdin-eof`, and
   `terminate`. `stdin-write` carries an invocation identifier, a strictly
   contiguous byte offset, and bounded hexadecimal exact bytes; `terminate` is an
   unconditional `SIGKILL` independent of any OCI stop signal.
 * Live stdout and stderr frames carry the invocation, the stream, a per-stream
   byte offset, one monotonic cross-stream sequence number, and exact bytes. The
-  exit record independently reports per-stream totals and SHA-256 digests. A
-  per-frame or per-invocation limit overflow, a non-contiguous offset, and a
-  control or pipe transport failure are fatal: the invocation is killed and the
-  agent reports an infrastructure error rather than a workload property.
+  exit record independently reports per-stream totals, SHA-256 digests, and the
+  number of frames emitted. A per-frame or per-invocation limit overflow, a
+  non-contiguous offset, and a control or pipe transport failure are fatal: the
+  invocation is killed and the agent reports an infrastructure error rather than
+  a workload property. One batch offers each stream at most half of the remaining
+  budget, so a continuously readable stream cannot starve the other, while a
+  single ready stream still drains the whole budget across the batch. A process
+  exit record whose code or signal is outside the Linux range cannot be accepted
+  by a typed frame reader. The runtime's own producer uses the wait-status macros,
+  so it only ever encodes values inside the range.
 * On primary exit or termination the runtime signals every member of the active
   invocation, reaps until only the agent remains, and drains both pipes to end of
   file before emitting `cleanup-complete`. The reap and the signal are scoped to
   the invocation: in guest scope they cover the whole process table, and in
   process-group scope only the invocation's own process group, so a host test
-  cannot disturb or consume an unrelated child. A new `start` is refused until
-  that barrier completes. The agent reports process and byte facts only;
-  application protocol interpretation remains in the host scenario checker.
+  cannot disturb or consume an unrelated child. Each advance reaps before it
+  services input, so an already-exited primary moves straight into the barrier
+  instead of a write to a pipe whose readers are gone being reported as an
+  infrastructure failure. `terminate` discards queued input and closes the
+  child's standard input before it signals, for the same reason, and input is
+  refused once termination is requested.
+
+  Root removal is explicit and fallible on every path that created a root,
+  including a failed start: a removal failure is reported alongside the launch
+  failure, and a root that could not be removed is remembered so the next start
+  retries its removal and is refused while the path survives. The single-workload
+  slot also stays occupied when the barrier cannot remove its root, so a later
+  invocation can never start on top of a root that is still on disk. A new
+  `start` is refused until that barrier completes. The agent
+  reports process and byte facts only; application protocol interpretation
+  remains in the host scenario checker.
 
 === Checked-in evidence command
 
@@ -1068,9 +1102,12 @@ the host. A representative run produced:
 
 [source,text]
 ----
-running 24 tests
+running 29 tests
+test a_completed_invocation_reports_a_root_that_cannot_be_removed ... ok
+test a_continuously_ready_stream_does_not_starve_the_other ... ok
 test a_descendant_retaining_the_output_pipe_is_killed_by_the_cleanup_barrier ... ok
 test a_failed_materialization_leaves_no_partial_root ... ok
+test a_failed_start_reports_a_root_that_cannot_be_removed_and_refuses_the_next_start ... ok
 test a_full_stdin_pipe_does_not_block_the_control_loop ... ok
 test a_member_that_closes_its_output_descriptors_is_still_reaped ... ok
 test a_missing_executable_is_a_typed_launch_failure ... ok
@@ -1087,14 +1124,16 @@ test an_overlay_collision_is_rejected_before_any_invocation ... ok
 test an_unexecutable_file_reports_a_typed_launch_failure ... ok
 test each_invocation_materializes_a_fresh_root ... ok
 test output_frames_are_contiguous_per_stream_and_sequenced ... ok
+test output_offsets_advance_across_multiple_frames_per_stream ... ok
 test shutdown_reports_the_real_primary_exit_status ... ok
 test standard_input_round_trips_through_contiguous_offsets ... ok
 test terminate_kills_and_reaps_the_invocation ... ok
+test terminating_an_invocation_with_queued_input_is_not_an_infrastructure_error ... ok
 test the_agent_drives_the_runtime_over_the_serial_control_channel ... ok
 test the_runtime_overlay_is_visible_inside_the_workload_root ... ok
 test the_workload_starts_with_the_default_sigpipe_disposition ... ok
 
-test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
 ----
 
 The fixture is the pinned static busybox copied into the template and executed as
@@ -1157,6 +1196,23 @@ argument vector, a malformed environment entry, and a relative working directory
   acknowledgement count, live output attributed to the command being handled
   while the workload ran, an exact output stream, `cleanup-complete`, and
   `agent-stopped`.
+
+* termination with input still queued behind a full pipe reporting the requested
+  termination and a completed barrier rather than a broken-pipe infrastructure
+  failure;
+* a continuously readable stdout not starving stderr, so a stream that is always
+  ready cannot delay the other until the invocation fails;
+* per-stream offsets advancing across more than one frame, with the exit record's
+  frame count matching the frames actually emitted;
+* a root that cannot be removed being reported instead of swallowed, on both a
+  failed start and a completed invocation, with the next start refused while the
+  root is still on disk and accepted again once removal succeeds, and a malformed
+  process exit record being refused while the frame is read;
+* a batch that starts with a whole batch of standard output already waiting still
+  servicing standard error, with the batch staying inside its frame bound;
+* a guest process state record with a non-UTF-8 command name still yielding its
+  flags, so a workload cannot break the barrier by naming itself with arbitrary
+  bytes.
 
 Output framing is asserted as a contract rather than a fixed split: per-stream
 offsets start at zero and stay contiguous, sequence numbers are contiguous across

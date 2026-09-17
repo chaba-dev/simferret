@@ -192,8 +192,46 @@ impl OutputStream {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum ProcessExit {
-    Exited { code: i32 },
-    Signaled { signal: i32 },
+    Exited {
+        #[serde(deserialize_with = "deserialize_exit_code")]
+        code: i32,
+    },
+    Signaled {
+        #[serde(deserialize_with = "deserialize_signal")]
+        signal: i32,
+    },
+}
+
+/// Require a real Linux wait status exit code. The range is enforced while the
+/// record is deserialized, so a malformed frame cannot cross the wire boundary
+/// and reach a consumer that assumes the contract.
+fn deserialize_exit_code<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let code = i32::deserialize(deserializer)?;
+    if (0..=255).contains(&code) {
+        Ok(code)
+    } else {
+        Err(serde::de::Error::custom(
+            "a process exit code must be between 0 and 255",
+        ))
+    }
+}
+
+/// Require a real Linux signal number, for the same reason as the exit code.
+fn deserialize_signal<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let signal = i32::deserialize(deserializer)?;
+    if (1..=64).contains(&signal) {
+        Ok(signal)
+    } else {
+        Err(serde::de::Error::custom(
+            "a process termination signal must be between 1 and 64",
+        ))
+    }
 }
 
 impl ProcessExit {
@@ -204,14 +242,6 @@ impl ProcessExit {
         match self {
             Self::Exited { code } => code,
             Self::Signaled { signal } => 128_i32.saturating_add(signal),
-        }
-    }
-
-    /// Report whether this record describes a real Linux exit or signal.
-    pub fn is_valid(self) -> bool {
-        match self {
-            Self::Exited { code } => (0..=255).contains(&code),
-            Self::Signaled { signal } => (1..=64).contains(&signal),
         }
     }
 }
@@ -601,10 +631,77 @@ mod tests {
         // A hostile signal value saturates instead of overflowing.
         let extreme = ProcessExit::Signaled { signal: i32::MAX };
         assert_eq!(extreme.status_code(), i32::MAX);
-        assert!(!extreme.is_valid());
-        assert!(ProcessExit::Signaled { signal: 9 }.is_valid());
-        assert!(ProcessExit::Exited { code: 0 }.is_valid());
-        assert!(!ProcessExit::Exited { code: 256 }.is_valid());
+    }
+
+    /// A malformed exit record must be refused while the frame is read, not by
+    /// a validator the caller has to remember to invoke.
+    #[test]
+    fn malformed_process_exit_records_are_rejected_by_the_frame_reader() {
+        for exit in [
+            json!({"kind": "exited", "code": -1}),
+            json!({"kind": "exited", "code": 256}),
+            json!({"kind": "exited", "code": i32::MAX}),
+            json!({"kind": "signaled", "signal": 0}),
+            json!({"kind": "signaled", "signal": -9}),
+            json!({"kind": "signaled", "signal": 65}),
+            json!({"kind": "signaled", "signal": i32::MAX}),
+        ] {
+            assert!(
+                serde_json::from_value::<ProcessExit>(exit.clone()).is_err(),
+                "{exit} must not deserialize"
+            );
+            // A complete, otherwise valid frame whose only defect is the exit
+            // value, so the reader cannot reject it for an unrelated reason.
+            let frame = EventFrame {
+                protocol_version: PROTOCOL_VERSION,
+                event_id: 1,
+                command_id: 1,
+                event: Event::WorkloadExited {
+                    invocation: 1,
+                    exit: ProcessExit::Exited { code: 0 },
+                    stdout_bytes: 0,
+                    stdout_sha256: String::new(),
+                    stderr_bytes: 0,
+                    stderr_sha256: String::new(),
+                    frames: 0,
+                },
+                diagnostics: DiagnosticFields::default(),
+            };
+            let mut value = serde_json::to_value(&frame).unwrap();
+            value["event"]["exit"] = exit.clone();
+            let mut bytes = serde_json::to_vec(&value).unwrap();
+            bytes.push(b'\n');
+            assert!(
+                read_line_frame::<EventFrame>(&mut bytes.as_slice()).is_err(),
+                "{value} must not be accepted by the frame reader"
+            );
+        }
+        // The boundary values a real wait status can produce still round trip.
+        for exit in [
+            ProcessExit::Exited { code: 0 },
+            ProcessExit::Exited { code: 255 },
+            ProcessExit::Signaled { signal: 1 },
+            ProcessExit::Signaled { signal: 64 },
+        ] {
+            let frame = EventFrame {
+                protocol_version: PROTOCOL_VERSION,
+                event_id: 1,
+                command_id: 1,
+                event: Event::WorkloadExited {
+                    invocation: 1,
+                    exit,
+                    stdout_bytes: 0,
+                    stdout_sha256: String::new(),
+                    stderr_bytes: 0,
+                    stderr_sha256: String::new(),
+                    frames: 0,
+                },
+                diagnostics: DiagnosticFields::default(),
+            };
+            let mut bytes = Vec::new();
+            write_line_frame(&mut bytes, &frame).unwrap();
+            assert_eq!(read_line_frame(&mut bytes.as_slice()).unwrap(), Some(frame));
+        }
     }
 
     #[test]

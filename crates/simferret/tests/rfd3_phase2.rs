@@ -88,6 +88,9 @@ fn template(label: &str) -> (TempDir, PathBuf) {
     // The descendant fixtures block in `sleep`, which is an applet as well: a
     // missing applet would make them exit immediately and pass vacuously.
     std::os::unix::fs::symlink("sh", bin.join("sleep")).unwrap();
+    // The removal fixtures build a deep directory tree to exhaust the
+    // descriptor budget that recursive removal needs.
+    std::os::unix::fs::symlink("sh", bin.join("mkdir")).unwrap();
     fs::create_dir_all(template.join("tmp")).unwrap();
     fs::create_dir_all(template.join("dev")).unwrap();
     (root, shell)
@@ -200,6 +203,51 @@ fn raise_descriptor_limit(target: u64) -> Option<u64> {
         }
     }
     Some(previous)
+}
+
+/// Lower the descriptor limit for the duration of a test and restore it on drop.
+struct DescriptorLimit(u64);
+
+impl DescriptorLimit {
+    fn lower_to(target: u64) -> Option<Self> {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is writable and the call has no other effects.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return None;
+        }
+        let previous = limit.rlim_cur;
+        if previous <= target {
+            return None;
+        }
+        let next = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: `next` is a valid limit the caller is allowed to set.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &next) } != 0 {
+            return None;
+        }
+        Some(Self(previous))
+    }
+}
+
+impl Drop for DescriptorLimit {
+    fn drop(&mut self) {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is writable and the call has no other effects.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return;
+        }
+        limit.rlim_cur = self.0;
+        // SAFETY: `limit` keeps the current hard limit and only raises the soft one.
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    }
 }
 
 fn restore_descriptor_limit(previous: u64) {
@@ -596,9 +644,25 @@ fn an_invocation_does_not_steal_an_unrelated_child() {
         .arg("exit 7")
         .spawn()
         .expect("the unrelated child must spawn");
-    // The child must already be a zombie when the invocation runs, and the
-    // test must not reap it: `try_wait` would consume it.
-    std::thread::sleep(Duration::from_millis(300));
+    // `waitid` with `WNOWAIT` blocks until the child has exited and leaves the
+    // status unconsumed, so the test cannot race a sleep and the zombie is
+    // guaranteed to exist before the invocation starts.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        // SAFETY: `info` is writable and `pid` is the live child.
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                unrelated.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        },
+        0,
+        "waitid must report the unrelated child's exit"
+    );
+    // SAFETY: `info` was filled by the successful `waitid` above.
+    assert_eq!(unsafe { info.si_pid() }, unrelated.id() as libc::pid_t);
 
     let (root, _) = template("scoped-reap");
     let mut runtime = runtime(&root);
@@ -722,6 +786,272 @@ fn the_workload_starts_with_the_default_sigpipe_disposition() {
             signal: libc::SIGPIPE
         }
     );
+}
+
+#[test]
+fn terminating_an_invocation_with_queued_input_is_not_an_infrastructure_error() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("terminate-queued-input");
+    let mut runtime = runtime(&root);
+    // The workload never reads its standard input, so the pipe fills and the
+    // remainder stays in the bounded queue.
+    let mut events = runtime.start(1, &launch("sleep 30"));
+    let chunk = vec![b'x'; 4096];
+    let mut offset = 0_u64;
+    let mut queued = 0_usize;
+    for _ in 0..32 {
+        match runtime.stdin_write(1, offset, &encode_bytes(&chunk)) {
+            Ok(accepted) => {
+                events.extend(accepted);
+                offset += chunk.len() as u64;
+                queued += chunk.len();
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(queued > 64 * 1024, "the queue must hold more than the pipe");
+
+    events.extend(runtime.terminate(1).unwrap());
+    // Wait until the killed readers are gone, so the queued input has nowhere
+    // to go. A poll that flushed it first would report a broken pipe as an
+    // infrastructure failure instead of the requested termination.
+    std::thread::sleep(Duration::from_millis(300));
+    poll_until_cleanup(&mut runtime, &mut events);
+    assert!(matches!(events.last(), Some(Event::CleanupComplete { .. })));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Event::WorkloadExited {
+                exit: ProcessExit::Signaled { .. },
+                ..
+            }
+        )),
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn a_continuously_ready_stream_does_not_starve_the_other() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("fairness");
+    let mut runtime = runtime(&root);
+    // The filler keeps standard output continuously readable, so a batch that
+    // serves one stream to exhaustion would never reach the other.
+    let filler = "x".repeat(1024);
+    let mut events = runtime.start(
+        1,
+        &launch(&format!(
+            "printf 'err\\n' 1>&2; while :; do printf '%s' '{filler}'; done"
+        )),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut stderr_seen = false;
+    while !stderr_seen && std::time::Instant::now() < deadline {
+        events.extend(runtime.poll(Duration::from_millis(20)).unwrap());
+        stderr_seen = events.iter().any(|event| {
+            matches!(
+                event,
+                Event::WorkloadOutput {
+                    stream: OutputStream::Stderr,
+                    ..
+                }
+            )
+        });
+    }
+    assert!(
+        stderr_seen,
+        "standard error was starved by a continuously ready standard output"
+    );
+    events.extend(runtime.terminate(1).unwrap());
+    poll_until_cleanup(&mut runtime, &mut events);
+}
+
+#[test]
+fn output_offsets_advance_across_multiple_frames_per_stream() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("offset-advance");
+    // A frame limit smaller than either stream forces every stream to split, so
+    // an implementation that always reports offset zero cannot pass.
+    let mut runtime = Runtime::new(RuntimeConfig {
+        template_root: root.0.join("template"),
+        runtime_root: root.0.join("runtime"),
+        limits: RuntimeLimits {
+            output_frame_bytes: 4,
+            ..RuntimeLimits::default()
+        },
+        scope: MemberScope::ProcessGroup,
+    })
+    .unwrap();
+    let events = run_script(&mut runtime, 1, "printf 'abcdefgh'; printf 'ijklmnop' 1>&2");
+
+    let mut stdout_offsets = Vec::new();
+    let mut stderr_offsets = Vec::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut frames = 0_u64;
+    for event in &events {
+        let Event::WorkloadOutput {
+            stream,
+            offset,
+            bytes,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        frames += 1;
+        let decoded = simferret::protocol::decode_bytes(bytes, 4096).unwrap();
+        match stream {
+            OutputStream::Stdout => {
+                stdout_offsets.push(*offset);
+                stdout.extend_from_slice(&decoded);
+            }
+            OutputStream::Stderr => {
+                stderr_offsets.push(*offset);
+                stderr.extend_from_slice(&decoded);
+            }
+        }
+    }
+    assert_eq!(stdout_offsets, vec![0, 4], "stdout offsets must advance");
+    assert_eq!(stderr_offsets, vec![0, 4], "stderr offsets must advance");
+    assert_eq!(stdout, b"abcdefgh");
+    assert_eq!(stderr, b"ijklmnop");
+    let reported = events
+        .iter()
+        .find_map(|event| match event {
+            Event::WorkloadExited { frames, .. } => Some(*frames),
+            _ => None,
+        })
+        .expect("the invocation must report an exit record");
+    assert_eq!(
+        reported, frames,
+        "the exit record must count the frames that were emitted"
+    );
+}
+
+/// A failed start whose root cannot be removed must report the removal failure,
+/// refuse the next start while the root is still on disk, and recover once the
+/// root can be removed.
+#[test]
+fn a_failed_start_reports_a_root_that_cannot_be_removed_and_refuses_the_next_start() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("failed-start-removal");
+    // The template is deeper than the descriptor budget the test installs, so
+    // both copying and removing the root exhaust the table.
+    let mut deep = root.0.join("template/deep");
+    fs::create_dir(&deep).unwrap();
+    for _ in 0..200 {
+        deep.push("d");
+        fs::create_dir(&deep).unwrap();
+    }
+
+    let mut runtime = runtime(&root);
+    let Some(limit) = DescriptorLimit::lower_to(64) else {
+        eprintln!("skipping: cannot lower the descriptor limit");
+        return;
+    };
+
+    let mut missing = launch("printf 'unused\\n'");
+    missing.executable = "/bin/missing".into();
+    missing.arguments = vec!["/bin/missing".into()];
+    let events = runtime.start(1, &missing);
+    let detail = match &events[0] {
+        Event::LaunchFailed {
+            failure: LaunchFailure::Materialization,
+            detail,
+            ..
+        } => detail.clone(),
+        other => panic!("expected a materialization failure: {other:?}"),
+    };
+    assert!(
+        detail.contains("invocation root"),
+        "the removal failure must be reported with the launch failure: {detail}"
+    );
+
+    // The root is still on disk, so the next start must be refused.
+    let events = runtime.start(2, &launch("printf 'unused\\n'"));
+    assert!(
+        matches!(
+            events[0],
+            Event::LaunchFailed {
+                failure: LaunchFailure::Materialization,
+                ..
+            }
+        ),
+        "a start on top of an unremoved root must be refused: {events:#?}"
+    );
+
+    // Once the root can be removed again the runtime recovers.
+    drop(limit);
+    let mut events = runtime.start(3, &launch("printf 'recovered\\n'"));
+    assert!(
+        matches!(events[0], Event::WorkloadStarted { .. }),
+        "{events:#?}"
+    );
+    poll_until_cleanup(&mut runtime, &mut events);
+    assert_eq!(stdout_bytes(&events), b"recovered\n");
+}
+
+/// A completed invocation whose root cannot be removed must not report a
+/// completed barrier or release the single-workload slot.
+#[test]
+fn a_completed_invocation_reports_a_root_that_cannot_be_removed() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("completed-removal");
+    let mut runtime = runtime(&root);
+    let Some(limit) = DescriptorLimit::lower_to(64) else {
+        eprintln!("skipping: cannot lower the descriptor limit");
+        return;
+    };
+    // The workload builds a tree deeper than the descriptor budget, so the
+    // barrier's root removal exhausts the table.
+    let mut events = runtime.start(
+        1,
+        &launch(
+            "cd /tmp; i=0; while [ $i -lt 200 ]; do mkdir d; cd d; i=$((i+1)); done; printf 'deep\\n'",
+        ),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let failure = loop {
+        match runtime.poll(Duration::from_millis(50)) {
+            Ok(more) => events.extend(more),
+            Err(error) => break error,
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the barrier must report the removal failure: {events:#?}"
+        );
+    };
+    assert!(failure.to_string().contains("invocation root"), "{failure}");
+    // The barrier did not complete and the slot is still occupied.
+    assert!(runtime.is_active());
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::CleanupComplete { .. }))
+    );
+    let events = runtime.start(2, &launch("printf 'unused\\n'"));
+    assert!(
+        matches!(
+            events[0],
+            Event::LaunchFailed {
+                failure: LaunchFailure::InvocationActive,
+                ..
+            }
+        ),
+        "{events:#?}"
+    );
+    drop(limit);
 }
 
 #[test]
@@ -1045,6 +1375,17 @@ fn the_agent_drives_the_runtime_over_the_serial_control_channel() {
                 simferret::protocol::Event::InputAccepted { eof: false, .. }
             )
     });
+    // The response must be delivered while the shell is still blocked waiting
+    // for another input line, so an implementation that buffers all output
+    // until process exit cannot pass.
+    wait_for_frame(&collected, |frame| match &frame.event {
+        simferret::protocol::Event::WorkloadOutput {
+            stream: OutputStream::Stdout,
+            bytes,
+            ..
+        } => simferret::protocol::decode_bytes(bytes, 4096).unwrap() == b"got:live\n",
+        _ => false,
+    });
     let eof_id = send(&mut commands, Command::StdinEof { invocation: 1 });
     wait_for_frame(&collected, |frame| {
         frame.command_id == eof_id
@@ -1096,7 +1437,10 @@ fn the_agent_drives_the_runtime_over_the_serial_control_channel() {
             )
         })
         .expect("a live output frame must be emitted");
-    assert!(output_frame.command_id <= eof_id, "{events:#?}");
+    assert_eq!(
+        output_frame.command_id, write_id,
+        "live output must be attributed to the command in flight: {events:#?}"
+    );
     assert_eq!(
         decode_output(&events),
         b"got:live\n",

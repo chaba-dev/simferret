@@ -16,6 +16,7 @@ use serde_json::{Map, Value};
 use super::root::{Root, invalid};
 use super::spec::{
     LaunchIdentity, normalize_environment, normalize_user, normalize_working_directory,
+    validate_launch_identity,
 };
 use super::tree::{
     Entry, EntryKind, Tree, ancestors, join_path, normalize_layer_path, parent_of, sha256_bytes,
@@ -434,14 +435,16 @@ fn normalize_launch(config: &Map<String, Value>, tree: &Tree) -> io::Result<Laun
         optional_string_value(oci.and_then(|oci| oci.get("WorkingDir")), "WorkingDir")?,
         tree,
     )?;
-    Ok(LaunchIdentity {
+    let launch = LaunchIdentity {
         executable: format!("/{}", String::from_utf8_lossy(&relative)),
         arguments,
         environment,
         working_directory,
         uid,
         gid,
-    })
+    };
+    validate_launch_identity(&launch)?;
+    Ok(launch)
 }
 
 fn string_list(value: Option<&Value>, what: &str) -> io::Result<Vec<String>> {
