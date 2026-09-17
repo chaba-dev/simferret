@@ -348,6 +348,55 @@ fn the_runtime_overlay_is_visible_inside_the_workload_root() {
 }
 
 #[test]
+fn a_package_directory_below_the_overlay_does_not_block_the_launch() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("overlay-descendant");
+    let template_root = root.0.join("template");
+    // An empty directory tree below an overlay path is legal, but the overlay
+    // replaces the subtree instead of merging with it.
+    fs::create_dir_all(template_root.join("tmp/nested")).unwrap();
+    // A directory named `/dev/null` is legal input, and it must not make the
+    // overlay fail when it installs the character device.
+    fs::create_dir_all(template_root.join("dev/null")).unwrap();
+    let mut runtime = runtime(&root);
+    let events = run_script(
+        &mut runtime,
+        1,
+        "if [ -c /dev/null ]; then printf 'null=char\\n'; else printf 'null=other\\n'; fi; \
+         if [ -d /tmp/nested ]; then printf 'nested=kept\\n'; else printf 'nested=replaced\\n'; fi",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&stdout_bytes(&events)),
+        "null=char\nnested=replaced\n"
+    );
+    assert!(matches!(events.last(), Some(Event::CleanupComplete { .. })));
+}
+
+/// OCI normalization canonicalizes the executable while preserving the caller's
+/// argument vector, so the runtime must accept a first argument that differs
+/// from the executed path.
+#[test]
+fn an_oci_normalized_launch_identity_runs() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("oci-normalized");
+    let mut runtime = runtime(&root);
+    let mut identity = launch("printf 'normalized\\n'");
+    identity.executable = "/bin/sh".into();
+    identity.arguments = vec![
+        "/bin/./sh".into(),
+        "-c".into(),
+        "printf 'normalized\\n'".into(),
+    ];
+    let mut events = runtime.start(1, &identity);
+    poll_until_cleanup(&mut runtime, &mut events);
+    assert_eq!(stdout_bytes(&events), b"normalized\n");
+}
+
+#[test]
 fn a_descendant_retaining_the_output_pipe_is_killed_by_the_cleanup_barrier() {
     if !require_root() {
         return;
@@ -500,14 +549,14 @@ fn a_failed_materialization_leaves_no_partial_root() {
         return;
     }
     let (root, _) = template("partial");
-    // A file larger than the configured bound fails during materialization,
+    // A file larger than the canonical file bound fails during materialization,
     // after the root and some of its entries already exist.
     fs::write(root.0.join("template/bin/large"), vec![0_u8; 8192]).unwrap();
     let mut runtime = Runtime::new(RuntimeConfig {
         template_root: root.0.join("template"),
         runtime_root: root.0.join("runtime"),
         limits: RuntimeLimits {
-            output_bytes: 4096,
+            file_bytes: 4096,
             ..RuntimeLimits::default()
         },
         scope: MemberScope::ProcessGroup,
