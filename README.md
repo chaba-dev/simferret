@@ -260,8 +260,53 @@ Phase 1 acceptance tests:
 .agents/dev cargo test --locked --workspace --all-targets --all-features
 ```
 
-The guest process runtime, the scenario integration, and the recorded
-input/output protocol remain Phase 2 and Phase 3 work.
+## RFD 3 guest process runtime
+
+The PID-1 agent supervises one packaged workload at a time. The immutable
+template is assembled below `/workload`, outside the agent, its tools, and the
+runtime scratch space. For every invocation the agent materializes a fresh
+writable root under `/run/simferret` from that template, reproduces its canonical
+bytes and metadata, and applies the versioned overlay: `/tmp` is an empty
+root-owned mode-`01777` directory, `/dev` is root-owned mode `0755`, and
+`/dev/null` and `/dev/zero` are mode-`0666` character devices with fixed device
+numbers. A package entry at `/tmp` or `/dev` must be a directory and has its
+metadata replaced; a non-directory entry below either path collides and is
+rejected before any root is created.
+
+The agent never changes its own root. It forks a child that receives only fresh
+standard pipes, closes every other inherited descriptor, changes root and then
+its in-root working directory, clears supplementary groups, sets `no_new_privs`,
+applies the normalized nonzero GID and UID, and executes the exact argument
+vector without a shell. A setup failure exits the child before any workload code
+runs and is reported as a typed `launch-failed` event.
+
+The versioned process protocol adds `start`, `stdin-write`, `stdin-eof`, and
+`terminate`. `stdin-write` carries a strictly contiguous byte offset and bounded
+exact bytes; `terminate` is an unconditional `SIGKILL`. While the workload runs
+the agent emits bounded stdout and stderr frames with the invocation, the stream,
+a per-stream offset, one monotonic cross-stream sequence number, and exact bytes;
+the exit record independently reports per-stream totals and SHA-256 digests. A
+limit overflow, a non-contiguous offset, and a control or pipe transport failure
+are fatal: the invocation is killed and the agent reports an infrastructure
+error rather than a workload property. On exit or termination the agent signals
+every member of the invocation, reaps until only itself remains, and drains both
+pipes to end of file before emitting `cleanup-complete`; a new start is refused
+until that barrier completes. The agent reports process and byte facts only, so
+application protocol interpretation stays in the host scenario checker.
+
+The focused runtime command builds the test binary and runs it as PID 1 in a
+fresh PID namespace, because the runtime changes root, drops credentials, and
+creates device nodes, and its guest-wide cleanup barrier must not signal
+unrelated host processes:
+
+```shell
+sudo env "PATH=$PATH" SIMFERRET_BUSYBOX="$SIMFERRET_BUSYBOX" \
+  ./scripts/rfd3-phase2-runtime.sh
+```
+
+Selecting the workload in `simferret run`, recording its identity in the run
+manifest, driving the live protocol from the scenario checker, and the recorded
+passive replay remain Phase 3 work.
 
 ## Development
 

@@ -257,8 +257,12 @@ fn record_with_adapter_and_assets(
     let attempt = (|| {
         let (scenario, scenario_source) = Scenario::read(&options.scenario)?;
         let choices = scenario.choices(options.seed);
-        let image =
-            build_guest_image_with_assets(&options.executable, &options.runs_directory, assets)?;
+        let image = build_guest_image_with_assets(
+            &options.executable,
+            &options.runs_directory,
+            assets,
+            None,
+        )?;
         fs::create_dir(staging.path.join("logs"))?;
         fs::write(staging.path.join("scenario.toml"), scenario_source)?;
         write_json(staging.path.join("choices.json"), &choices)?;
@@ -467,7 +471,8 @@ fn replay_with_adapter_and_assets(
             )));
         }
 
-        let image = build_guest_image_with_assets(&options.executable, runs_directory, assets)?;
+        let image =
+            build_guest_image_with_assets(&options.executable, runs_directory, assets, None)?;
         if image.executable_sha256 != manifest.simferret_sha256 {
             return Err(invalid_data(format!(
                 "SimFerret executable digest differs from recording: expected {}, found {}",
@@ -946,6 +951,7 @@ fn build_guest_image_with_assets(
     executable: &Path,
     runs_directory: &Path,
     assets: &GuestImageAssets,
+    workload_template: Option<&[u8]>,
 ) -> io::Result<GuestImage> {
     let executable_bytes = fs::read(executable)?;
     let executable_sha256 = sha256_bytes(&executable_bytes);
@@ -972,6 +978,12 @@ fn build_guest_image_with_assets(
         &assets.rtl8139cp,
     )?;
     append_cpio(&mut archive, "init", 0o100755, &executable_bytes)?;
+    // The immutable workload template is assembled below its reserved root,
+    // outside the PID-1 agent, its tools, and the runtime scratch space. Its
+    // entries carry no trailing marker so the whole image stays one archive.
+    if let Some(template) = workload_template {
+        archive.extend_from_slice(template);
+    }
     append_cpio(&mut archive, "TRAILER!!!", 0, &[])?;
 
     let mut compressor = GzBuilder::new()
@@ -1775,7 +1787,7 @@ mod tests {
     }
 
     fn build_guest_image(executable: &Path, runs_directory: &Path) -> io::Result<GuestImage> {
-        build_guest_image_with_assets(executable, runs_directory, &synthetic_assets())
+        build_guest_image_with_assets(executable, runs_directory, &synthetic_assets(), None)
     }
 
     impl FakeAdapter {
@@ -2017,6 +2029,9 @@ mod tests {
                         self.event(frame.command_id, Event::AgentStopped {});
                     }
                 }
+                // The fake models the network fixture only; process commands
+                // are exercised by the runtime and phase 2 suites.
+                _ => {}
             }
             Ok(())
         }
@@ -2891,6 +2906,81 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_guest_image_assembles_the_workload_below_its_reserved_root() {
+        use crate::workload::{Entry, Tree};
+
+        let root = temporary_root("workload-image");
+        let options = test_options(&root, false);
+        let mut tree = Tree::new();
+        tree.insert_default_directory(b".");
+        tree.insert_default_directory(b"bin");
+        tree.insert(
+            b"bin/app".to_vec(),
+            Entry::file(b"payload".to_vec(), 0o755, 65534, 65534, 0),
+        );
+        let template = tree.template_entries("workload").unwrap();
+        let image = build_guest_image_with_assets(
+            &options.executable,
+            &options.runs_directory,
+            &synthetic_assets(),
+            Some(&template),
+        )
+        .unwrap();
+        let compressed = fs::read(&image.path).unwrap();
+        let mut archive = Vec::new();
+        flate2::read::GzDecoder::new(&compressed[..])
+            .read_to_end(&mut archive)
+            .unwrap();
+        let names = cpio_names(&archive);
+        // The workload template is present below its reserved root.
+        assert!(names.iter().any(|name| name == "workload"));
+        assert!(names.iter().any(|name| name == "workload/bin/app"));
+        // The agent and its tools stay outside the reserved root.
+        assert!(names.iter().any(|name| name == "init"));
+        assert!(names.iter().any(|name| name == "bin/busybox"));
+        assert!(names.iter().any(|name| name == "modules/mii.ko"));
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("workload/") && name.contains("busybox")),
+            "{names:#?}"
+        );
+        // The concatenation must remain one archive with exactly one trailer.
+        assert_eq!(names.iter().filter(|name| *name == "TRAILER!!!").count(), 1);
+        assert_eq!(names.last().unwrap(), "TRAILER!!!");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn cpio_names(archive: &[u8]) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut offset = 0;
+        while offset + 110 <= archive.len() {
+            let header = &archive[offset..offset + 110];
+            assert_eq!(
+                &header[..6],
+                b"070701",
+                "bad header at offset {offset} of {}",
+                archive.len()
+            );
+            let field = |index: usize| -> usize {
+                let start = 6 + index * 8;
+                usize::from_str_radix(std::str::from_utf8(&header[start..start + 8]).unwrap(), 16)
+                    .unwrap()
+            };
+            let file_size = field(6);
+            let name_size = field(11);
+            let name_start = offset + 110;
+            let name = &archive[name_start..name_start + name_size - 1];
+            names.push(String::from_utf8_lossy(name).into_owned());
+            // The 110-byte header is not a multiple of four, so padding is
+            // computed from the running archive offset, not the field length.
+            let contents_start = (name_start + name_size + 3) & !3;
+            offset = (contents_start + file_size + 3) & !3;
+        }
+        names
     }
 
     #[test]

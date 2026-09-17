@@ -979,3 +979,138 @@ boundary, no-op-load, and address-space cases remain as they were.
 
 Each of these tests was confirmed to fail when its fix is reverted, so none of
 them asserts a merely incidental error.
+
+== Phase 2 guest process runtime
+
+Phase 2 replaces the throwaway Phase 0 supervisor with `crates/simferret/src/runtime.rs`
+and extends the versioned control protocol with the process commands. The PID-1
+agent stays outside an immutable workload template at `/workload`; for every
+invocation it materializes a fresh writable root under `/run/simferret`, applies
+the versioned overlay, and supervises exactly one child in a private filesystem
+root.
+
+The guest image assembler now appends the canonical workload template below that
+reserved root. `Tree::template_entries` emits the same `newc` records as
+`Tree::template` without the trailing marker, so the workload template and the
+agent's own entries concatenate into one initramfs archive. A unit test decodes
+the resulting archive and requires `workload` and `workload/bin/app` to be
+present, `init`, `bin/busybox`, and `modules/mii.ko` to stay outside it, and
+exactly one trailer. The run flow still passes no template, because selecting the
+workload and recording its identity in the run manifest belongs to Phase 3.
+
+=== Runtime profile
+
+The runtime enforces the RFD's launch and lifecycle rules:
+
+* The template is validated before any invocation. A package entry at `/tmp` or
+  `/dev` must be a directory and is replaced by the overlay; a non-directory
+  entry anywhere below those paths is rejected as an overlay collision. Special
+  files, entries beyond the count bound, and paths beyond the length bound are
+  rejected before any root is created.
+* Each invocation copies the template bytes and canonical metadata into a new
+  root, then synthesizes `/tmp` as a root-owned mode-`01777` directory, `/dev` as
+  a root-owned mode-`0755` directory, and `/dev/null` and `/dev/zero` as
+  mode-`0666` character devices `1:3` and `1:5`. The root is removed at the
+  cleanup barrier, so no invocation can observe a previous one.
+* The child receives only fresh standard pipes; every other inherited descriptor
+  is closed. It then changes root, changes to the normalized working directory,
+  clears supplementary groups, sets `no_new_privs`, applies the nonzero GID and
+  UID, and executes the exact argument vector without a shell. Setup failures are
+  reported through a close-on-exec pipe as typed `launch-failed` events, so a
+  successful `execve` is unambiguous.
+* The versioned process commands are `start`, `stdin-write`, `stdin-eof`, and
+  `terminate`. `stdin-write` carries an invocation identifier, a strictly
+  contiguous byte offset, and bounded hexadecimal exact bytes; `terminate` is an
+  unconditional `SIGKILL` independent of any OCI stop signal.
+* Live stdout and stderr frames carry the invocation, the stream, a per-stream
+  byte offset, one monotonic cross-stream sequence number, and exact bytes. The
+  exit record independently reports per-stream totals and SHA-256 digests. A
+  per-frame or per-invocation limit overflow, a non-contiguous offset, and a
+  control or pipe transport failure are fatal: the invocation is killed and the
+  agent reports an infrastructure error rather than a workload property.
+* On primary exit or termination the runtime signals every member of the active
+  invocation, reaps until only the agent remains, and drains both pipes to end of
+  file before emitting `cleanup-complete`. A new `start` is refused until that
+  barrier completes. The agent reports process and byte facts only; application
+  protocol interpretation remains in the host scenario checker.
+
+=== Checked-in evidence command
+
+[source,shell]
+----
+sudo env "PATH=$PATH" SIMFERRET_BUSYBOX="$SIMFERRET_BUSYBOX" \
+  ./scripts/rfd3-phase2-runtime.sh
+----
+
+The script builds the phase 2 test binary, then runs it as PID 1 in a fresh PID
+namespace. The namespace matters twice: the runtime changes root, drops
+credentials, and creates device nodes, which needs root; and the guest-wide
+cleanup barrier signals every process in the process table, which must not reach
+the host. A representative run produced:
+
+[source,text]
+----
+running 12 tests
+test a_descendant_retaining_the_output_pipe_is_killed_by_the_cleanup_barrier ... ok
+test a_missing_executable_is_a_typed_launch_failure ... ok
+test a_non_contiguous_offset_kills_the_invocation_and_is_fatal ... ok
+test a_second_start_is_refused_while_an_invocation_is_active ... ok
+test an_escaped_descendant_cannot_outlive_the_cleanup_barrier ... ok
+test an_overlay_collision_is_rejected_before_any_invocation ... ok
+test each_invocation_materializes_a_fresh_root ... ok
+test live_output_frames_carry_exact_bytes_offsets_and_sequence ... ok
+test standard_input_round_trips_through_contiguous_offsets ... ok
+test terminate_kills_and_reaps_the_invocation ... ok
+test the_agent_drives_the_runtime_over_the_serial_control_channel ... ok
+test the_runtime_overlay_is_visible_inside_the_workload_root ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+----
+
+The fixture is the pinned static busybox copied into the template and executed as
+the workload. It is ordinary Linux software with no SimFerret library dependency,
+so the runtime supervises what a packaged workload would be. When the effective
+user is not root the tests skip with an explicit diagnostic instead of failing;
+the same code runs as PID 1 in the guest.
+
+=== Phase 2 regression tests
+
+`crates/simferret/src/runtime.rs` unit tests cover the template walk and overlay
+profile: a valid template with content outside the overlay, a non-directory
+`/tmp` and a non-directory `/dev/null`, a legal nested empty directory tree, the
+entry and path bounds, a FIFO, and every rejected launch value including an
+escaping or relative executable, root credentials, an empty or mismatched
+argument vector, a malformed environment entry, and a relative working directory.
+
+`crates/simferret/tests/rfd3_phase2.rs` covers the runtime end to end:
+
+* live stdout and stderr frames with exact bytes, per-stream offsets, one
+  cross-stream sequence, and independently recomputed totals and digests;
+* a stdin round trip through contiguous offsets and `stdin-eof`, with the
+  accepted-offset record matching the input exactly;
+* a non-contiguous offset that kills the invocation and reports a fatal error;
+* `terminate` producing a `SIGKILL` exit record and a completed barrier;
+* a second `start` refused while an invocation is active, and accepted only after
+  `cleanup-complete`;
+* a first invocation's `/tmp` mutation absent from a second invocation;
+* the overlay visible inside the workload root as character devices and a
+  sticky, world-writable `/tmp`;
+* a descendant that retains the output pipe being killed before the barrier can
+  complete;
+* an escaped `setsid` descendant killed by the guest-wide barrier, which requires
+  the PID namespace the script provides;
+* a missing executable reported as a typed `launch-failed` event with no active
+  invocation;
+* an overlay collision rejected before the runtime root is created;
+* the agent driving the runtime over the real serial control channel, with
+  command-byte acknowledgements, live output attributed to the command being
+  handled while the workload ran, an exact output stream, `cleanup-complete`, and
+  `agent-stopped`.
+
+=== Deliberate limits
+
+The host tests exercise the process-group scope for the ordinary descendant and
+the guest-wide scope only inside a PID namespace, because the guest-wide sweep
+must not signal unrelated host processes. Application protocol parsing, workload
+assertions, and the run manifest's workload identity remain Phase 3 work. The
+runtime reports no throughput or security claim beyond the accepted profile.
