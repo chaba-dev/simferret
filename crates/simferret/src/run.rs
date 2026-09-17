@@ -3141,6 +3141,9 @@ mod tests {
         /// Write a failing tail while the host waits for the end-of-input
         /// acknowledgement, then acknowledge it and stay alive.
         failing_tail_before_eof: Option<FailingTail>,
+        /// Exit cleanly once the current invocation has answered this many
+        /// requests, before the host can end its input.
+        exit_after_fetch: Option<u64>,
         pending_tail: Option<u64>,
     }
 
@@ -3226,6 +3229,7 @@ mod tests {
                 over_bound_tail_after_response: false,
                 late_tail_after_response: self.late_tail_after_response,
                 failing_tail_before_eof: None,
+                exit_after_fetch: None,
                 pending_tail: None,
             })
         }
@@ -3546,6 +3550,18 @@ mod tests {
                             "network state=unavailable request={request_id} errno={}\n",
                             libc::EACCES
                         ),
+                    );
+                }
+                if self.exit_after_fetch == Some(self.workload.fetched as u64)
+                    && self.workload.live == Some(invocation)
+                {
+                    // A workload can stop on its own after its last response, so
+                    // the host observes the exit before it can end the input.
+                    self.emit_workload_exit(
+                        command_id,
+                        invocation,
+                        ProcessExit::Exited { code: 0 },
+                        1,
                     );
                 }
             }
@@ -3921,6 +3937,7 @@ mod tests {
             over_bound_tail_after_response: false,
             late_tail_after_response: false,
             failing_tail_before_eof: None,
+            exit_after_fetch: None,
             pending_tail: None,
         };
         let mut diagnostics = failure_diagnostics("record");
@@ -5884,6 +5901,7 @@ mod tests {
             over_bound_tail_after_response: false,
             late_tail_after_response: false,
             failing_tail_before_eof: None,
+            exit_after_fetch: None,
             pending_tail: None,
         }
     }
@@ -5891,15 +5909,40 @@ mod tests {
     fn drive_fake_workload(vm: &mut FakeVm) -> (Vec<NormalizedEvent>, AssertionReport) {
         let scenario = workload_scenario_fixture();
         let choices = scenario.choices(42);
+        drive_fake_workload_with(vm, &scenario, &choices)
+    }
+
+    fn drive_fake_workload_with(
+        vm: &mut FakeVm,
+        scenario: &WorkloadScenario,
+        choices: &WorkloadChoicePlan,
+    ) -> (Vec<NormalizedEvent>, AssertionReport) {
         let mut diagnostics = failure_diagnostics("record");
-        drive_workload_scenario(
-            &scenario,
-            &choices,
-            &workload_launch(),
-            vm,
-            &mut diagnostics,
-        )
-        .expect("an application failure must not become an infrastructure failure")
+        drive_workload_scenario(scenario, choices, &workload_launch(), vm, &mut diagnostics)
+            .expect("an application failure must not become an infrastructure failure")
+    }
+
+    #[test]
+    fn a_clean_exit_before_the_end_of_input_fails_response_integrity() {
+        // The driver stops issuing commands as soon as it observes an exit, so a
+        // workload that stops on its own after its last response produces a
+        // recording without the end-of-input acknowledgement. Every response line
+        // and root witness is intact, so only the checker's input accounting can
+        // reject the incomplete scenario.
+        let scenario = workload_scenario_fixture();
+        let choices = scenario.choices(42);
+        let mut vm = fake_workload_vm();
+        vm.exit_after_fetch =
+            Some((choices.requests.len() - choices.process_fault_request_index) as u64);
+        let (events, report) = drive_fake_workload_with(&mut vm, &scenario, &choices);
+        assert!(!report.passed, "{:#?}", report.assertions);
+        assert!(!report.assertions[1].passed, "{:#?}", report.assertions);
+        assert!(
+            !events
+                .iter()
+                .any(|frame| matches!(frame.event, Event::InputAccepted { eof: true, .. })),
+            "the driver must not have ended the input"
+        );
     }
 
     #[test]
@@ -6040,6 +6083,7 @@ mod tests {
             over_bound_tail_after_response: false,
             late_tail_after_response: false,
             failing_tail_before_eof: None,
+            exit_after_fetch: None,
             pending_tail: None,
         }
     }

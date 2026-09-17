@@ -944,17 +944,21 @@ fn response_integrity(trace: &WorkloadTrace, choices: &WorkloadChoicePlan) -> As
         // Every response line but the startup line answers one accepted input
         // command, and an invocation that reached its end of input acknowledged
         // it exactly once and last, so a recording cannot drop or duplicate the
-        // acknowledgements of the commands whose responses it produced.
+        // acknowledgements of the commands whose responses it produced. The
+        // acceptance contract ends the surviving invocation's input, so its end
+        // of input is required, not merely permitted: a recording that omits it
+        // has not exercised the scenario.
         let (data_inputs, eof_inputs) = trace
             .invocations
             .get(&invocation)
             .map_or((0, 0), |streams| (streams.data_inputs, streams.eof_inputs));
         let expected_inputs = (expected.len() - 1) as u64;
-        if data_inputs != expected_inputs || eof_inputs > 1 {
+        let expected_eofs = u64::from(invocation == 2);
+        if data_inputs != expected_inputs || eof_inputs != expected_eofs {
             return failed(
                 AssertionName::ResponseIntegrity,
                 format!(
-                    "invocation {invocation} acknowledged {data_inputs} input command(s) and {eof_inputs} end(s) of input; expected {expected_inputs} and at most 1"
+                    "invocation {invocation} acknowledged {data_inputs} input command(s) and {eof_inputs} end(s) of input; expected {expected_inputs} and {expected_eofs}"
                 ),
             );
         }
@@ -1108,9 +1112,9 @@ fn fault_properties(
     };
 
     let restoration_result = match restoration {
-        Some((peer_cidr, event_id)) => passed(
+        Some((_, event_id)) => passed(
             AssertionName::Restoration,
-            format!("network restoration of {peer_cidr} was confirmed at event {event_id}"),
+            format!("network restoration of {peer} was confirmed at event {event_id}"),
         ),
         None => failed(
             AssertionName::Restoration,
@@ -1597,6 +1601,39 @@ mod tests {
         );
         let report = evaluate_workload(&events, &scenario(), &choices, &launch());
         assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
+    }
+
+    #[test]
+    fn a_missing_end_of_input_fails_response_integrity() {
+        // The acceptance contract ends the surviving invocation's input before it
+        // stops, so a recording that omits the acknowledgement has not exercised
+        // the scenario even when every response line and root witness is intact.
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let index = events
+            .iter()
+            .position(|frame| {
+                matches!(
+                    frame.event,
+                    Event::InputAccepted {
+                        invocation: 2,
+                        eof: true,
+                        ..
+                    }
+                )
+            })
+            .expect("the fixture acknowledges invocation 2's end of input");
+        events.remove(index);
+        for later in events[index..].iter_mut() {
+            later.event_id -= 1;
+        }
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[1].passed, "{:#?}", report.assertions);
+        assert!(
+            report.assertions[1].detail.contains("end(s) of input"),
+            "{}",
+            report.assertions[1].detail
+        );
     }
 
     #[test]
