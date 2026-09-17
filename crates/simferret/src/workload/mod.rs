@@ -320,6 +320,23 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_specification_never_quotes_the_environment() {
+        // A TOML type error can quote the offending value, and an environment
+        // value is a secret, so the diagnostic must not carry it.
+        let source = b"version = 1\nkind = \"binary\"\npath = \"app\"\nargs = []\nenv = [\"SECRET=classification-marker\", 17]\nworking_directory = \"/\"\nuser = \"65534:65534\"\n";
+        let error = WorkloadSpec::parse(source).unwrap_err();
+        assert!(
+            !error.to_string().contains("classification-marker"),
+            "{error}"
+        );
+
+        // A syntax error must still name its location without the document text.
+        let syntax = b"version = 1\nkind = \"binary\n";
+        let error = WorkloadSpec::parse(syntax).unwrap_err();
+        assert!(error.to_string().contains("byte offset"), "{error}");
+    }
+
+    #[test]
     fn overlay_collisions_are_refused_during_assembly() {
         let mut tree = Tree::new();
         tree.insert_default_directory(b".");

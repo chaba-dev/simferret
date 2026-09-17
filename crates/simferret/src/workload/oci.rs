@@ -478,7 +478,7 @@ fn blob_path(digest: &str) -> io::Result<String> {
 
 fn parse_json(bytes: &[u8], what: &str) -> io::Result<Value> {
     serde_json::from_slice(bytes)
-        .map_err(|error| invalid(format!("malformed {what} JSON: {error}")))
+        .map_err(|error| crate::diagnostics::json_error(&format!("malformed {what} JSON"), &error))
 }
 
 fn as_object<'a>(value: &'a Value, what: &str) -> io::Result<&'a Map<String, Value>> {

@@ -504,8 +504,9 @@ fn read_serial_frames(
             ));
         }
         frames.push(
-            serde_json::from_slice(body)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            serde_json::from_slice(body).map_err(|error| {
+                crate::diagnostics::json_error("malformed command frame", &error)
+            })?,
         );
     }
     if buffer.bytes.len() > crate::protocol::MAX_FRAME_LENGTH {

@@ -1167,7 +1167,7 @@ fn read_serial_event(
     }
     serde_json::from_slice(&body)
         .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .map_err(|error| crate::diagnostics::json_error("malformed event frame", &error))
 }
 
 struct CommandWriter {
@@ -1294,7 +1294,7 @@ impl RunningVm for QemuVm {
             Ok(Ok(None)) => Ok(()),
             Ok(Ok(Some(event))) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unexpected event after shutdown: {event:?}"),
+                format!("unexpected {} after shutdown", event.event.describe()),
             )),
             Ok(Err(error)) => Err(error),
             Err(RecvTimeoutError::Timeout) => Err(io::Error::new(

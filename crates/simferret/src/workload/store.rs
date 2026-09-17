@@ -224,7 +224,7 @@ pub fn load(store: &Path) -> io::Result<LoadedWorkload> {
     )?;
     let closure_sha256 = sha256_bytes(&closure_bytes);
     let closure: Closure = serde_json::from_slice(&closure_bytes)
-        .map_err(|error| invalid(format!("malformed raw closure: {error}")))?;
+        .map_err(|error| crate::diagnostics::json_error("malformed raw closure", &error))?;
     if closure.version != CLOSURE_VERSION {
         return Err(invalid(format!(
             "unsupported raw closure version {}",
@@ -856,7 +856,7 @@ fn verify_derived(
         "derived lock",
     )?;
     let lock: DerivedLock = serde_json::from_slice(&lock_bytes)
-        .map_err(|error| invalid(format!("malformed derived lock: {error}")))?;
+        .map_err(|error| crate::diagnostics::json_error("malformed derived lock", &error))?;
     if lock.version != DERIVED_LOCK_VERSION
         || lock.canonical_digest != canonical_digest
         || lock.tree_sha256 != tree_sha256
