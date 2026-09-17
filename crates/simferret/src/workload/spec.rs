@@ -252,11 +252,17 @@ fn validate_locator(field: &str, value: &str) -> io::Result<()> {
 }
 
 pub fn parse_digest(value: &str) -> io::Result<String> {
+    // A digest is a launch-adjacent field the user wrote, so the diagnostic
+    // names the shape it expected rather than the value it rejected.
     let Some(hex) = value.strip_prefix("sha256:") else {
-        return Err(invalid(format!("unsupported digest {value:?}")));
+        return Err(invalid(
+            "the digest must be a sha256: prefixed lowercase hex digest",
+        ));
     };
     if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(invalid(format!("malformed digest {value:?}")));
+        return Err(invalid(
+            "the digest must be a sha256: prefixed lowercase hex digest",
+        ));
     }
     Ok(hex.to_ascii_lowercase())
 }
@@ -318,7 +324,11 @@ pub fn normalize_environment(values: &[String]) -> io::Result<Vec<String>> {
             )));
         }
         if seen.contains(&name) {
-            return Err(invalid(format!("duplicate environment name {name:?}")));
+            // The name is reported by index too, because a name is the other half
+            // of a private environment entry.
+            return Err(invalid(format!(
+                "environment entry {index} repeats an earlier name"
+            )));
         }
         seen.push(name);
     }
@@ -343,32 +353,30 @@ pub fn normalize_required_user(value: &str) -> io::Result<(u32, u32)> {
 }
 
 fn parse_user(value: &str) -> io::Result<(u32, u32)> {
+    // A user value is part of the launch identity, so only the expected shape is
+    // reported, never the value the user wrote.
     let mut parts = value.split(':');
     let (Some(uid), Some(gid), None) = (parts.next(), parts.next(), parts.next()) else {
-        return Err(invalid(format!("unsupported user {value:?}")));
+        return Err(invalid("the user must be an explicit nonzero uid:gid pair"));
     };
     if uid.is_empty()
         || gid.is_empty()
         || !uid.bytes().all(|byte| byte.is_ascii_digit())
         || !gid.bytes().all(|byte| byte.is_ascii_digit())
     {
-        return Err(invalid(format!(
-            "user {value:?} is not a numeric uid:gid pair"
-        )));
+        return Err(invalid("the user must be an explicit nonzero uid:gid pair"));
     }
     let uid: u32 = uid
         .parse()
-        .map_err(|_| invalid(format!("user {value:?} is out of range")))?;
+        .map_err(|_| invalid("the user uid is out of range"))?;
     let gid: u32 = gid
         .parse()
-        .map_err(|_| invalid(format!("user {value:?} is out of range")))?;
+        .map_err(|_| invalid("the user gid is out of range"))?;
     if uid == 0 || gid == 0 {
         return Err(invalid("root credentials are not supported"));
     }
     if uid == super::RESERVED_OWNER || gid == super::RESERVED_OWNER {
-        return Err(invalid(format!(
-            "user {value:?} uses the reserved owner identifier"
-        )));
+        return Err(invalid("the reserved owner identifier is not a credential"));
     }
     Ok((uid, gid))
 }
@@ -470,9 +478,7 @@ pub fn normalize_working_directory(value: Option<&str>, tree: &Tree) -> io::Resu
         Some(value) => value,
     };
     if !value.starts_with('/') {
-        return Err(invalid(format!(
-            "working directory {value:?} is not absolute"
-        )));
+        return Err(invalid("the working directory must be absolute"));
     }
     let stripped = value.trim_matches('/');
     let relative = if stripped.is_empty() {
@@ -487,23 +493,21 @@ pub fn normalize_working_directory(value: Option<&str>, tree: &Tree) -> io::Resu
         if let Some(entry) = tree.get(&ancestor)
             && entry.kind == super::tree::EntryKind::Symlink
         {
-            return Err(invalid(format!(
-                "working directory {value:?} traverses a symbolic link"
-            )));
+            return Err(invalid("the working directory traverses a symbolic link"));
         }
     }
     if relative != ROOT_PATH
         && tree.get(&relative).map(|entry| entry.kind) != Some(super::tree::EntryKind::Directory)
     {
-        return Err(invalid(format!(
-            "working directory {value:?} is not a directory in the workload"
-        )));
+        return Err(invalid(
+            "the working directory is not a directory in the workload",
+        ));
     }
     if relative == ROOT_PATH {
         Ok("/".into())
     } else {
         let text = std::str::from_utf8(&relative)
-            .map_err(|_| invalid(format!("working directory {value:?} is not UTF-8")))?;
+            .map_err(|_| invalid("the working directory is not UTF-8"))?;
         Ok(format!("/{text}"))
     }
 }

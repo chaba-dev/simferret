@@ -389,26 +389,22 @@ fn normalize_launch(config: &Map<String, Value>, tree: &Tree) -> io::Result<Laun
     // same bound as an explicitly declared argument list.
     let arguments = super::spec::normalize_arguments(&arguments, "arguments")?;
     let executable = &arguments[0];
+    // The first argument is the launch executable, so its diagnostic names the
+    // field it rejected rather than the value it holds.
     if !executable.starts_with('/') {
-        return Err(invalid(format!(
-            "executable {executable:?} is not an absolute path"
-        )));
+        return Err(invalid("the executable argument must be an absolute path"));
     }
     let relative = normalize_layer_path(executable.trim_start_matches('/').as_bytes())?;
-    let entry = tree.get(&relative).ok_or_else(|| {
-        invalid(format!(
-            "executable {executable:?} is not a file in the workload"
-        ))
-    })?;
+    let entry = tree
+        .get(&relative)
+        .ok_or_else(|| invalid("the executable argument is not a file in the workload"))?;
     if entry.kind != EntryKind::File {
-        return Err(invalid(format!(
-            "executable {executable:?} is not a file in the workload"
-        )));
+        return Err(invalid(
+            "the executable argument is not a file in the workload",
+        ));
     }
     if entry.mode & 0o111 == 0 {
-        return Err(invalid(format!(
-            "executable {executable:?} is not executable"
-        )));
+        return Err(invalid("the executable argument is not executable"));
     }
     let (uid, gid) = normalize_user(optional_string_value(
         oci.and_then(|oci| oci.get("User")),
@@ -927,6 +923,8 @@ fn apply_layer(tree: &mut Tree, members: Vec<Member>) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     fn dir(name: &str) -> Member {
@@ -961,6 +959,31 @@ mod tests {
             Entry::file(b"app".to_vec(), 0o755, 0, 0, 0),
         );
         tree
+    }
+
+    #[test]
+    fn a_launch_value_is_never_quoted_by_a_diagnostic() {
+        let tree = seeded();
+        let config_with = |entrypoint: Value| -> Map<String, Value> {
+            let mut launch = Map::new();
+            launch.insert("Entrypoint".into(), entrypoint);
+            let mut config = Map::new();
+            config.insert("architecture".into(), Value::String("amd64".into()));
+            config.insert("os".into(), Value::String("linux".into()));
+            config.insert("config".into(), Value::Object(launch));
+            config
+        };
+
+        // A correctly typed entrypoint whose first argument is not absolute.
+        let error =
+            normalize_launch(&config_with(json!(["SECRET=launch-marker"])), &tree).unwrap_err();
+        assert!(!error.to_string().contains("launch-marker"), "{error}");
+        assert!(error.to_string().contains("executable argument"), "{error}");
+
+        // A correctly typed entrypoint that is not in the workload.
+        let error = normalize_launch(&config_with(json!(["/bin/SECRET=launch-marker"])), &tree)
+            .unwrap_err();
+        assert!(!error.to_string().contains("launch-marker"), "{error}");
     }
 
     #[test]
