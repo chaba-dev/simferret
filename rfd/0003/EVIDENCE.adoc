@@ -1005,19 +1005,34 @@ The runtime enforces the RFD's launch and lifecycle rules:
 * The template is validated before any invocation. A package entry at `/tmp` or
   `/dev` must be a directory and is replaced by the overlay; a non-directory
   entry anywhere below those paths is rejected as an overlay collision. Special
-  files, entries beyond the count bound, and paths beyond the length bound are
-  rejected before any root is created.
+  files, entries beyond the canonical view bound, and paths beyond the canonical
+  path bound are rejected before any root is created. The runtime reuses the
+  assembler's constants and counts the template root the same way, so it never
+  rejects a template the assembler accepted.
 * Each invocation copies the template bytes and canonical metadata into a new
-  root, then synthesizes `/tmp` as a root-owned mode-`01777` directory, `/dev` as
-  a root-owned mode-`0755` directory, and `/dev/null` and `/dev/zero` as
-  mode-`0666` character devices `1:3` and `1:5`. The root is removed at the
-  cleanup barrier, so no invocation can observe a previous one.
+  root, skipping the `/tmp` and `/dev` subtrees so the overlay replaces them
+  instead of merging with them, then synthesizes `/tmp` as a root-owned
+  mode-`01777` directory, `/dev` as a root-owned mode-`0755` directory, and
+  `/dev/null` and `/dev/zero` as mode-`0666` character devices `1:3` and `1:5`.
+  The canonical root metadata is applied after the overlay, so creating it cannot
+  change the recorded directory timestamps. The root is removed at the cleanup
+  barrier, so no invocation can observe a previous one.
 * The child receives only fresh standard pipes; every other inherited descriptor
-  is closed. It then changes root, changes to the normalized working directory,
-  clears supplementary groups, sets `no_new_privs`, applies the nonzero GID and
-  UID, and executes the exact argument vector without a shell. Setup failures are
-  reported through a close-on-exec pipe as typed `launch-failed` events, so a
-  successful `execve` is unambiguous.
+  is closed, covering the whole descriptor table in two `close_range` calls so a
+  descriptor above any scan cap cannot leak. The close-on-exec flag is cleared
+  explicitly on the standard descriptors, because `dup2` leaves it alone when
+  both descriptors are equal. The child then restores the default `SIGPIPE`
+  disposition that Rust installs for itself, changes root, changes to the
+  normalized working directory, clears supplementary groups, sets
+  `no_new_privs`, applies the nonzero GID and UID, and executes the exact
+  argument vector without a shell. Setup failures are reported through a
+  close-on-exec pipe as typed `launch-failed` events, so a successful `execve` is
+  unambiguous.
+* Launch validation is one shared rule set: the executable and the working
+  directory must be absolute in-root paths, the first argument must name an
+  absolute in-root path without being required to equal the executed path, and
+  the argument and environment vectors are bounded. Diagnostics name the field
+  and never echo a caller-supplied argument or environment value.
 * The versioned process commands are `start`, `stdin-write`, `stdin-eof`, and
   `terminate`. `stdin-write` carries an invocation identifier, a strictly
   contiguous byte offset, and bounded hexadecimal exact bytes; `terminate` is an
@@ -1030,9 +1045,12 @@ The runtime enforces the RFD's launch and lifecycle rules:
   agent reports an infrastructure error rather than a workload property.
 * On primary exit or termination the runtime signals every member of the active
   invocation, reaps until only the agent remains, and drains both pipes to end of
-  file before emitting `cleanup-complete`. A new `start` is refused until that
-  barrier completes. The agent reports process and byte facts only; application
-  protocol interpretation remains in the host scenario checker.
+  file before emitting `cleanup-complete`. The reap and the signal are scoped to
+  the invocation: in guest scope they cover the whole process table, and in
+  process-group scope only the invocation's own process group, so a host test
+  cannot disturb or consume an unrelated child. A new `start` is refused until
+  that barrier completes. The agent reports process and byte facts only;
+  application protocol interpretation remains in the host scenario checker.
 
 === Checked-in evidence command
 
@@ -1050,21 +1068,33 @@ the host. A representative run produced:
 
 [source,text]
 ----
-running 12 tests
+running 24 tests
 test a_descendant_retaining_the_output_pipe_is_killed_by_the_cleanup_barrier ... ok
+test a_failed_materialization_leaves_no_partial_root ... ok
+test a_full_stdin_pipe_does_not_block_the_control_loop ... ok
+test a_member_that_closes_its_output_descriptors_is_still_reaped ... ok
 test a_missing_executable_is_a_typed_launch_failure ... ok
 test a_non_contiguous_offset_kills_the_invocation_and_is_fatal ... ok
+test a_package_directory_below_the_overlay_does_not_block_the_launch ... ok
 test a_second_start_is_refused_while_an_invocation_is_active ... ok
+test a_standard_pipe_that_lands_on_descriptor_zero_survives_exec ... ok
 test an_escaped_descendant_cannot_outlive_the_cleanup_barrier ... ok
+test an_inherited_descriptor_above_the_scan_cap_does_not_leak ... ok
+test an_invocation_does_not_steal_an_unrelated_child ... ok
+test an_invocation_identifier_cannot_be_reused ... ok
+test an_oci_normalized_launch_identity_runs ... ok
 test an_overlay_collision_is_rejected_before_any_invocation ... ok
+test an_unexecutable_file_reports_a_typed_launch_failure ... ok
 test each_invocation_materializes_a_fresh_root ... ok
-test live_output_frames_carry_exact_bytes_offsets_and_sequence ... ok
+test output_frames_are_contiguous_per_stream_and_sequenced ... ok
+test shutdown_reports_the_real_primary_exit_status ... ok
 test standard_input_round_trips_through_contiguous_offsets ... ok
 test terminate_kills_and_reaps_the_invocation ... ok
 test the_agent_drives_the_runtime_over_the_serial_control_channel ... ok
 test the_runtime_overlay_is_visible_inside_the_workload_root ... ok
+test the_workload_starts_with_the_default_sigpipe_disposition ... ok
 
-test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ----
 
 The fixture is the pinned static busybox copied into the template and executed as
@@ -1095,22 +1125,51 @@ argument vector, a malformed environment entry, and a relative working directory
 * a first invocation's `/tmp` mutation absent from a second invocation;
 * the overlay visible inside the workload root as character devices and a
   sticky, world-writable `/tmp`;
+* a package-provided empty directory tree below `/tmp` and a directory at
+  `/dev/null` not blocking the launch, with the overlay replacing the subtree
+  instead of merging with it, and the canonical root and `/dev` timestamps
+  preserved across overlay creation;
+* a copied template file bounded by the canonical file bound rather than by the
+  invocation's output budget, and the template entry bound and root-inclusive
+  entry count matching the assembler's;
 * a descendant that retains the output pipe being killed before the barrier can
   complete;
 * an escaped `setsid` descendant killed by the guest-wide barrier, which requires
-  the PID namespace the script provides;
-* a missing executable reported as a typed `launch-failed` event with no active
-  invocation;
+  the PID namespace the script provides. The descendant publishes its own
+  identifier after `setsid`, and the test confirms from the process table that it
+  really leads its own process group and session before terminating the primary,
+  so the test cannot pass because `setsid` silently failed;
+* a missing or unexecutable executable reported as a typed `launch-failed` event
+  with no active invocation and no surviving partial root;
 * an overlay collision rejected before the runtime root is created;
-* the agent driving the runtime over the real serial control channel, with
-  command-byte acknowledgements, live output attributed to the command being
-  handled while the workload ran, an exact output stream, `cleanup-complete`, and
+* an OCI-normalized launch identity whose first argument differs from the
+  executed path running, and launch diagnostics that never echo a caller value;
+* a writable inherited descriptor above the old descriptor-scan cap not reaching
+  the workload, and a standard input pipe that lands on descriptor `0` because
+  the agent closed its own surviving `execve`;
+* the workload starting with the default `SIGPIPE` disposition rather than the
+  one Rust installs for itself;
+* an invocation leaving an unrelated exited child of the agent alone, so the
+  agent can still observe that child's status;
+* the agent driving the runtime over the real serial control channel. The test
+  reads the event channel while the agent runs and waits for the agent to report
+  each state instead of sleeping, so it asserts an exact per-byte command
+  acknowledgement count, live output attributed to the command being handled
+  while the workload ran, an exact output stream, `cleanup-complete`, and
   `agent-stopped`.
+
+Output framing is asserted as a contract rather than a fixed split: per-stream
+offsets start at zero and stay contiguous, sequence numbers are contiguous across
+the whole series of frames, and the concatenated bytes per stream are exact.
 
 === Deliberate limits
 
 The host tests exercise the process-group scope for the ordinary descendant and
 the guest-wide scope only inside a PID namespace, because the guest-wide sweep
-must not signal unrelated host processes. Application protocol parsing, workload
-assertions, and the run manifest's workload identity remain Phase 3 work. The
-runtime reports no throughput or security claim beyond the accepted profile.
+must not signal unrelated host processes. In process-group scope the reap is
+scoped to the invocation's own process group, so a host test cannot lose an
+unrelated child it still needs to observe. Application protocol parsing, workload
+assertions, and the run manifest's workload identity remain Phase 3 work, and so
+does a recorded QEMU acceptance of this runtime: the checked-in phase 2 evidence
+is the host PID-namespace script above. The runtime reports no throughput or
+security claim beyond the accepted profile.
