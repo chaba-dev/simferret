@@ -132,8 +132,7 @@ pub fn parse_graph(objects: &OciObjects) -> io::Result<OciGraph> {
     let layout = as_object(&layout_value, "oci-layout")?;
     if required_string(layout, "imageLayoutVersion", "oci-layout")? != LAYOUT_VERSION {
         return Err(invalid(format!(
-            "unsupported image layout version {:?}",
-            layout.get("imageLayoutVersion")
+            "unsupported image layout version; expected {LAYOUT_VERSION:?}"
         )));
     }
     let index_value = parse_json(&objects.index, "index")?;
@@ -203,7 +202,7 @@ pub fn parse_graph(objects: &OciObjects) -> io::Result<OciGraph> {
             .ok_or_else(|| invalid(format!("layer {position} has no media type")))?;
         if media_type != PLAIN_LAYER_MEDIA_TYPE && media_type != GZIP_LAYER_MEDIA_TYPE {
             return Err(invalid(format!(
-                "unsupported layer media type {media_type:?}"
+                "layer {position} has an unsupported media type; expected an OCI tar or tar+gzip layer"
             )));
         }
         verify_descriptor(&descriptor, data, &format!("layer {position}"))?;
@@ -217,7 +216,7 @@ pub fn parse_graph(objects: &OciObjects) -> io::Result<OciGraph> {
                 "layer {position} DiffID does not match uncompressed bytes"
             )));
         }
-        apply_layer(&mut tree, parse_layer(&expanded)?)?;
+        apply_layer(&mut tree, parse_layer(&expanded, position)?)?;
         // Bounds are enforced after every layer so a hostile multi-layer image
         // cannot accumulate an unbounded intermediate tree before the final
         // check. The same check runs on replay, which shares this path.
@@ -317,10 +316,9 @@ fn select_manifest_descriptor(index: &Value, manifest_digest: &str) -> io::Resul
     }
     let descriptor = parse_descriptor(selected[0], "selected")?;
     if descriptor.media_type.as_deref() != Some(MANIFEST_MEDIA_TYPE) {
-        return Err(invalid(format!(
-            "selected descriptor media type {:?}",
-            descriptor.media_type
-        )));
+        return Err(invalid(
+            "the selected descriptor is not an OCI image manifest",
+        ));
     }
     let platform = selected[0]
         .get("platform")
@@ -532,9 +530,9 @@ fn expand_layer(data: &[u8], media_type: &str) -> io::Result<Vec<u8>> {
         return Ok(data.to_vec());
     }
     if media_type != GZIP_LAYER_MEDIA_TYPE {
-        return Err(invalid(format!(
-            "unsupported layer media type {media_type:?}"
-        )));
+        return Err(invalid(
+            "the layer has an unsupported media type; expected an OCI tar or tar+gzip layer",
+        ));
     }
     let mut expanded = Vec::new();
     MultiGzDecoder::new(data)
@@ -575,31 +573,35 @@ impl Marker {
 /// distinguish it from a payload, so it is refused rather than reinterpreted.
 fn reject_declared_size<R: std::io::Read>(
     entry: &mut tar::Entry<'_, R>,
-    name: &[u8],
+    layer: usize,
+    member: usize,
 ) -> io::Result<()> {
-    let size = entry
-        .header()
-        .size()
-        .map_err(|error| invalid(format!("malformed layer archive: {error}")))?;
+    let size = entry.header().size().map_err(|_| {
+        invalid(format!(
+            "layer {layer} member {member} has a malformed size field"
+        ))
+    })?;
     if size != 0 {
         return Err(invalid(format!(
-            "nonzero size at {:?}",
-            String::from_utf8_lossy(name)
+            "layer {layer} member {member} declares a nonzero size"
         )));
     }
     Ok(())
 }
 
-fn parse_layer(expanded: &[u8]) -> io::Result<Vec<Member>> {
+fn parse_layer(expanded: &[u8], layer: usize) -> io::Result<Vec<Member>> {
     let mut archive = tar::Archive::new(std::io::Cursor::new(expanded));
     let entries = archive
         .entries()
-        .map_err(|error| invalid(format!("malformed layer archive: {error}")))?;
+        .map_err(|_| invalid(format!("layer {layer} has a malformed archive header")))?;
     let mut members = Vec::new();
     let mut end_of_last_member = 0_u64;
-    for entry in entries.raw(true) {
-        let mut entry =
-            entry.map_err(|error| invalid(format!("malformed layer archive: {error}")))?;
+    for (member, entry) in entries.raw(true).enumerate() {
+        let mut entry = entry.map_err(|_| {
+            invalid(format!(
+                "layer {layer} member {member} has a malformed header"
+            ))
+        })?;
         // The raw iterator advances by the declared size, so this is the physical
         // end of the member: its header, its data, and any padding.
         let padded_size = entry
@@ -613,107 +615,104 @@ fn parse_layer(expanded: &[u8]) -> io::Result<Vec<Member>> {
             .ok_or_else(|| invalid("malformed layer archive: member size overflow"))?;
         let entry_type = entry.header().entry_type();
         let name = normalize_layer_path(&entry.path_bytes())?;
-        let mode = entry
-            .header()
-            .mode()
-            .map_err(|error| invalid(format!("malformed layer archive: {error}")))?;
+        let mode = entry.header().mode().map_err(|_| {
+            invalid(format!(
+                "layer {layer} member {member} has a malformed mode field"
+            ))
+        })?;
         if mode > 0o7777 {
             return Err(invalid(format!(
-                "unsupported mode at {:?}",
-                String::from_utf8_lossy(&name)
+                "layer {layer} member {member} has an unsupported mode"
             )));
         }
         if mode & 0o6000 != 0 {
             return Err(invalid(format!(
-                "setuid or setgid mode at {:?}",
-                String::from_utf8_lossy(&name)
+                "layer {layer} member {member} is setuid or setgid"
             )));
         }
-        let uid = entry
-            .header()
-            .uid()
-            .map_err(|error| invalid(format!("malformed layer archive: {error}")))?;
-        let gid = entry
-            .header()
-            .gid()
-            .map_err(|error| invalid(format!("malformed layer archive: {error}")))?;
-        let mtime = entry
-            .header()
-            .mtime()
-            .map_err(|error| invalid(format!("malformed layer archive: {error}")))?;
+        let uid = entry.header().uid().map_err(|_| {
+            invalid(format!(
+                "layer {layer} member {member} has a malformed uid field"
+            ))
+        })?;
+        let gid = entry.header().gid().map_err(|_| {
+            invalid(format!(
+                "layer {layer} member {member} has a malformed gid field"
+            ))
+        })?;
+        let mtime = entry.header().mtime().map_err(|_| {
+            invalid(format!(
+                "layer {layer} member {member} has a malformed mtime field"
+            ))
+        })?;
         if uid >= u32::MAX as u64 || gid >= u32::MAX as u64 {
             return Err(invalid(format!(
-                "ownership out of range at {:?}",
-                String::from_utf8_lossy(&name)
+                "layer {layer} member {member} has an out-of-range ownership"
             )));
         }
         if mtime > u32::MAX as u64 {
             return Err(invalid(format!(
-                "timestamp out of range at {:?}",
-                String::from_utf8_lossy(&name)
+                "layer {layer} member {member} has an out-of-range timestamp"
             )));
         }
         let entry = match entry_type {
             tar::EntryType::Directory => {
                 // USTAR records no data for a directory, so a nonzero declared
                 // size would silently skip physical bytes.
-                reject_declared_size(&mut entry, &name)?;
+                reject_declared_size(&mut entry, layer, member)?;
                 Entry::directory(mode, uid as u32, gid as u32, mtime as u32)
             }
             tar::EntryType::Symlink => {
-                reject_declared_size(&mut entry, &name)?;
+                reject_declared_size(&mut entry, layer, member)?;
                 let target = entry
                     .header()
                     .link_name_bytes()
                     .ok_or_else(|| {
                         invalid(format!(
-                            "symbolic link at {:?} has no target",
-                            String::from_utf8_lossy(&name)
+                            "layer {layer} member {member} is a symbolic link with no target"
                         ))
                     })?
                     .into_owned();
-                validate_symlink_syntax(&name, &target)?;
+                validate_symlink_syntax(&target)?;
                 Entry::symlink(target, uid as u32, gid as u32, mtime as u32)
             }
             tar::EntryType::Regular => {
-                let size = entry
-                    .header()
-                    .size()
-                    .map_err(|error| invalid(format!("malformed layer archive: {error}")))?;
+                let size = entry.header().size().map_err(|_| {
+                    invalid(format!(
+                        "layer {layer} member {member} has a malformed size field"
+                    ))
+                })?;
                 if size > MAX_FILE_BYTES as u64 {
                     return Err(invalid(format!(
-                        "file {:?} exceeds {MAX_FILE_BYTES} bytes",
-                        String::from_utf8_lossy(&name)
+                        "layer {layer} member {member} is a file over {MAX_FILE_BYTES} bytes"
                     )));
                 }
                 let mut data = Vec::new();
-                entry
-                    .read_to_end(&mut data)
-                    .map_err(|error| invalid(format!("malformed layer archive: {error}")))?;
+                entry.read_to_end(&mut data).map_err(|_| {
+                    invalid(format!(
+                        "layer {layer} member {member} is an unreadable file"
+                    ))
+                })?;
                 if data.len() as u64 != size {
                     return Err(invalid(format!(
-                        "truncated file at {:?}",
-                        String::from_utf8_lossy(&name)
+                        "layer {layer} member {member} is a truncated file"
                     )));
                 }
                 Entry::file(data, mode, uid as u32, gid as u32, mtime as u32)
             }
             tar::EntryType::Link => {
                 return Err(invalid(format!(
-                    "hard link at {:?}",
-                    String::from_utf8_lossy(&name)
+                    "layer {layer} member {member} is a hard link, which is unsupported"
                 )));
             }
             tar::EntryType::Char | tar::EntryType::Block | tar::EntryType::Fifo => {
                 return Err(invalid(format!(
-                    "unsupported file type at {:?}",
-                    String::from_utf8_lossy(&name)
+                    "layer {layer} member {member} has an unsupported file type"
                 )));
             }
             tar::EntryType::GNUSparse => {
                 return Err(invalid(format!(
-                    "sparse file at {:?}",
-                    String::from_utf8_lossy(&name)
+                    "layer {layer} member {member} is a sparse file, which is unsupported"
                 )));
             }
             tar::EntryType::GNULongName
@@ -721,14 +720,12 @@ fn parse_layer(expanded: &[u8]) -> io::Result<Vec<Member>> {
             | tar::EntryType::XHeader
             | tar::EntryType::XGlobalHeader => {
                 return Err(invalid(format!(
-                    "unsupported extended metadata at {:?}",
-                    String::from_utf8_lossy(&name)
+                    "layer {layer} member {member} carries unsupported extended metadata"
                 )));
             }
             _ => {
                 return Err(invalid(format!(
-                    "unsupported file type at {:?}",
-                    String::from_utf8_lossy(&name)
+                    "layer {layer} member {member} has an unsupported file type"
                 )));
             }
         };
@@ -767,28 +764,19 @@ fn split_marker(member: &Member) -> io::Result<Option<Marker>> {
     };
     for component in parents {
         if component.starts_with(b".wh.") {
-            return Err(invalid(format!(
-                "whiteout marker {:?} is not a basename",
-                String::from_utf8_lossy(component)
-            )));
+            return Err(invalid("a whiteout marker is not a basename"));
         }
     }
     let parent = parent_of(&member.name).unwrap_or_else(|| b".".to_vec());
     if *base == b".wh..wh..opq" {
         if member.entry.kind != EntryKind::File || !is_empty_file(&member.entry) {
-            return Err(invalid(format!(
-                "opaque marker at {:?} is not an empty regular file",
-                String::from_utf8_lossy(&member.name)
-            )));
+            return Err(invalid("an opaque marker must be an empty regular file"));
         }
         return Ok(Some(Marker::Opaque(parent)));
     }
     if base.starts_with(b".wh.") {
         if member.entry.kind != EntryKind::File || !is_empty_file(&member.entry) {
-            return Err(invalid(format!(
-                "whiteout marker at {:?} is not an empty regular file",
-                String::from_utf8_lossy(&member.name)
-            )));
+            return Err(invalid("a whiteout marker must be an empty regular file"));
         }
         let target = &base[4..];
         if target.is_empty()
@@ -797,10 +785,7 @@ fn split_marker(member: &Member) -> io::Result<Option<Marker>> {
             || target.contains(&b'/')
             || target.contains(&0)
         {
-            return Err(invalid(format!(
-                "invalid whiteout marker at {:?}",
-                String::from_utf8_lossy(&member.name)
-            )));
+            return Err(invalid("invalid whiteout marker target"));
         }
         return Ok(Some(Marker::Whiteout(join_path(&parent, target))));
     }
@@ -817,10 +802,7 @@ fn apply_layer(tree: &mut Tree, members: Vec<Member>) -> io::Result<()> {
     let mut additions = Vec::new();
     for member in &members {
         if !seen.insert(&member.name) {
-            return Err(invalid(format!(
-                "duplicate layer path {:?}",
-                String::from_utf8_lossy(&member.name)
-            )));
+            return Err(invalid("a layer contains duplicate normalized paths"));
         }
         match split_marker(member)? {
             None => additions.push(member),
@@ -856,11 +838,7 @@ fn apply_layer(tree: &mut Tree, members: Vec<Member>) -> io::Result<()> {
                 && entry.kind == EntryKind::Symlink
                 && !provided_directories.contains(&ancestor)
             {
-                return Err(invalid(format!(
-                    "marker {:?} traverses symlink {:?}",
-                    String::from_utf8_lossy(marker.target()),
-                    String::from_utf8_lossy(&ancestor)
-                )));
+                return Err(invalid("a layer marker traverses a symbolic link"));
             }
         }
     }
@@ -879,12 +857,7 @@ fn apply_layer(tree: &mut Tree, members: Vec<Member>) -> io::Result<()> {
             if let Some(entry) = tree.get(&ancestor)
                 && entry.kind != EntryKind::Directory
             {
-                return Err(invalid(format!(
-                    "path {:?} traverses {} {:?}",
-                    String::from_utf8_lossy(&member.name),
-                    entry.kind.name(),
-                    String::from_utf8_lossy(&ancestor)
-                )));
+                return Err(invalid("a layer path traverses a non-directory ancestor"));
             }
         }
         for ancestor in ancestors(&member.name) {
@@ -914,10 +887,7 @@ fn apply_layer(tree: &mut Tree, members: Vec<Member>) -> io::Result<()> {
             && let Some(entry) = tree.get(target)
             && entry.kind != EntryKind::Directory
         {
-            return Err(invalid(format!(
-                "opaque marker on non-directory {:?}",
-                String::from_utf8_lossy(target)
-            )));
+            return Err(invalid("an opaque marker targets a non-directory entry"));
         }
     }
     Ok(())
@@ -1007,6 +977,100 @@ mod tests {
         assert!(error.to_string().contains("recorded manifest"), "{error}");
     }
 
+    /// One raw USTAR member with a chosen entry type, declared size, and raw mode
+    /// bytes, so a test can present a header the typed writer would never emit.
+    fn raw_member(
+        name: &[u8],
+        entry_type: tar::EntryType,
+        declared_size: u64,
+        raw_mode: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let mut header = tar::Header::new_ustar();
+        header.set_mode(0o644);
+        header.set_size(declared_size);
+        header.set_mtime(0);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_entry_type(entry_type);
+        {
+            let bytes = header.as_mut_bytes();
+            bytes[..name.len()].copy_from_slice(name);
+            if let Some(mode) = raw_mode {
+                bytes[100..100 + mode.len()].copy_from_slice(mode);
+            }
+        }
+        header.set_cksum();
+        header.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn layer_diagnostics_never_quote_artifact_content() {
+        // The member path, the media type, and the numeric header fields all come
+        // from the artifact, so a rejected layer names the category only.
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (
+                raw_member(b"/SECRET=CANARY", tar::EntryType::Regular, 0, None),
+                "absolute layer paths are unsupported",
+            ),
+            (
+                raw_member(b"../SECRET=CANARY", tar::EntryType::Regular, 0, None),
+                "'..' components",
+            ),
+            (
+                raw_member(
+                    b"etc/SECRET=CANARY",
+                    tar::EntryType::Regular,
+                    0,
+                    Some(b"CANARY"),
+                ),
+                "malformed mode field",
+            ),
+            (
+                raw_member(b"etc/SECRET=CANARY", tar::EntryType::Link, 0, None),
+                "hard link",
+            ),
+            (
+                raw_member(
+                    b"etc/SECRET=CANARY",
+                    tar::EntryType::Regular,
+                    MAX_FILE_BYTES as u64 + 1,
+                    None,
+                ),
+                "over",
+            ),
+        ];
+        for (member, expected) in cases {
+            let error = match parse_layer(&member, 0) {
+                Ok(_) => panic!("{expected}: the layer was accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert!(!error.contains("CANARY"), "{expected}: {error}");
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+
+        // The tree-level rejections name no path either.
+        let mut tree = seeded();
+        tree.insert(
+            b"redirect".to_vec(),
+            Entry::symlink(b"elsewhere".to_vec(), 0, 0, 0),
+        );
+        let error = apply_layer(&mut tree, vec![file("redirect/.wh.SECRET=CANARY", b"")])
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("CANARY"), "{error}");
+        assert!(error.contains("traverses a symbolic link"), "{error}");
+
+        let mut tree = seeded();
+        let error = apply_layer(
+            &mut tree,
+            vec![file("SECRET=CANARY", b"one"), file("SECRET=CANARY", b"two")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("CANARY"), "{error}");
+        assert!(error.contains("duplicate normalized paths"), "{error}");
+    }
+
     #[test]
     fn duplicate_paths_in_one_layer_are_rejected() {
         let mut tree = seeded();
@@ -1016,7 +1080,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            error.to_string().contains("duplicate layer path"),
+            error.to_string().contains("duplicate normalized paths"),
             "{error}"
         );
     }
@@ -1077,7 +1141,10 @@ mod tests {
             Entry::symlink(b"elsewhere".to_vec(), 0, 0, 0),
         );
         let error = apply_layer(&mut tree, vec![file("redirect/.wh.victim", b"")]).unwrap_err();
-        assert!(error.to_string().contains("traverses symlink"), "{error}");
+        assert!(
+            error.to_string().contains("traverses a symbolic link"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1098,14 +1165,17 @@ mod tests {
             Entry::file(b"file".to_vec(), 0o644, 0, 0, 0),
         );
         let error = apply_layer(&mut tree, vec![file("etc/config", b"x")]).unwrap_err();
-        assert!(error.to_string().contains("traverses file"), "{error}");
+        assert!(
+            error.to_string().contains("non-directory ancestor"),
+            "{error}"
+        );
     }
 
     #[test]
     fn symlink_targets_are_validated_when_read() {
-        assert!(validate_symlink_syntax(b"link", b"").is_err());
-        assert!(validate_symlink_syntax(b"link", b"/abs").is_err());
-        assert!(validate_symlink_syntax(b"link", b"rel").is_ok());
+        assert!(validate_symlink_syntax(b"").is_err());
+        assert!(validate_symlink_syntax(b"/abs").is_err());
+        assert!(validate_symlink_syntax(b"rel").is_ok());
     }
 
     #[test]
