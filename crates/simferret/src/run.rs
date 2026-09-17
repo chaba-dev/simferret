@@ -164,7 +164,10 @@ struct FailureDiagnostics {
 struct FaultTransitionDiagnostic {
     event_id: u64,
     transition: &'static str,
-    peer_cidr: String,
+    /// The validated peer of the run's fixed network profile. The event's own
+    /// string is never copied: a diverging frame can carry any bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_cidr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rule: Option<String>,
 }
@@ -222,20 +225,24 @@ impl FailureDiagnostics {
     }
 
     fn observe(&mut self, event: &NormalizedEvent) {
+        // A fault transition is reported from the validated network profile the
+        // run configured, never from the strings the guest reported: a diverging
+        // frame can carry any bytes in its peer or rule field.
+        let fault = self.network.as_ref().map(|network| &network.fault);
         match &event.event {
-            Event::OutageActivated { peer_cidr, rule } => {
+            Event::OutageActivated { .. } => {
                 self.fault_transitions.push(FaultTransitionDiagnostic {
                     event_id: event.event_id,
                     transition: "activated",
-                    peer_cidr: peer_cidr.clone(),
-                    rule: Some(rule.clone()),
+                    peer_cidr: fault.map(|fault| fault.peer_cidr.clone()),
+                    rule: fault.map(|fault| fault.rule.clone()),
                 });
             }
-            Event::NetworkRestored { peer_cidr } => {
+            Event::NetworkRestored { .. } => {
                 self.fault_transitions.push(FaultTransitionDiagnostic {
                     event_id: event.event_id,
                     transition: "restored",
-                    peer_cidr: peer_cidr.clone(),
+                    peer_cidr: fault.map(|fault| fault.peer_cidr.clone()),
                     rule: None,
                 });
             }
@@ -3141,6 +3148,9 @@ mod tests {
         /// Write a failing tail while the host waits for the end-of-input
         /// acknowledgement, then acknowledge it and stay alive.
         failing_tail_before_eof: Option<FailingTail>,
+        /// Report an outage activation whose peer and rule carry a marker, as a
+        /// diverging guest would.
+        forged_outage_activation: bool,
         /// Exit cleanly once the current invocation has answered this many
         /// requests, before the host can end its input.
         exit_after_fetch: Option<u64>,
@@ -3159,6 +3169,7 @@ mod tests {
         exit_on_outage: bool,
         divergent_workload_launch: bool,
         late_tail_after_response: bool,
+        forged_outage_activation: bool,
         recorded_events: Arc<Mutex<Vec<EventFrame>>>,
     }
 
@@ -3229,6 +3240,7 @@ mod tests {
                 over_bound_tail_after_response: false,
                 late_tail_after_response: self.late_tail_after_response,
                 failing_tail_before_eof: None,
+                forged_outage_activation: self.forged_outage_activation,
                 exit_after_fetch: None,
                 pending_tail: None,
             })
@@ -3633,13 +3645,16 @@ mod tests {
                     self.running = false;
                     self.workload.network_up = false;
                     self.outage_active = true;
-                    self.event(
-                        frame.command_id,
-                        Event::OutageActivated {
-                            peer_cidr: peer_cidr.clone(),
-                            rule: format!("prohibit {peer_cidr}"),
-                        },
-                    );
+                    let (peer_cidr, rule) = if self.forged_outage_activation {
+                        // A diverging guest can put any bytes in these fields.
+                        (
+                            "TOKEN=CANARY/32".to_owned(),
+                            "prohibit TOKEN=CANARY/32".to_owned(),
+                        )
+                    } else {
+                        (peer_cidr.clone(), format!("prohibit {peer_cidr}"))
+                    };
+                    self.event(frame.command_id, Event::OutageActivated { peer_cidr, rule });
                 }
                 Command::RestoreNetwork { peer_cidr } => {
                     self.running = true;
@@ -3937,6 +3952,7 @@ mod tests {
             over_bound_tail_after_response: false,
             late_tail_after_response: false,
             failing_tail_before_eof: None,
+            forged_outage_activation: false,
             exit_after_fetch: None,
             pending_tail: None,
         };
@@ -3998,6 +4014,7 @@ mod tests {
             exit_on_outage: false,
             divergent_workload_launch: false,
             late_tail_after_response: false,
+            forged_outage_activation: false,
             recorded_events: Arc::new(Mutex::new(Vec::new())),
         };
         let result = record_with_adapter(
@@ -4963,6 +4980,7 @@ mod tests {
             exit_on_outage: false,
             divergent_workload_launch: false,
             late_tail_after_response: false,
+            forged_outage_activation: false,
             recorded_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -5741,6 +5759,36 @@ mod tests {
     }
 
     #[test]
+    fn a_rejected_guest_fault_transition_never_reaches_the_failure_bundle() {
+        // The guest's own event strings are unvalidated: a diverging activation
+        // can carry any bytes. Neither the error text nor the retained bundle may
+        // copy them, and the report still names the validated profile.
+        let root = temporary_root("fault-transition-privacy");
+        let options = workload_options(&root, false);
+        let mut adapter = fake_adapter(None);
+        adapter.forged_outage_activation = true;
+        let error = record_with_adapter(&options, &adapter).unwrap_err();
+        assert!(!error.to_string().contains("CANARY"), "{error}");
+        assert!(error.to_string().contains("outage_activated"), "{error}");
+
+        let bundle = only_failure_bundle(&options.runs_directory);
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle.join("failure.json")).unwrap()).unwrap();
+        let transitions = report["diagnostics"]["fault_transitions"]
+            .as_array()
+            .expect("the failure bundle retains the fault transition");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0]["transition"], "activated");
+        assert_eq!(transitions[0]["peer_cidr"], "10.0.2.2/32");
+        assert_eq!(transitions[0]["rule"], "prohibit 10.0.2.2/32");
+        assert!(
+            !serde_json::to_string(&report).unwrap().contains("CANARY"),
+            "{report}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn an_over_bound_tail_after_a_matching_response_stops_the_run() {
         // The expected response is valid, but the unfinished tail that follows it
         // can never be, so the driver must stop rather than continue to the next
@@ -5901,6 +5949,7 @@ mod tests {
             over_bound_tail_after_response: false,
             late_tail_after_response: false,
             failing_tail_before_eof: None,
+            forged_outage_activation: false,
             exit_after_fetch: None,
             pending_tail: None,
         }
@@ -6083,6 +6132,7 @@ mod tests {
             over_bound_tail_after_response: false,
             late_tail_after_response: false,
             failing_tail_before_eof: None,
+            forged_outage_activation: false,
             exit_after_fetch: None,
             pending_tail: None,
         }
