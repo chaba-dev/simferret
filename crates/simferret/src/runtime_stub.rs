@@ -36,8 +36,12 @@ pub struct RuntimeLimits {
     pub output_bytes: usize,
     pub input_frame_bytes: usize,
     pub output_frame_bytes: usize,
+    /// Bounds the template walk. Kept identical to the Linux runtime and to the
+    /// canonical view bound the assembler enforces.
     pub template_entries: usize,
     pub template_path_bytes: usize,
+    /// Bounds one copied template file, independent of the output byte budget.
+    pub file_bytes: usize,
 }
 
 impl Default for RuntimeLimits {
@@ -47,8 +51,9 @@ impl Default for RuntimeLimits {
             output_bytes: crate::protocol::MAX_INVOCATION_OUTPUT_BYTES,
             input_frame_bytes: crate::protocol::MAX_STDIN_FRAME_BYTES,
             output_frame_bytes: crate::protocol::MAX_OUTPUT_FRAME_BYTES,
-            template_entries: 1 << 14,
-            template_path_bytes: 1024,
+            template_entries: crate::workload::MAX_VIEW_ENTRIES,
+            template_path_bytes: crate::workload::MAX_PATH_BYTES,
+            file_bytes: crate::workload::MAX_FILE_BYTES,
         }
     }
 }
