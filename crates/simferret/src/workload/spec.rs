@@ -287,7 +287,7 @@ pub fn normalize_environment(values: &[String]) -> io::Result<Vec<String>> {
     }
     let mut total = 0;
     let mut seen: Vec<&str> = Vec::new();
-    for entry in values {
+    for (index, entry) in values.iter().enumerate() {
         if entry.len() > MAX_ENVIRONMENT_ENTRY_BYTES {
             return Err(invalid(format!(
                 "environment entry exceeds {MAX_ENVIRONMENT_ENTRY_BYTES} bytes"
@@ -302,14 +302,16 @@ pub fn normalize_environment(values: &[String]) -> io::Result<Vec<String>> {
         if entry.contains('\0') {
             return Err(invalid("environment entry contains a NUL byte"));
         }
+        // The entry index is reported instead of the entry, because an
+        // environment value is a secret that must not reach a diagnostic.
         let Some((name, _)) = entry.split_once('=') else {
             return Err(invalid(format!(
-                "environment entry {entry:?} is not NAME=VALUE"
+                "environment entry {index} is not NAME=VALUE"
             )));
         };
         if name.is_empty() {
             return Err(invalid(format!(
-                "environment entry {entry:?} is not NAME=VALUE"
+                "environment entry {index} is not NAME=VALUE"
             )));
         }
         if seen.contains(&name) {

@@ -24,6 +24,12 @@ pub const WORKLOAD_CHOICE_PLAN_VERSION: u16 = 1;
 /// the request sequence and keep it distinct from both fault transitions, so it
 /// needs at least one request before the fault and one after.
 pub const MIN_WORKLOAD_REQUEST_COUNT: usize = 4;
+/// The pinned acceptance fixture accepts only `[A-Za-z0-9_-]` tokens shorter than
+/// 128 bytes, and a planned payload is hex-encoded before it is written to the
+/// fixture's stdin, so a payload may not exceed 63 bytes. The bound is a property
+/// of the fixture contract, not of the transport, and is checked here so an
+/// oversized payload fails during preparation instead of inside the guest.
+pub const MAX_WORKLOAD_PAYLOAD_BYTES: usize = 63;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -127,10 +133,9 @@ impl WorkloadScenario {
                 "request_count must be between {MIN_WORKLOAD_REQUEST_COUNT} and {MAX_REQUEST_COUNT}"
             )));
         }
-        if self.payload_bytes == 0 || self.payload_bytes > MAX_REQUEST_DATA_LENGTH / 4 {
+        if self.payload_bytes == 0 || self.payload_bytes > MAX_WORKLOAD_PAYLOAD_BYTES {
             return Err(invalid(format!(
-                "payload_bytes must be between 1 and {}",
-                MAX_REQUEST_DATA_LENGTH / 4
+                "payload_bytes must be between 1 and {MAX_WORKLOAD_PAYLOAD_BYTES}, because the fixture's hex-encoded token must stay under 128 bytes"
             )));
         }
         let total_payload_bytes = self
@@ -448,6 +453,16 @@ mod tests {
 
         invalid = workload_scenario();
         invalid.liveness_event_bound = 1;
+        assert!(invalid.validate().is_err());
+
+        // The fixture's hex-encoded token must stay under its 128-byte limit, so
+        // a payload at the transport bound is rejected during preparation.
+        invalid = workload_scenario();
+        invalid.payload_bytes = MAX_WORKLOAD_PAYLOAD_BYTES + 1;
+        assert!(invalid.validate().is_err());
+
+        invalid = workload_scenario();
+        invalid.payload_bytes = MAX_REQUEST_DATA_LENGTH / 4;
         assert!(invalid.validate().is_err());
     }
 

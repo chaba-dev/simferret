@@ -216,7 +216,12 @@ pub fn assemble(specification: &Path, store: &Path) -> io::Result<AssembledWorkl
 /// canonical tree and encoded guest template. No live source is consulted.
 pub fn load(store: &Path) -> io::Result<LoadedWorkload> {
     let root = Root::open(store)?;
-    let closure_bytes = root.read_file(RAW_CLOSURE_PATH, MAX_CACHE_METADATA_BYTES)?;
+    let closure_bytes = read_required(
+        &root,
+        RAW_CLOSURE_PATH,
+        MAX_CACHE_METADATA_BYTES,
+        &format!("raw closure {RAW_CLOSURE_PATH}"),
+    )?;
     let closure_sha256 = sha256_bytes(&closure_bytes);
     let closure: Closure = serde_json::from_slice(&closure_bytes)
         .map_err(|error| invalid(format!("malformed raw closure: {error}")))?;
