@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -552,8 +552,6 @@ fn record_workload_scenario(
         &choices,
         &loaded.launch,
         vm.as_mut(),
-        true,
-        None,
         diagnostics,
     )?;
     diagnostics.stage = "shutdown".into();
@@ -957,15 +955,12 @@ fn replay_workload_scenario(
     diagnostics.stage = "launch".into();
     let mut vm = adapter.launch_replay(&config, &manifest.vm)?;
     diagnostics.stage = "execution".into();
-    let (events, assertions) = drive_workload_scenario(
-        &scenario,
-        &choices,
-        &loaded.launch,
-        vm.as_mut(),
-        false,
-        Some(&expected_events),
-        diagnostics,
-    )?;
+    let frames = replay_workload_events(&expected_events, vm.as_mut(), diagnostics)?;
+    let events = frames
+        .iter()
+        .map(EventFrame::normalize)
+        .collect::<Vec<NormalizedEvent>>();
+    let assertions = evaluate_workload(&frames, &scenario, &choices, &loaded.launch);
     diagnostics.stage = "shutdown".into();
     let status = vm.wait()?;
     if !status.success() {
@@ -1489,6 +1484,52 @@ fn is_terminal_workload_event(event: &Event) -> bool {
     )
 }
 
+/// Consume and compare the recorded workload event stream.
+///
+/// A replayed guest reproduces the recorded execution, including the input it
+/// received, so the host sends nothing and must not re-decide the command
+/// schedule from its own queue timing: it reads exactly the recorded events,
+/// requires each to match byte for byte, and then lets the checker recompute the
+/// report from them.
+fn replay_workload_events(
+    expected: &[NormalizedEvent],
+    vm: &mut dyn RunningVm,
+    diagnostics: &mut FailureDiagnostics,
+) -> io::Result<Vec<EventFrame>> {
+    let Some(last) = expected.last() else {
+        return Err(invalid_data("the recording has no normalized events"));
+    };
+    if !matches!(last.event, Event::AgentStopped {}) {
+        return Err(invalid_data(
+            "the recorded event stream does not end with agent-stopped",
+        ));
+    }
+    let mut frames = Vec::with_capacity(expected.len());
+    for (index, expected) in expected.iter().enumerate() {
+        let frame = vm.receive()?;
+        if frame.protocol_version != PROTOCOL_VERSION || frame.event_id != expected.event_id {
+            return Err(invalid_data(format!(
+                "unexpected event envelope at index {index}: version={}, event_id={} (expected event {})",
+                frame.protocol_version, frame.event_id, expected.event_id
+            )));
+        }
+        let normalized = frame.normalize();
+        if &normalized != expected {
+            return Err(invalid_data(format!(
+                "normalized event divergence at index {index}: expected {} at event {}, found {} at event {}",
+                expected.event.describe(),
+                expected.event_id,
+                normalized.event.describe(),
+                normalized.event_id
+            )));
+        }
+        diagnostics.observe(&normalized);
+        frames.push(frame);
+    }
+    vm.finish_events()?;
+    Ok(frames)
+}
+
 /// The workload control loop. Unlike the network controller, responses to a
 /// command are interleaved with live output frames, so it reads until the
 /// expected typed event or response line appears and folds every frame into the
@@ -1496,62 +1537,43 @@ fn is_terminal_workload_event(event: &Event) -> bool {
 struct WorkloadController<'a> {
     vm: &'a mut dyn RunningVm,
     diagnostics: &'a mut FailureDiagnostics,
-    send_commands: bool,
-    expected_events: Option<Vec<NormalizedEvent>>,
     next_command_id: u64,
     next_event_id: u64,
     raw_events: Vec<EventFrame>,
     events: Vec<NormalizedEvent>,
     trace: WorkloadTrace,
     consumed_lines: BTreeMap<u64, usize>,
-    /// Events that arrived ahead of the command they belong to. Passive replay
-    /// can deliver a guest's events faster than the driver issues their commands,
-    /// so a drain stops at the first event for an unissued command and keeps it
-    /// here, preserving the exact read order.
-    pending: VecDeque<EventFrame>,
 }
 
 impl<'a> WorkloadController<'a> {
-    fn new(
-        vm: &'a mut dyn RunningVm,
-        send_commands: bool,
-        expected_events: Option<&[NormalizedEvent]>,
-        diagnostics: &'a mut FailureDiagnostics,
-    ) -> Self {
+    fn new(vm: &'a mut dyn RunningVm, diagnostics: &'a mut FailureDiagnostics) -> Self {
         Self {
             vm,
             diagnostics,
-            send_commands,
-            expected_events: expected_events.map(<[NormalizedEvent]>::to_vec),
             next_command_id: 1,
             next_event_id: 1,
             raw_events: Vec::new(),
             events: Vec::new(),
             trace: WorkloadTrace::default(),
             consumed_lines: BTreeMap::new(),
-            pending: VecDeque::new(),
         }
     }
 
-    /// Assign a command identifier and send the command when this run is a live
-    /// recording. Passive replay only advances the identifier, so the expected
-    /// envelope stays identical.
+    /// Assign a command identifier and send the command.
     fn issue(&mut self, command: Command) -> io::Result<u64> {
         let command_id = self.next_command_id;
         self.next_command_id += 1;
-        if self.send_commands {
-            self.vm.send(&CommandFrame {
-                protocol_version: PROTOCOL_VERSION,
-                command_id,
-                command,
-            })?;
-        }
+        self.vm.send(&CommandFrame {
+            protocol_version: PROTOCOL_VERSION,
+            command_id,
+            command,
+        })?;
         Ok(command_id)
     }
 
-    /// Fold one received frame into the trace and the replay comparison. The
-    /// command identifier must name a command that was actually issued, and the
-    /// event identifier must continue the stream.
+    /// Fold one received frame into the trace. The command identifier must name a
+    /// command that was actually issued, and the event identifier must continue
+    /// the stream.
     fn absorb(&mut self, frame: EventFrame) -> io::Result<EventFrame> {
         if frame.protocol_version != PROTOCOL_VERSION
             || frame.event_id != self.next_event_id
@@ -1568,28 +1590,6 @@ impl<'a> WorkloadController<'a> {
         }
         self.next_event_id += 1;
         let normalized = frame.normalize();
-        if let Some(expected) = &self.expected_events {
-            let index = self.events.len();
-            match expected.get(index) {
-                Some(expected) if expected == &normalized => {}
-                Some(expected) => {
-                    return Err(invalid_data(format!(
-                        "normalized event divergence at index {index}: expected {} at event {}, found {} at event {}",
-                        expected.event.describe(),
-                        expected.event_id,
-                        normalized.event.describe(),
-                        normalized.event_id
-                    )));
-                }
-                None => {
-                    return Err(invalid_data(format!(
-                        "replay produced surplus normalized event at index {index}: {} at event {}",
-                        normalized.event.describe(),
-                        normalized.event_id
-                    )));
-                }
-            }
-        }
         self.diagnostics.observe(&normalized);
         self.trace.push(&frame);
         self.raw_events.push(frame.clone());
@@ -1598,36 +1598,19 @@ impl<'a> WorkloadController<'a> {
     }
 
     fn receive_one(&mut self) -> io::Result<EventFrame> {
-        let frame = match self.pending.pop_front() {
-            Some(frame) => frame,
-            None => self.vm.receive()?,
-        };
+        let frame = self.vm.receive()?;
         self.absorb(frame)
     }
 
-    /// Fold every already-queued event that belongs to an issued command into the
-    /// trace without waiting. A closed channel is still an error: the guest ended
-    /// without its shutdown handshake.
-    ///
-    /// Only passive replay parks an event whose command has not been issued yet:
-    /// a replayed guest runs ahead of the host, which sends nothing. A live
-    /// recording cannot legitimately see an event for a command it has not sent,
-    /// so such an event is an envelope violation there.
+    /// Fold every already-queued event into the trace without waiting. A live
+    /// recording cannot see an event for a command it has not sent, so an event
+    /// whose command has not been issued is an envelope violation. A closed
+    /// channel is still an error: the guest ended without its shutdown handshake.
     fn drain(&mut self) -> io::Result<()> {
-        loop {
-            let frame = match self.pending.pop_front() {
-                Some(frame) => frame,
-                None => match self.vm.try_receive()? {
-                    Some(frame) => frame,
-                    None => return Ok(()),
-                },
-            };
-            if frame.command_id >= self.next_command_id && !self.send_commands {
-                self.pending.push_back(frame);
-                return Ok(());
-            }
+        while let Some(frame) = self.vm.try_receive()? {
             self.absorb(frame)?;
         }
+        Ok(())
     }
 
     /// Read until the expected typed event for the just-issued command arrives,
@@ -1731,6 +1714,41 @@ impl<'a> WorkloadController<'a> {
         }
     }
 
+    /// Read until the invocation exits, or until an already-observed response
+    /// failure means the run must stop instead of waiting for an exit that may
+    /// never come. Output frames are folded as they arrive, so a stderr byte or an
+    /// over-bound unfinished line ends the wait as soon as it is observed.
+    fn await_exit(&mut self, command_id: u64, invocation: u64) -> io::Result<bool> {
+        loop {
+            let frame = self.receive_one()?;
+            match &frame.event {
+                Event::WorkloadExited {
+                    invocation: actual, ..
+                } if *actual == invocation => {
+                    if frame.command_id != command_id {
+                        return Err(invalid_data(format!(
+                            "the workload-exited response carries command {} instead of {command_id}",
+                            frame.command_id
+                        )));
+                    }
+                    return Ok(true);
+                }
+                Event::WorkloadOutput { .. } => {
+                    if !self.healthy(invocation) {
+                        return Ok(false);
+                    }
+                }
+                event if is_terminal_workload_event(event) => {}
+                event => {
+                    return Err(invalid_data(format!(
+                        "unexpected {} while waiting for workload-exited",
+                        event.describe()
+                    )));
+                }
+            }
+        }
+    }
+
     /// Whether the invocation is still live after folding every queued event.
     /// A process command for a released invocation is an infrastructure error, so
     /// the driver checks liveness before issuing one.
@@ -1814,11 +1832,9 @@ fn drive_workload_scenario(
     choices: &WorkloadChoicePlan,
     launch: &LaunchIdentity,
     vm: &mut dyn RunningVm,
-    send_commands: bool,
-    expected_events: Option<&[NormalizedEvent]>,
     diagnostics: &mut FailureDiagnostics,
 ) -> io::Result<(Vec<NormalizedEvent>, AssertionReport)> {
-    let mut controller = WorkloadController::new(vm, send_commands, expected_events, diagnostics);
+    let mut controller = WorkloadController::new(vm, diagnostics);
     let interface = "eth0".to_owned();
     let guest_cidr = "10.0.2.15/24".to_owned();
     let configure = controller.issue(Command::ConfigureNetwork {
@@ -1944,9 +1960,10 @@ fn drive_workload_scenario(
                 controller.expect(command, "termination-requested", false, |event| {
                     matches!(event, Event::TerminationRequested { .. })
                 })?;
-                controller.expect(command, "workload-exited", false, |event| {
-                    matches!(event, Event::WorkloadExited { .. })
-                })?;
+                if !controller.await_exit(command, invocation)? {
+                    stopped = true;
+                    continue;
+                }
                 controller.expect(command, "cleanup-complete", false, |event| {
                     matches!(event, Event::CleanupComplete { .. })
                 })?;
@@ -1965,9 +1982,10 @@ fn drive_workload_scenario(
                             if *actual == invocation && *offset == expected_end
                     )
                 })?;
-                controller.expect(command, "workload-exited", false, |event| {
-                    matches!(event, Event::WorkloadExited { .. })
-                })?;
+                if !controller.await_exit(command, invocation)? {
+                    stopped = true;
+                    continue;
+                }
                 controller.expect(command, "cleanup-complete", false, |event| {
                     matches!(event, Event::CleanupComplete { .. })
                 })?;
@@ -2026,15 +2044,6 @@ fn drive_workload_scenario(
         }
     }
     controller.vm.finish_events()?;
-    if let Some(expected) = &controller.expected_events
-        && controller.events.len() != expected.len()
-    {
-        return Err(invalid_data(format!(
-            "replay ended after {} normalized events; expected {}",
-            controller.events.len(),
-            expected.len()
-        )));
-    }
     let report = evaluate_workload(&controller.raw_events, scenario, choices, launch);
     Ok((controller.events, report))
 }
@@ -3042,6 +3051,8 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
     use std::sync::{Arc, Mutex};
 
+    use std::collections::VecDeque;
+
     use super::*;
     use crate::checker::MAX_RESPONSE_LINE_BYTES;
     use crate::protocol::{DiagnosticFields, OutputStream, ProcessExit};
@@ -3109,6 +3120,10 @@ mod tests {
         /// Write the expected response and then an over-bound unfinished tail,
         /// without exiting.
         over_bound_tail_after_response: bool,
+        /// Withhold the over-bound tail until the next command is processed, so
+        /// the recording observes it later than a replay does.
+        late_tail_after_response: bool,
+        pending_tail: Option<u64>,
     }
 
     struct FakeAdapter {
@@ -3122,6 +3137,7 @@ mod tests {
         corrupt: bool,
         exit_on_outage: bool,
         divergent_workload_launch: bool,
+        late_tail_after_response: bool,
         recorded_events: Arc<Mutex<Vec<EventFrame>>>,
     }
 
@@ -3190,6 +3206,8 @@ mod tests {
                 stderr_without_exit: false,
                 over_bound_line_without_exit: false,
                 over_bound_tail_after_response: false,
+                late_tail_after_response: self.late_tail_after_response,
+                pending_tail: None,
             })
         }
     }
@@ -3437,6 +3455,16 @@ mod tests {
                     // The barrier is serialized separately, so the host reads it
                     // only with the command that follows the exit record.
                     self.pending_cleanup = Some((invocation, 1));
+                } else if self.late_tail_after_response && self.workload.fetched == 1 {
+                    // The tail is serialized later, so the recording observes it
+                    // only after it has already issued the next command.
+                    self.pending_tail = Some(invocation);
+                    self.emit_output(
+                        command_id,
+                        invocation,
+                        OutputStream::Stdout,
+                        &format!("network state=ok request={request_id}\n"),
+                    );
                 } else if self.over_bound_tail_after_response && self.workload.fetched == 1 {
                     // The expected response is valid, but the unfinished tail that
                     // follows it can never be, and the invocation stays alive.
@@ -3534,6 +3562,14 @@ mod tests {
                 self.event(
                     frame.command_id,
                     Event::CleanupComplete { invocation, reaped },
+                );
+            }
+            if let Some(invocation) = self.pending_tail.take() {
+                self.emit_output(
+                    frame.command_id,
+                    invocation,
+                    OutputStream::Stdout,
+                    &"x".repeat(MAX_RESPONSE_LINE_BYTES + 1),
                 );
             }
             match &frame.command {
@@ -3846,6 +3882,8 @@ mod tests {
             stderr_without_exit: false,
             over_bound_line_without_exit: false,
             over_bound_tail_after_response: false,
+            late_tail_after_response: false,
+            pending_tail: None,
         };
         let mut diagnostics = failure_diagnostics("record");
         let (events, report) =
@@ -3904,6 +3942,7 @@ mod tests {
             corrupt: false,
             exit_on_outage: false,
             divergent_workload_launch: false,
+            late_tail_after_response: false,
             recorded_events: Arc::new(Mutex::new(Vec::new())),
         };
         let result = record_with_adapter(
@@ -4868,6 +4907,7 @@ mod tests {
             corrupt: false,
             exit_on_outage: false,
             divergent_workload_launch: false,
+            late_tail_after_response: false,
             recorded_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -5427,8 +5467,6 @@ mod tests {
             &choices,
             &workload_launch(),
             &mut vm,
-            true,
-            None,
             &mut diagnostics,
         )
         .unwrap_err();
@@ -5447,8 +5485,6 @@ mod tests {
             &choices,
             &workload_launch(),
             &mut vm,
-            true,
-            None,
             &mut diagnostics,
         )
         .unwrap_err();
@@ -5470,8 +5506,6 @@ mod tests {
             &choices,
             &workload_launch(),
             &mut vm,
-            true,
-            None,
             &mut diagnostics,
         )
         .unwrap_err();
@@ -5696,6 +5730,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_recording_that_stops_on_a_late_tail_still_replays() {
+        // The tail is serialized after the recording's pre-command drain, so the
+        // recording stops one command later than a replay that can already see it.
+        // Passive replay consumes and compares the recorded stream instead of
+        // re-deciding the schedule, so the failing recording still replays.
+        let root = temporary_root("late-tail-replay");
+        let options = workload_options(&root, false);
+        let mut adapter = fake_adapter(None);
+        adapter.late_tail_after_response = true;
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        assert!(!recorded.assertions.passed, "{:#?}", recorded.assertions);
+        let replay = replay_with_adapter(
+            &replay_options(&options, recorded.directory.clone()),
+            &adapter,
+        )
+        .unwrap();
+        assert_eq!(replay.assertions, recorded.assertions);
+        assert_eq!(replay.exit_code(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// A fake guest and scenario for driving the workload control loop directly,
     /// without a record or replay publication.
     fn workload_scenario_fixture() -> WorkloadScenario {
@@ -5750,6 +5806,8 @@ mod tests {
             stderr_without_exit: false,
             over_bound_line_without_exit: false,
             over_bound_tail_after_response: false,
+            late_tail_after_response: false,
+            pending_tail: None,
         }
     }
 
@@ -5762,8 +5820,6 @@ mod tests {
             &choices,
             &workload_launch(),
             vm,
-            true,
-            None,
             &mut diagnostics,
         )
         .expect("an application failure must not become an infrastructure failure")
@@ -5905,6 +5961,8 @@ mod tests {
             stderr_without_exit: false,
             over_bound_line_without_exit: false,
             over_bound_tail_after_response: false,
+            late_tail_after_response: false,
+            pending_tail: None,
         }
     }
 
