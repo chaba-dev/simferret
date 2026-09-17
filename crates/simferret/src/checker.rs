@@ -704,6 +704,27 @@ impl WorkloadTrace {
             .flat_map(|streams| streams.stdout_lines.iter())
             .find(|line| line.text == wanted)
     }
+
+    /// One complete stdout line, by text, together with the event identifier of
+    /// the data acknowledgement that answers it. The startup line answers no
+    /// command, so it is never returned.
+    fn stdout_line_with_ack(&self, wanted: &str) -> Option<(&CompletedLine, u64)> {
+        for streams in self.invocations.values() {
+            for (index, line) in streams.stdout_lines.iter().enumerate() {
+                if line.text != wanted {
+                    continue;
+                }
+                let Some(acknowledged) = index
+                    .checked_sub(1)
+                    .and_then(|position| streams.data_input_events.get(position))
+                else {
+                    continue;
+                };
+                return Some((line, *acknowledged));
+            }
+        }
+        None
+    }
 }
 
 /// Evaluate the structured process, response-integrity, outage, and recovery
@@ -1140,13 +1161,15 @@ fn fault_properties(
             ) == RequestPhase::Outage
         })?;
         let wanted = expected_network_line(&choices.requests[index], RequestPhase::Outage);
-        let line = trace.any_stdout_line(&wanted)?;
-        // The prohibited request must be observed while the outage is in force,
-        // so it cannot be satisfied by a response that only arrived after the
-        // network was restored.
+        let (line, acknowledged) = trace.stdout_line_with_ack(&wanted)?;
+        // The prohibited request must have been accepted while the outage was in
+        // force, so neither its acknowledgement nor its response may precede the
+        // activation, and it cannot be satisfied by a response that only arrived
+        // after the network was restored.
         let before_restoration =
             restoration.is_none_or(|(_, restoration_id)| line.event_id < *restoration_id);
-        (line.event_id > *activation_id
+        (acknowledged > *activation_id
+            && line.event_id > *activation_id
             && before_restoration
             && line.event_id - activation_id <= scenario.outage_event_bound)
             .then_some((line.event_id, line.event_id - activation_id))
@@ -1187,8 +1210,11 @@ fn fault_properties(
             ) == RequestPhase::Recovery
         })?;
         let wanted = expected_network_line(&choices.requests[index], RequestPhase::Recovery);
-        let line = trace.any_stdout_line(&wanted)?;
-        (line.event_id > *restoration_id
+        let (line, acknowledged) = trace.stdout_line_with_ack(&wanted)?;
+        // The recovery request must have been accepted after the restoration, so
+        // a response whose command preceded it cannot satisfy the property.
+        (acknowledged > *restoration_id
+            && line.event_id > *restoration_id
             && line.event_id - restoration_id <= scenario.liveness_event_bound)
             .then_some((line.event_id, line.event_id - restoration_id))
     });
@@ -1606,6 +1632,16 @@ mod tests {
         );
     }
 
+    /// Swap two adjacent frames and their identifiers, so the frame that moves
+    /// earlier keeps the smaller identifier and the trace stays ordered.
+    fn swap_and_renumber(events: &mut [EventFrame], index: usize) {
+        events.swap(index, index + 1);
+        let earlier = events[index + 1].event_id;
+        let later = events[index].event_id;
+        events[index].event_id = earlier;
+        events[index + 1].event_id = later;
+    }
+
     /// The frame index of one invocation's exit record.
     fn exit_index(events: &[EventFrame], invocation: u64) -> usize {
         events
@@ -1696,6 +1732,57 @@ mod tests {
                 .contains("before the input command"),
             "{}",
             report.assertions[1].detail
+        );
+    }
+
+    #[test]
+    fn a_witness_acknowledged_before_its_transition_fails_controlled_outage() {
+        // A response cannot count as an outage observation when its request was
+        // accepted before the prohibition was in force, even though the response
+        // line itself completed after the activation.
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let index = events
+            .iter()
+            .position(|frame| matches!(frame.event, Event::OutageActivated { .. }))
+            .expect("the fixture activates the outage");
+        assert!(
+            matches!(events[index + 1].event, Event::InputAccepted { .. }),
+            "{:?}",
+            events[index + 1]
+        );
+        swap_and_renumber(&mut events, index);
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[2].passed, "{:#?}", report.assertions);
+        assert!(
+            report.assertions[2].detail.contains("within"),
+            "{}",
+            report.assertions[2].detail
+        );
+    }
+
+    #[test]
+    fn a_witness_acknowledged_before_its_transition_fails_bounded_recovery() {
+        // The same holds for restoration: the recovery request must have been
+        // accepted after the network was restored, not merely completed after it.
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let index = events
+            .iter()
+            .position(|frame| matches!(frame.event, Event::NetworkRestored { .. }))
+            .expect("the fixture restores the network");
+        assert!(
+            matches!(events[index + 1].event, Event::InputAccepted { .. }),
+            "{:?}",
+            events[index + 1]
+        );
+        swap_and_renumber(&mut events, index);
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[4].passed, "{:#?}", report.assertions);
+        assert!(
+            report.assertions[4].detail.contains("within"),
+            "{}",
+            report.assertions[4].detail
         );
     }
 
