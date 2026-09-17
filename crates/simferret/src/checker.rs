@@ -227,10 +227,11 @@ impl InvocationStreams {
         bytes: u64,
         eof: bool,
     ) {
-        let expected = self.input_offset.saturating_add(bytes);
-        if offset != expected {
+        let expected = self.input_offset.checked_add(bytes);
+        if expected != Some(offset) {
             self.violations.push(format!(
-                "invocation {invocation} input offset {offset} is not the expected end {expected} at event {event_id}"
+                "invocation {invocation} input offset {offset} does not follow {} plus {bytes} byte(s) at event {event_id}",
+                self.input_offset
             ));
         }
         if eof && bytes != 0 {
@@ -1181,7 +1182,7 @@ fn fault_properties(
             && line.event_id > *activation_id
             && before_restoration
             && line.event_id - activation_id <= scenario.outage_event_bound)
-            .then_some((line.event_id, line.event_id - activation_id))
+            .then(|| (line.event_id, line.event_id - activation_id))
     });
     let controlled_outage = match outage {
         Some((event_id, distance)) => passed(
@@ -1225,7 +1226,7 @@ fn fault_properties(
         (acknowledged > *restoration_id
             && line.event_id > *restoration_id
             && line.event_id - restoration_id <= scenario.liveness_event_bound)
-            .then_some((line.event_id, line.event_id - restoration_id))
+            .then(|| (line.event_id, line.event_id - restoration_id))
     });
     // A restart is only a recovery if the restarted invocation answers inside the
     // same liveness bound. Measuring from the second start event, rather than
@@ -1243,7 +1244,7 @@ fn fault_properties(
                 .find(|line| line.text == wanted)?;
             (line.event_id > start.event_id
                 && line.event_id - start.event_id <= scenario.liveness_event_bound)
-                .then_some((line.event_id, line.event_id - start.event_id))
+                .then(|| (line.event_id, line.event_id - start.event_id))
         });
     let bounded_recovery = match (recovery, restart) {
         (Some((event_id, distance)), Some((restart_id, restart_distance))) => passed(
@@ -2075,6 +2076,74 @@ mod tests {
         mutate_output(&mut events, 2, true, |_, sequence, _| *sequence = 99);
         let report = evaluate_workload(&events, &scenario(), &choices, &launch());
         assert!(!report.assertions[0].passed);
+    }
+
+    #[test]
+    fn a_non_advancing_input_offset_fails_process_safety() {
+        // A positive byte count must advance the accepted offset, so a saturated
+        // sum cannot be accepted as the expected end of the first acknowledgement.
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let mut first = true;
+        for frame in events.iter_mut() {
+            if let Event::InputAccepted {
+                invocation: 1,
+                bytes,
+                offset,
+                eof: false,
+                ..
+            } = &mut frame.event
+            {
+                if first {
+                    *bytes = u64::MAX;
+                    first = false;
+                }
+                *offset = u64::MAX;
+            }
+        }
+        assert!(
+            !first,
+            "the fixture acknowledges the first invocation's inputs"
+        );
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.passed, "{:#?}", report.assertions);
+        assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
+    }
+
+    #[test]
+    fn an_outage_witness_entirely_before_its_activation_fails_controlled_outage() {
+        // The witness arithmetic must not underflow when both the acknowledgement
+        // and the response precede the activation.
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let index = events
+            .iter()
+            .position(|frame| matches!(frame.event, Event::OutageActivated { .. }))
+            .expect("the fixture activates the outage");
+        let activation = events.remove(index);
+        events.insert(index + 2, activation);
+        for (offset, frame) in events[index..].iter_mut().enumerate() {
+            frame.event_id = (index + offset) as u64 + 1;
+        }
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[2].passed, "{:#?}", report.assertions);
+    }
+
+    #[test]
+    fn a_recovery_witness_entirely_before_its_restoration_fails_bounded_recovery() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let index = events
+            .iter()
+            .position(|frame| matches!(frame.event, Event::NetworkRestored { .. }))
+            .expect("the fixture restores the network");
+        let restoration = events.remove(index);
+        events.insert(index + 2, restoration);
+        for (offset, frame) in events[index..].iter_mut().enumerate() {
+            frame.event_id = (index + offset) as u64 + 1;
+        }
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[4].passed, "{:#?}", report.assertions);
     }
 
     #[test]
