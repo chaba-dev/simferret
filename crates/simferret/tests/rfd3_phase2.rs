@@ -1,3 +1,7 @@
+// The guest process runtime is Linux-only, so this whole target is compiled
+// only there. The checked-in script runs it as PID 1 in a fresh PID namespace.
+#![cfg(target_os = "linux")]
+
 //! RFD 3 Phase 2 acceptance: the guest process runtime.
 //!
 //! The runtime changes the child root, drops to nonzero credentials, and
