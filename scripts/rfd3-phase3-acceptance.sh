@@ -227,16 +227,20 @@ with open(sys.argv[1], encoding="utf-8") as handle:
             streams.setdefault(event["invocation"], bytearray()).extend(
                 bytes.fromhex(event["bytes"])
             )
-fresh = 0
-for data in streams.values():
-    for line in bytes(data).split(b"\n"):
-        if line == b"state value=fresh root=fresh":
-            fresh += 1
-print(f"{len(streams)}:{fresh}")
+# Only newline-completed lines count, exactly as the checker counts them.
+fresh = {}
+for invocation, data in streams.items():
+    lines = bytes(data).split(b"\n")[:-1]
+    fresh[invocation] = sum(1 for line in lines if line == b"state value=fresh root=fresh")
+print(
+    ",".join(str(key) for key in sorted(streams))
+    + ":"
+    + ",".join(str(fresh.get(key, 0)) for key in sorted(streams))
+)
 PY
 )"
-  if [[ "$fresh_witnesses" != "2:2" ]]; then
-    echo "expected two invocations with two fresh-root witnesses, observed $fresh_witnesses" >&2
+  if [[ "$fresh_witnesses" != "1,2:1,1" ]]; then
+    echo "expected one fresh-root witness in each invocation, observed $fresh_witnesses" >&2
     exit 1
   fi
 
