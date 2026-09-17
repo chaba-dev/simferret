@@ -1,0 +1,1600 @@
+//! RFD 3 Phase 2: the guest process runtime.
+//!
+//! The agent stays PID 1 outside an immutable workload template. For every
+//! invocation it materializes a fresh writable root from that template, applies
+//! a versioned runtime overlay, and supervises exactly one workload child in a
+//! private filesystem root. The child receives only fresh standard pipes, a
+//! cleared supplementary-group set, `no_new_privs`, and the normalized nonzero
+//! credentials; it is executed without a shell.
+//!
+//! Every process in the guest other than the agent is a member of the active
+//! invocation. On termination or primary-process exit the runtime kills and
+//! reaps until only the agent remains and all workload output pipes reach end
+//! of file, then reports `cleanup-complete`. A new invocation is refused until
+//! that barrier completes.
+//!
+//! The runtime reports process and byte facts only. Application protocol
+//! interpretation and workload assertions belong to the host scenario checker.
+
+use std::ffi::CString;
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use sha2::{Digest, Sha256};
+
+use crate::protocol::{
+    Event, LaunchFailure, MAX_INVOCATION_INPUT_BYTES, MAX_INVOCATION_OUTPUT_BYTES,
+    MAX_OUTPUT_FRAME_BYTES, MAX_STDIN_FRAME_BYTES, OutputStream, ProcessExit, TERMINATION_SIGNAL,
+};
+use crate::workload::LaunchIdentity;
+
+/// The reserved guest path holding the immutable workload template. The PID-1
+/// agent and its tools stay outside it.
+pub const GUEST_TEMPLATE_ROOT: &str = "/workload";
+/// The default guest path below which fresh writable invocation roots live.
+pub const GUEST_RUNTIME_ROOT: &str = "/run/simferret";
+
+/// The overlay directory whose metadata the runtime replaces.
+const OVERLAY_TMP: &[u8] = b"tmp";
+/// The overlay directory whose metadata and device nodes the runtime replaces.
+const OVERLAY_DEV: &[u8] = b"dev";
+const DEV_NULL: (u32, u32) = (1, 3);
+const DEV_ZERO: (u32, u32) = (1, 5);
+const OVERLAY_DIRECTORY_MODE: u32 = 0o755;
+const OVERLAY_TMP_MODE: u32 = 0o1777;
+const OVERLAY_DEVICE_MODE: u32 = 0o666;
+
+/// Bounds the template walk so a hostile template cannot force unbounded work.
+const MAX_TEMPLATE_ENTRIES: usize = 1 << 14;
+const MAX_TEMPLATE_PATH_BYTES: usize = 1024;
+const MAX_DESCRIPTOR_SCAN: u64 = 1 << 16;
+/// The bounded wait for the child's setup result before exec.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Child setup result codes. The child writes one byte to a close-on-exec error
+/// pipe before `execve`, so a successful exec is an unreadable pipe and a setup
+/// failure is an unambiguous typed byte.
+mod child_status {
+    pub const DUP: u8 = 1;
+    pub const CHROOT: u8 = 2;
+    pub const CHDIR: u8 = 3;
+    pub const GROUPS: u8 = 4;
+    pub const NO_NEW_PRIVS: u8 = 5;
+    pub const CREDENTIALS: u8 = 6;
+    pub const EXEC: u8 = 7;
+
+    pub fn failure(code: u8) -> (&'static str, &'static str) {
+        match code {
+            DUP => ("pipe", "could not connect the workload standard pipes"),
+            CHROOT => ("setup", "could not change the workload root"),
+            CHDIR => (
+                "working_directory",
+                "could not enter the workload working directory",
+            ),
+            GROUPS => ("setup", "could not clear supplementary groups"),
+            NO_NEW_PRIVS => ("setup", "could not set no_new_privs"),
+            CREDENTIALS => ("setup", "could not apply the workload credentials"),
+            EXEC => ("executable", "could not execute the workload"),
+            _ => ("setup", "unknown workload setup failure"),
+        }
+    }
+}
+
+/// The process-table scope the cleanup barrier is allowed to touch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberScope {
+    /// Every process in the guest other than the agent. Valid only when the
+    /// agent is PID 1, which is the only process the workload cannot outlive.
+    Guest,
+    /// Only the invocation's own process group. Used by host tests, where the
+    /// agent shares a process table with unrelated processes.
+    ProcessGroup,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeLimits {
+    pub input_bytes: usize,
+    pub output_bytes: usize,
+    pub input_frame_bytes: usize,
+    pub output_frame_bytes: usize,
+    pub template_entries: usize,
+    pub template_path_bytes: usize,
+}
+
+impl Default for RuntimeLimits {
+    fn default() -> Self {
+        Self {
+            input_bytes: MAX_INVOCATION_INPUT_BYTES,
+            output_bytes: MAX_INVOCATION_OUTPUT_BYTES,
+            input_frame_bytes: MAX_STDIN_FRAME_BYTES,
+            output_frame_bytes: MAX_OUTPUT_FRAME_BYTES,
+            template_entries: MAX_TEMPLATE_ENTRIES,
+            template_path_bytes: MAX_TEMPLATE_PATH_BYTES,
+        }
+    }
+}
+
+pub struct RuntimeConfig {
+    pub template_root: PathBuf,
+    pub runtime_root: PathBuf,
+    pub limits: RuntimeLimits,
+    pub scope: MemberScope,
+}
+
+impl RuntimeConfig {
+    /// The production guest configuration.
+    pub fn guest() -> Self {
+        Self {
+            template_root: PathBuf::from(GUEST_TEMPLATE_ROOT),
+            runtime_root: PathBuf::from(GUEST_RUNTIME_ROOT),
+            limits: RuntimeLimits::default(),
+            scope: MemberScope::Guest,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StreamState {
+    offset: u64,
+    bytes: u64,
+    hasher: Sha256,
+    eof: bool,
+}
+
+impl StreamState {
+    fn new() -> Self {
+        Self {
+            offset: 0,
+            bytes: 0,
+            hasher: Sha256::new(),
+            eof: false,
+        }
+    }
+}
+
+struct Invocation {
+    id: u64,
+    root: PathBuf,
+    pid: libc::pid_t,
+    stdin: Option<OwnedFd>,
+    stdout: Option<OwnedFd>,
+    stderr: Option<OwnedFd>,
+    stdout_state: StreamState,
+    stderr_state: StreamState,
+    input_offset: u64,
+    input_bytes: u64,
+    sequence: u64,
+    frames: u64,
+    exit: Option<ProcessExit>,
+    primary_reaped: bool,
+    reaped: u64,
+    cleanup_complete: bool,
+}
+
+/// One guest process runtime. It owns at most one active invocation.
+pub struct Runtime {
+    config: RuntimeConfig,
+    active: Option<Invocation>,
+}
+
+impl Runtime {
+    /// Build a runtime and validate the immutable template's overlay profile.
+    pub fn new(config: RuntimeConfig) -> io::Result<Self> {
+        validate_template(&config.template_root, &config.limits)?;
+        Ok(Self {
+            config,
+            active: None,
+        })
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// The live output pipe descriptors, so the agent can poll them together
+    /// with its control channel instead of busy-waiting.
+    pub fn output_fds(&self) -> Vec<RawFd> {
+        self.active
+            .as_ref()
+            .map(|active| {
+                poll_descriptors(active)
+                    .into_iter()
+                    .map(|descriptor| descriptor.fd)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn limits(&self) -> &RuntimeLimits {
+        &self.config.limits
+    }
+
+    /// Start one invocation. Returns typed protocol events; every failure is a
+    /// `launch-failed` event rather than a host error, so the host checker sees
+    /// a bounded diagnostic.
+    pub fn start(&mut self, invocation: u64, launch: &LaunchIdentity) -> Vec<Event> {
+        match self.start_inner(invocation, launch) {
+            Ok(event) => vec![event],
+            Err((failure, detail)) => vec![Event::LaunchFailed {
+                invocation,
+                failure,
+                detail,
+            }],
+        }
+    }
+
+    fn start_inner(
+        &mut self,
+        invocation: u64,
+        launch: &LaunchIdentity,
+    ) -> Result<Event, (LaunchFailure, String)> {
+        if self.active.is_some() {
+            return Err((
+                LaunchFailure::InvocationActive,
+                "an invocation is already active".into(),
+            ));
+        }
+        validate_launch(launch).map_err(|error| (LaunchFailure::Executable, error.to_string()))?;
+        let root = self
+            .config
+            .runtime_root
+            .join(format!("invocation-{invocation}"));
+        if root.exists() {
+            return Err((
+                LaunchFailure::InvocationRepeated,
+                format!("invocation root {} already exists", root.display()),
+            ));
+        }
+        create_private_directory(&self.config.runtime_root).map_err(|error| {
+            (
+                LaunchFailure::Materialization,
+                format!("cannot create the runtime root: {error}"),
+            )
+        })?;
+        materialize(&self.config.template_root, &root, &self.config.limits)
+            .map_err(|error| (LaunchFailure::Materialization, error.to_string()))?;
+        if let Err(error) = apply_overlay(&root) {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err((LaunchFailure::Materialization, error.to_string()));
+        }
+        if let Err(error) = verify_launch_target(&root, launch) {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err(error);
+        }
+        match spawn(&root, launch, self.config.scope) {
+            Ok(spawned) => {
+                self.active = Some(Invocation {
+                    id: invocation,
+                    root,
+                    pid: spawned.pid,
+                    stdin: Some(spawned.stdin),
+                    stdout: Some(spawned.stdout),
+                    stderr: Some(spawned.stderr),
+                    stdout_state: StreamState::new(),
+                    stderr_state: StreamState::new(),
+                    input_offset: 0,
+                    input_bytes: 0,
+                    sequence: 0,
+                    frames: 0,
+                    exit: None,
+                    primary_reaped: false,
+                    reaped: 0,
+                    cleanup_complete: false,
+                });
+                Ok(Event::WorkloadStarted {
+                    invocation,
+                    launch: launch.clone(),
+                })
+            }
+            Err((failure, detail)) => {
+                let _ = std::fs::remove_dir_all(&root);
+                Err((failure, detail))
+            }
+        }
+    }
+
+    /// Accept one bounded, strictly contiguous stdin frame.
+    pub fn stdin_write(
+        &mut self,
+        invocation: u64,
+        offset: u64,
+        bytes: &str,
+    ) -> io::Result<Vec<Event>> {
+        let data = crate::protocol::decode_bytes(bytes, self.config.limits.input_frame_bytes)
+            .map_err(|error| self.fatal(invocation, error))?;
+        let limits = self.config.limits;
+        let (current_offset, current_bytes) = {
+            let active = self.invocation_mut(invocation)?;
+            (active.input_offset, active.input_bytes)
+        };
+        if current_offset != offset {
+            return Err(self.fatal(
+                invocation,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("stdin offset {offset} is not contiguous with {current_offset}"),
+                ),
+            ));
+        }
+        if current_bytes.saturating_add(data.len() as u64) > limits.input_bytes as u64 {
+            return Err(self.fatal(
+                invocation,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invocation input exceeds the configured bound",
+                ),
+            ));
+        }
+        let fd = self
+            .invocation_mut(invocation)?
+            .stdin
+            .as_ref()
+            .map(AsRawFd::as_raw_fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "workload stdin is closed"))?;
+        if let Err(error) = write_all(fd, &data) {
+            return Err(self.fatal(
+                invocation,
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot write workload input: {error}"),
+                ),
+            ));
+        }
+        let active = self.invocation_mut(invocation)?;
+        active.input_offset += data.len() as u64;
+        active.input_bytes += data.len() as u64;
+        Ok(vec![Event::InputAccepted {
+            invocation,
+            offset: active.input_offset,
+            bytes: data.len() as u64,
+            eof: false,
+        }])
+    }
+
+    /// Close the workload's standard input.
+    pub fn stdin_eof(&mut self, invocation: u64) -> io::Result<Vec<Event>> {
+        let active = self.invocation_mut(invocation)?;
+        active.stdin = None;
+        Ok(vec![Event::InputAccepted {
+            invocation,
+            offset: active.input_offset,
+            bytes: 0,
+            eof: true,
+        }])
+    }
+
+    /// Request unconditional termination of the invocation.
+    pub fn terminate(&mut self, invocation: u64) -> io::Result<Vec<Event>> {
+        let active = self.invocation_mut(invocation)?;
+        if active.exit.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the invocation has already exited",
+            ));
+        }
+        signal_members(active.pid, self.config.scope, TERMINATION_SIGNAL);
+        Ok(vec![Event::TerminationRequested {
+            invocation,
+            signal: TERMINATION_SIGNAL,
+        }])
+    }
+
+    /// Drain live output and advance the invocation. The timeout applies only
+    /// while the primary process is live; the cleanup barrier after exit always
+    /// runs to completion before this returns.
+    pub fn poll(&mut self, timeout: Duration) -> io::Result<Vec<Event>> {
+        let Some(active) = self.active.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let mut events = Vec::new();
+        if active.exit.is_none() {
+            drain_ready(active, &self.config.limits, timeout, &mut events)?;
+            reap_primary(active);
+        }
+        if active.exit.is_some() && !active.cleanup_complete {
+            cleanup(active, self.config.scope, &self.config.limits, &mut events)?;
+        }
+        // A completed barrier releases the single-workload slot so the next
+        // start is accepted only after cleanup.
+        let finished = active.cleanup_complete;
+        if finished {
+            self.active = None;
+        }
+        Ok(events)
+    }
+
+    /// Terminate and reap any active invocation, then report the barrier.
+    pub fn shutdown(&mut self) -> io::Result<Vec<Event>> {
+        let Some(active) = self.active.as_mut() else {
+            return Ok(Vec::new());
+        };
+        if active.exit.is_none() {
+            signal_members(active.pid, self.config.scope, TERMINATION_SIGNAL);
+        }
+        let mut events = Vec::new();
+        cleanup(active, self.config.scope, &self.config.limits, &mut events)?;
+        self.active = None;
+        Ok(events)
+    }
+
+    fn invocation_mut(&mut self, invocation: u64) -> io::Result<&mut Invocation> {
+        match self.active.as_mut() {
+            Some(active) if active.id == invocation => Ok(active),
+            Some(active) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invocation {invocation} does not match the active invocation {}",
+                    active.id
+                ),
+            )),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invocation {invocation} is not active"),
+            )),
+        }
+    }
+
+    /// A fatal protocol or transport failure kills the invocation and is
+    /// reported as an infrastructure error, never as a workload property.
+    fn fatal(&mut self, invocation: u64, error: io::Error) -> io::Error {
+        if let Ok(active) = self.invocation_mut(invocation)
+            && active.exit.is_none()
+        {
+            signal_members(active.pid, self.config.scope, TERMINATION_SIGNAL);
+        }
+        error
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if let Some(active) = self.active.as_mut() {
+            if active.exit.is_none() {
+                signal_members(active.pid, self.config.scope, TERMINATION_SIGNAL);
+            }
+            let mut ignored = Vec::new();
+            let _ = cleanup(active, self.config.scope, &self.config.limits, &mut ignored);
+            let _ = std::fs::remove_dir_all(&active.root);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Template validation and materialization
+// ---------------------------------------------------------------------------
+
+/// Walk the immutable template and enforce the versioned overlay profile.
+///
+/// `/tmp` and `/dev` must be directories when the package provides them, and
+/// every package entry below those paths must be a directory: the overlay
+/// replaces their metadata and content, so anything else collides.
+pub fn validate_template(template: &Path, limits: &RuntimeLimits) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(template)
+        .map_err(|error| invalid(format!("cannot inspect the workload template: {error}")))?;
+    if !metadata.is_dir() {
+        return Err(invalid("the workload template root is not a directory"));
+    }
+    let mut stack = vec![(template.to_path_buf(), Vec::<u8>::new())];
+    let mut entries = 0usize;
+    while let Some((directory, prefix)) = stack.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .map_err(|error| invalid(format!("cannot read the workload template: {error}")))?
+        {
+            let entry =
+                entry.map_err(|error| invalid(format!("cannot read a template entry: {error}")))?;
+            let name = entry.file_name();
+            let name = name.as_bytes();
+            if name.contains(&b'/') || name.contains(&0) {
+                return Err(invalid("a template entry name is not a path component"));
+            }
+            let mut path = prefix.clone();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(name);
+            entries += 1;
+            if entries > limits.template_entries {
+                return Err(invalid(format!(
+                    "the workload template exceeds {} entries",
+                    limits.template_entries
+                )));
+            }
+            if path.len() > limits.template_path_bytes {
+                return Err(invalid(format!(
+                    "a workload template path exceeds {} bytes",
+                    limits.template_path_bytes
+                )));
+            }
+            let file_type = entry
+                .file_type()
+                .map_err(|error| invalid(format!("cannot inspect a template entry: {error}")))?;
+            let overlay = path.as_slice() == OVERLAY_TMP
+                || path.as_slice() == OVERLAY_DEV
+                || path.starts_with(b"tmp/")
+                || path.starts_with(b"dev/");
+            if overlay && !file_type.is_dir() {
+                return Err(invalid(format!(
+                    "overlay path {:?} collides with the runtime overlay",
+                    String::from_utf8_lossy(&path)
+                )));
+            }
+            if file_type.is_dir() {
+                stack.push((entry.path(), path));
+            } else if !file_type.is_file() && !file_type.is_symlink() {
+                return Err(invalid(format!(
+                    "workload template entry {:?} is not a regular file, directory, or symbolic link",
+                    String::from_utf8_lossy(&path)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reproduce the template bytes and canonical metadata below a fresh root.
+fn materialize(template: &Path, destination: &Path, limits: &RuntimeLimits) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(template)
+        .map_err(|error| invalid(format!("cannot inspect the workload template: {error}")))?;
+    std::fs::create_dir(destination)
+        .map_err(|error| invalid(format!("cannot create the fresh workload root: {error}")))?;
+    copy_directory(template, destination, &metadata, limits)
+}
+
+fn copy_directory(
+    source: &Path,
+    destination: &Path,
+    metadata: &std::fs::Metadata,
+    limits: &RuntimeLimits,
+) -> io::Result<()> {
+    let mode = unix_mode(metadata);
+    let (uid, gid) = unix_owner(metadata);
+    let mtime = unix_mtime(metadata);
+    for entry in std::fs::read_dir(source)
+        .map_err(|error| invalid(format!("cannot read the workload template: {error}")))?
+    {
+        let entry =
+            entry.map_err(|error| invalid(format!("cannot read a template entry: {error}")))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| invalid(format!("cannot inspect a template entry: {error}")))?;
+        let target = destination.join(entry.file_name());
+        let source_path = entry.path();
+        let child = std::fs::symlink_metadata(&source_path)
+            .map_err(|error| invalid(format!("cannot inspect a template entry: {error}")))?;
+        if file_type.is_dir() {
+            std::fs::create_dir(&target)
+                .map_err(|error| invalid(format!("cannot create a workload directory: {error}")))?;
+            copy_directory(&source_path, &target, &child, limits)?;
+        } else if file_type.is_symlink() {
+            let link = std::fs::read_link(&source_path).map_err(|error| {
+                invalid(format!("cannot read a workload symbolic link: {error}"))
+            })?;
+            std::os::unix::fs::symlink(&link, &target).map_err(|error| {
+                invalid(format!("cannot create a workload symbolic link: {error}"))
+            })?;
+        } else if file_type.is_file() {
+            if child.len() > limits.output_bytes as u64 {
+                return Err(invalid("a workload file exceeds the runtime bound"));
+            }
+            std::fs::copy(&source_path, &target)
+                .map_err(|error| invalid(format!("cannot copy a workload file: {error}")))?;
+        } else {
+            return Err(invalid(
+                "the workload template contains an unsupported file type",
+            ));
+        }
+        set_metadata(
+            &target,
+            unix_mode(&child),
+            unix_owner(&child),
+            unix_mtime(&child),
+            file_type.is_symlink(),
+        )?;
+    }
+    set_metadata(destination, mode, (uid, gid), mtime, false)
+}
+
+/// Apply the versioned runtime overlay to a freshly materialized root.
+fn apply_overlay(root: &Path) -> io::Result<()> {
+    let tmp = root.join("tmp");
+    ensure_directory(&tmp)?;
+    set_metadata(&tmp, OVERLAY_TMP_MODE, (0, 0), 0, false)?;
+    let dev = root.join("dev");
+    ensure_directory(&dev)?;
+    set_metadata(&dev, OVERLAY_DIRECTORY_MODE, (0, 0), 0, false)?;
+    for (name, (major, minor)) in [("null", DEV_NULL), ("zero", DEV_ZERO)] {
+        let path = dev.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(invalid(format!(
+                    "cannot replace workload overlay device {name}: {error}"
+                )));
+            }
+        }
+        mknod_device(&path, major, minor)?;
+        set_metadata(&path, OVERLAY_DEVICE_MODE, (0, 0), 0, false)?;
+    }
+    Ok(())
+}
+
+fn ensure_directory(path: &Path) -> io::Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if std::fs::symlink_metadata(path)?.is_dir() {
+                Ok(())
+            } else {
+                Err(invalid(format!(
+                    "overlay path {} is not a directory",
+                    path.display()
+                )))
+            }
+        }
+        Err(error) => Err(invalid(format!(
+            "cannot create overlay path {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+/// Require the launch executable and working directory to resolve inside the
+/// fresh root without traversing a symbolic link.
+fn verify_launch_target(
+    root: &Path,
+    launch: &LaunchIdentity,
+) -> Result<(), (LaunchFailure, String)> {
+    let executable = resolve_in_root(root, &launch.executable).map_err(|error| {
+        (
+            LaunchFailure::Executable,
+            format!("workload executable is not usable: {error}"),
+        )
+    })?;
+    let metadata = std::fs::symlink_metadata(&executable).map_err(|error| {
+        (
+            LaunchFailure::Executable,
+            format!("cannot inspect the workload executable: {error}"),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err((
+            LaunchFailure::Executable,
+            "the workload executable is not a regular file".into(),
+        ));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err((
+            LaunchFailure::Executable,
+            "the workload executable has no execute permission".into(),
+        ));
+    }
+    let working = resolve_in_root(root, &launch.working_directory).map_err(|error| {
+        (
+            LaunchFailure::WorkingDirectory,
+            format!("workload working directory is not usable: {error}"),
+        )
+    })?;
+    if !std::fs::symlink_metadata(&working)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        return Err((
+            LaunchFailure::WorkingDirectory,
+            "the workload working directory is not a directory".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve an absolute in-root path component by component, refusing any
+/// symbolic link in the path so a link cannot redirect the launch.
+fn resolve_in_root(root: &Path, value: &str) -> io::Result<PathBuf> {
+    validate_in_root(value)?;
+    let mut current = root.to_path_buf();
+    for component in value.split('/').filter(|part| !part.is_empty()) {
+        current.push(component);
+        let metadata = std::fs::symlink_metadata(&current)
+            .map_err(|error| invalid(format!("cannot access {value:?}: {error}")))?;
+        if metadata.is_symlink() {
+            return Err(invalid(format!("path {value:?} traverses a symbolic link")));
+        }
+    }
+    Ok(current)
+}
+
+fn validate_in_root(value: &str) -> io::Result<()> {
+    if value.is_empty() || !value.starts_with('/') || value.contains('\0') {
+        return Err(invalid(format!(
+            "{value:?} is not an absolute in-root path"
+        )));
+    }
+    if value.split('/').any(|component| component == "..") {
+        return Err(invalid(format!("{value:?} escapes the workload root")));
+    }
+    Ok(())
+}
+
+fn validate_launch(launch: &LaunchIdentity) -> io::Result<()> {
+    validate_in_root(&launch.executable)?;
+    if launch.arguments.is_empty() {
+        return Err(invalid("the workload argument vector is empty"));
+    }
+    if launch.arguments[0] != launch.executable {
+        return Err(invalid(
+            "the workload argument vector does not begin with the executable",
+        ));
+    }
+    for argument in &launch.arguments {
+        if argument.contains('\0') {
+            return Err(invalid("a workload argument contains a NUL byte"));
+        }
+    }
+    for entry in &launch.environment {
+        if !entry.contains('=') || entry.contains('\0') {
+            return Err(invalid("a workload environment entry is not NAME=VALUE"));
+        }
+    }
+    validate_in_root(&launch.working_directory)?;
+    if launch.uid == 0 || launch.gid == 0 {
+        return Err(invalid("root credentials are not supported"));
+    }
+    if launch.uid == u32::MAX || launch.gid == u32::MAX {
+        return Err(invalid("the reserved owner identifier is not a credential"));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Child process setup and supervision
+// ---------------------------------------------------------------------------
+
+struct Spawned {
+    pid: libc::pid_t,
+    stdin: OwnedFd,
+    stdout: OwnedFd,
+    stderr: OwnedFd,
+}
+
+fn spawn(
+    root: &Path,
+    launch: &LaunchIdentity,
+    scope: MemberScope,
+) -> Result<Spawned, (LaunchFailure, String)> {
+    let stdin = create_pipe().map_err(|error| (LaunchFailure::Pipe, error.to_string()))?;
+    let stdout = create_pipe().map_err(|error| (LaunchFailure::Pipe, error.to_string()))?;
+    let stderr = create_pipe().map_err(|error| (LaunchFailure::Pipe, error.to_string()))?;
+    let error_pipe = create_pipe().map_err(|error| (LaunchFailure::Pipe, error.to_string()))?;
+
+    let root_c = path_cstring(root).map_err(|error| (LaunchFailure::Setup, error.to_string()))?;
+    let working_c = CString::new(launch.working_directory.as_bytes())
+        .map_err(|error| (LaunchFailure::WorkingDirectory, error.to_string()))?;
+    let executable_c = CString::new(launch.executable.as_bytes())
+        .map_err(|error| (LaunchFailure::Executable, error.to_string()))?;
+    let arguments = launch
+        .arguments
+        .iter()
+        .map(|value| CString::new(value.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| (LaunchFailure::Executable, error.to_string()))?;
+    let environment = launch
+        .environment
+        .iter()
+        .map(|value| CString::new(value.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| (LaunchFailure::Executable, error.to_string()))?;
+    let mut argv: Vec<*const libc::c_char> = arguments.iter().map(|value| value.as_ptr()).collect();
+    argv.push(std::ptr::null());
+    let mut envp: Vec<*const libc::c_char> =
+        environment.iter().map(|value| value.as_ptr()).collect();
+    envp.push(std::ptr::null());
+
+    let child_stdin = stdin.read.as_raw_fd();
+    let child_stdout = stdout.write.as_raw_fd();
+    let child_stderr = stderr.write.as_raw_fd();
+    let error_write = error_pipe.write.as_raw_fd();
+    let uid = launch.uid;
+    let gid = launch.gid;
+
+    // SAFETY: the child runs only async-signal-safe calls on pre-built
+    // arguments and then either `_exit`s or replaces its image with `execve`.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err((
+            LaunchFailure::Fork,
+            format!(
+                "cannot fork the workload child: {}",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    if pid == 0 {
+        // SAFETY: the child is a single-threaded forked process that only calls
+        // async-signal-safe functions before `execve`.
+        unsafe {
+            if scope == MemberScope::ProcessGroup {
+                libc::setpgid(0, 0);
+            }
+            child_exec(
+                child_stdin,
+                child_stdout,
+                child_stderr,
+                error_write,
+                &root_c,
+                &working_c,
+                &executable_c,
+                &argv,
+                &envp,
+                uid,
+                gid,
+            );
+        }
+    }
+
+    drop(stdin.read);
+    drop(stdout.write);
+    drop(stderr.write);
+    drop(error_pipe.write);
+
+    match await_setup(error_pipe.read) {
+        Ok(()) => {
+            set_nonblocking(stdout.read.as_raw_fd()).map_err(|error| {
+                (
+                    LaunchFailure::Pipe,
+                    format!("cannot configure the workload output pipe: {error}"),
+                )
+            })?;
+            set_nonblocking(stderr.read.as_raw_fd()).map_err(|error| {
+                (
+                    LaunchFailure::Pipe,
+                    format!("cannot configure the workload output pipe: {error}"),
+                )
+            })?;
+            Ok(Spawned {
+                pid,
+                stdin: stdin.write,
+                stdout: stdout.read,
+                stderr: stderr.read,
+            })
+        }
+        Err(code) => {
+            let mut status = 0;
+            // SAFETY: `pid` is the child created above and `status` is writable.
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            let (kind, detail) = child_status::failure(code);
+            let failure = match kind {
+                "working_directory" => LaunchFailure::WorkingDirectory,
+                "executable" => LaunchFailure::Executable,
+                "pipe" => LaunchFailure::Pipe,
+                _ => LaunchFailure::Setup,
+            };
+            Err((failure, detail.to_string()))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn child_exec(
+    child_stdin: RawFd,
+    child_stdout: RawFd,
+    child_stderr: RawFd,
+    error_write: RawFd,
+    root: &CString,
+    working: &CString,
+    executable: &CString,
+    argv: &[*const libc::c_char],
+    envp: &[*const libc::c_char],
+    uid: u32,
+    gid: u32,
+) -> ! {
+    // SAFETY: every call below uses a live descriptor or a pre-built
+    // NUL-terminated string and runs in a forked child before `execve`.
+    unsafe {
+        if libc::dup2(child_stdin, libc::STDIN_FILENO) < 0
+            || libc::dup2(child_stdout, libc::STDOUT_FILENO) < 0
+            || libc::dup2(child_stderr, libc::STDERR_FILENO) < 0
+        {
+            fail_child(error_write, child_status::DUP);
+        }
+        close_inherited_descriptors(error_write);
+        if libc::chroot(root.as_ptr()) != 0 {
+            fail_child(error_write, child_status::CHROOT);
+        }
+        if libc::chdir(working.as_ptr()) != 0 {
+            fail_child(error_write, child_status::CHDIR);
+        }
+        if libc::setgroups(0, std::ptr::null()) != 0 {
+            fail_child(error_write, child_status::GROUPS);
+        }
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            fail_child(error_write, child_status::NO_NEW_PRIVS);
+        }
+        if libc::setgid(gid) != 0 || libc::setuid(uid) != 0 {
+            fail_child(error_write, child_status::CREDENTIALS);
+        }
+        libc::execve(executable.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        fail_child(error_write, child_status::EXEC);
+    }
+}
+
+unsafe fn fail_child(error_write: RawFd, code: u8) -> ! {
+    // SAFETY: `error_write` is the live setup pipe write end and the one-byte
+    // value is a stack local.
+    unsafe {
+        let byte = [code];
+        libc::write(error_write, byte.as_ptr().cast(), 1);
+        libc::_exit(127);
+    }
+}
+
+unsafe fn close_inherited_descriptors(preserve: RawFd) {
+    let mut limit = 4096_u64;
+    let mut rlimit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `rlimit` is writable and the call has no other effects.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlimit) } == 0
+        && rlimit.rlim_cur != libc::RLIM_INFINITY
+    {
+        limit = rlimit.rlim_cur.min(MAX_DESCRIPTOR_SCAN);
+    }
+    for fd in 3..limit as RawFd {
+        if fd != preserve {
+            // SAFETY: closing an unused descriptor is harmless; EBADF is
+            // ignored because most descriptors in the range are unused.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+fn await_setup(error_read: OwnedFd) -> Result<(), u8> {
+    let fd = error_read.as_raw_fd();
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `descriptor` is a single initialized pollfd.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, SETUP_TIMEOUT.as_millis() as i32) };
+        if ready < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(child_status::EXEC);
+        }
+        if ready == 0 {
+            return Err(child_status::EXEC);
+        }
+        let mut byte = [0_u8; 1];
+        // SAFETY: `byte` is a writable one-byte buffer on the setup pipe.
+        let read = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+        return match read {
+            1 => Err(byte[0]),
+            0 => Ok(()),
+            _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
+            _ => Err(child_status::EXEC),
+        };
+    }
+}
+
+/// Poll the live output pipes once and drain whatever is ready.
+fn drain_ready(
+    active: &mut Invocation,
+    limits: &RuntimeLimits,
+    timeout: Duration,
+    events: &mut Vec<Event>,
+) -> io::Result<()> {
+    let descriptors = poll_descriptors(active);
+    if descriptors.is_empty() {
+        return Ok(());
+    }
+    let ready = poll_once(&descriptors, timeout)?;
+    if !ready {
+        return Ok(());
+    }
+    drain_stream(active, OutputStream::Stdout, limits, events)?;
+    drain_stream(active, OutputStream::Stderr, limits, events)?;
+    Ok(())
+}
+
+/// Drain both streams to end of file after the cleanup kill. The pipes close
+/// asynchronously once every member is dead, so this polls with a bounded
+/// retry instead of reading a single time.
+fn drain_to_eof(
+    active: &mut Invocation,
+    limits: &RuntimeLimits,
+    events: &mut Vec<Event>,
+) -> io::Result<()> {
+    for _ in 0..64 {
+        drain_stream(active, OutputStream::Stdout, limits, events)?;
+        drain_stream(active, OutputStream::Stderr, limits, events)?;
+        if active.stdout_state.eof && active.stderr_state.eof {
+            return Ok(());
+        }
+        let descriptors = poll_descriptors(active);
+        if descriptors.is_empty() {
+            return Ok(());
+        }
+        let _ = poll_once(&descriptors, Duration::from_millis(100))?;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "workload output pipes did not reach end of file after cleanup",
+    ))
+}
+
+fn poll_descriptors(active: &Invocation) -> Vec<libc::pollfd> {
+    let mut descriptors = Vec::new();
+    if !active.stdout_state.eof
+        && let Some(fd) = active.stdout.as_ref()
+    {
+        descriptors.push(libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    if !active.stderr_state.eof
+        && let Some(fd) = active.stderr.as_ref()
+    {
+        descriptors.push(libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    descriptors
+}
+
+fn poll_once(descriptors: &[libc::pollfd], timeout: Duration) -> io::Result<bool> {
+    let mut descriptors = descriptors.to_vec();
+    // SAFETY: `descriptors` is a live, initialized array of pollfd values.
+    let ready = unsafe {
+        libc::poll(
+            descriptors.as_mut_ptr(),
+            descriptors.len() as libc::nfds_t,
+            timeout.as_millis() as i32,
+        )
+    };
+    if ready < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    Ok(ready > 0)
+}
+
+fn drain_stream(
+    active: &mut Invocation,
+    stream: OutputStream,
+    limits: &RuntimeLimits,
+    events: &mut Vec<Event>,
+) -> io::Result<()> {
+    let Invocation {
+        stdout_state,
+        stdout,
+        stderr_state,
+        stderr,
+        sequence,
+        frames,
+        id,
+        ..
+    } = active;
+    let (state, fd) = match stream {
+        OutputStream::Stdout => (stdout_state, stdout),
+        OutputStream::Stderr => (stderr_state, stderr),
+    };
+    if state.eof {
+        return Ok(());
+    }
+    let Some(fd) = fd.as_ref() else {
+        state.eof = true;
+        return Ok(());
+    };
+    let raw = fd.as_raw_fd();
+    loop {
+        let mut buffer = vec![0_u8; limits.output_frame_bytes];
+        // SAFETY: `buffer` is a writable buffer of its own length and `raw` is
+        // a live non-blocking pipe read end.
+        let read = unsafe { libc::read(raw, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if read < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        if read == 0 {
+            state.eof = true;
+            return Ok(());
+        }
+        buffer.truncate(read as usize);
+        if state.bytes.saturating_add(buffer.len() as u64) > limits.output_bytes as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invocation output exceeds the configured bound",
+            ));
+        }
+        state.hasher.update(&buffer);
+        *sequence += 1;
+        *frames += 1;
+        let offset = state.offset;
+        state.offset += buffer.len() as u64;
+        state.bytes += buffer.len() as u64;
+        events.push(Event::WorkloadOutput {
+            invocation: *id,
+            stream,
+            offset,
+            sequence: *sequence,
+            bytes: crate::protocol::encode_bytes(&buffer),
+        });
+    }
+}
+
+fn reap_primary(active: &mut Invocation) {
+    if active.exit.is_some() {
+        return;
+    }
+    let mut status = 0;
+    // SAFETY: `status` is writable and the pid is the invocation's primary
+    // child.
+    let reaped = unsafe { libc::waitpid(active.pid, &mut status, libc::WNOHANG) };
+    if reaped != active.pid {
+        return;
+    }
+    active.primary_reaped = true;
+    active.exit = if libc::WIFEXITED(status) {
+        Some(ProcessExit::Exited {
+            code: libc::WEXITSTATUS(status),
+        })
+    } else if libc::WIFSIGNALED(status) {
+        Some(ProcessExit::Signaled {
+            signal: libc::WTERMSIG(status),
+        })
+    } else {
+        None
+    };
+}
+
+/// Kill every remaining member, reap until only the agent remains, and drain
+/// the workload pipes to end of file before reporting the barrier.
+fn cleanup(
+    active: &mut Invocation,
+    scope: MemberScope,
+    limits: &RuntimeLimits,
+    events: &mut Vec<Event>,
+) -> io::Result<()> {
+    // The cleanup barrier is idempotent: a second call after completion emits
+    // nothing, so `poll` can be called freely once an invocation is idle.
+    if active.cleanup_complete {
+        return Ok(());
+    }
+    let mut reaped = active.reaped + u64::from(active.primary_reaped);
+    signal_members(active.pid, scope, TERMINATION_SIGNAL);
+    active.stdin = None;
+    for _ in 0..64 {
+        reaped += reap_children();
+        if !members_remain(scope, active.pid) {
+            break;
+        }
+        signal_members(active.pid, scope, TERMINATION_SIGNAL);
+    }
+    drain_to_eof(active, limits, events)?;
+    let exit = active.exit.unwrap_or(ProcessExit::Signaled {
+        signal: TERMINATION_SIGNAL,
+    });
+    let stdout_sha256 = finish_stream(&mut active.stdout_state);
+    let stderr_sha256 = finish_stream(&mut active.stderr_state);
+    active.reaped = reaped;
+    active.cleanup_complete = true;
+    active.stdout = None;
+    active.stderr = None;
+    events.push(Event::WorkloadExited {
+        invocation: active.id,
+        exit,
+        stdout_bytes: active.stdout_state.bytes,
+        stdout_sha256,
+        stderr_bytes: active.stderr_state.bytes,
+        stderr_sha256,
+        frames: active.frames,
+    });
+    events.push(Event::CleanupComplete {
+        invocation: active.id,
+        reaped,
+    });
+    let _ = std::fs::remove_dir_all(&active.root);
+    Ok(())
+}
+
+fn finish_stream(state: &mut StreamState) -> String {
+    let digest = std::mem::take(&mut state.hasher).finalize();
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
+fn reap_children() -> u64 {
+    let mut reaped = 0;
+    loop {
+        let mut status = 0;
+        // SAFETY: `status` is writable; only the agent's own children are
+        // reaped, which is exactly the invocation's direct members.
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid <= 0 {
+            break;
+        }
+        reaped += 1;
+    }
+    reaped
+}
+
+fn signal_members(pid: libc::pid_t, scope: MemberScope, signal: i32) {
+    match scope {
+        MemberScope::ProcessGroup => {
+            // SAFETY: signalling a process group is harmless when it is empty.
+            unsafe { libc::kill(-pid, signal) };
+        }
+        MemberScope::Guest => {
+            for member in guest_process_table() {
+                if member == std::process::id() {
+                    continue;
+                }
+                // SAFETY: signalling an arbitrary guest pid is safe in the
+                // dedicated guest; ESRCH is expected for exited members.
+                unsafe { libc::kill(member as libc::pid_t, signal) };
+            }
+        }
+    }
+}
+
+fn members_remain(scope: MemberScope, pid: libc::pid_t) -> bool {
+    match scope {
+        MemberScope::ProcessGroup => {
+            // SAFETY: signal 0 only probes for existence.
+            unsafe { libc::kill(-pid, 0) == 0 }
+        }
+        MemberScope::Guest => guest_process_table()
+            .into_iter()
+            .any(|member| member != std::process::id()),
+    }
+}
+
+fn guest_process_table() -> Vec<u32> {
+    let mut members = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return members;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Ok(pid) = name.parse::<u32>() {
+            members.push(pid);
+        }
+    }
+    members.sort_unstable();
+    members
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem and process primitives
+// ---------------------------------------------------------------------------
+
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions)
+}
+
+struct Pipe {
+    read: OwnedFd,
+    write: OwnedFd,
+}
+
+/// One close-on-exec pipe pair. The child clears the close-on-exec flag only on
+/// the three standard descriptors it `dup2`s, so an unconnected setup pipe is
+/// closed by a successful `execve`.
+fn create_pipe() -> io::Result<Pipe> {
+    let mut descriptors = [0_i32; 2];
+    // SAFETY: `descriptors` is a writable two-element array and O_CLOEXEC is a
+    // valid flag.
+    if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors were just created and are owned by this process.
+    let read = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    // SAFETY: see above.
+    let write = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    Ok(Pipe { read, write })
+}
+
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `fd` is a live descriptor and F_GETFL/F_SETFL have no side
+    // effects beyond the descriptor flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: see above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn unix_mode(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o7777
+}
+
+fn unix_owner(metadata: &std::fs::Metadata) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.uid(), metadata.gid())
+}
+
+fn unix_mtime(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.mtime().max(0) as u32
+}
+
+fn set_metadata(
+    path: &Path,
+    mode: u32,
+    (uid, gid): (u32, u32),
+    mtime: u32,
+    is_symlink: bool,
+) -> io::Result<()> {
+    let path_c = path_cstring(path)?;
+    if !is_symlink {
+        // SAFETY: `path_c` is a live NUL-terminated path.
+        if unsafe { libc::chmod(path_c.as_ptr(), mode as libc::mode_t) } != 0 {
+            return Err(invalid(format!(
+                "cannot set workload mode on {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            )));
+        }
+    }
+    // SAFETY: `path_c` is a live NUL-terminated path.
+    if unsafe { libc::lchown(path_c.as_ptr(), uid, gid) } != 0 {
+        return Err(invalid(format!(
+            "cannot set workload owner on {}: {}",
+            path.display(),
+            io::Error::last_os_error()
+        )));
+    }
+    // The field type is the platform `time_t`, which both the pinned glibc and
+    // musl targets define as a signed 64-bit integer. Naming it directly is
+    // deprecated on musl, so the value is converted rather than cast.
+    let seconds = i64::from(mtime);
+    let times = [
+        libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: 0,
+        },
+    ];
+    // SAFETY: `path_c` and `times` are live for the duration of the call.
+    if unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path_c.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(invalid(format!(
+            "cannot set workload timestamp on {}: {}",
+            path.display(),
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+fn mknod_device(path: &Path, major: u32, minor: u32) -> io::Result<()> {
+    let path_c = path_cstring(path)?;
+    let device = libc::makedev(major, minor);
+    // SAFETY: `path_c` is a live NUL-terminated path; the mode requests a
+    // character device with the canonical overlay permissions.
+    if unsafe {
+        libc::mknod(
+            path_c.as_ptr(),
+            libc::S_IFCHR | OVERLAY_DEVICE_MODE as libc::mode_t,
+            device,
+        )
+    } != 0
+    {
+        return Err(invalid(format!(
+            "cannot create overlay device {}: {}",
+            path.display(),
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+fn write_all(fd: RawFd, data: &[u8]) -> io::Result<()> {
+    let mut written = 0;
+    while written < data.len() {
+        // SAFETY: `data` is live and `fd` is the invocation's stdin write end.
+        let result =
+            unsafe { libc::write(fd, data[written..].as_ptr().cast(), data.len() - written) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if result == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "workload input pipe closed",
+            ));
+        }
+        written += result as usize;
+    }
+    Ok(())
+}
+
+fn path_cstring(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| invalid(format!("path {} contains a NUL byte", path.display())))
+}
+
+pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "simferret-runtime-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn template() -> TempDir {
+        let root = TempDir::new();
+        std::fs::create_dir_all(root.0.join("bin")).unwrap();
+        std::fs::write(root.0.join("bin/app"), b"payload").unwrap();
+        std::fs::create_dir_all(root.0.join("dev/empty")).unwrap();
+        std::fs::create_dir_all(root.0.join("tmp")).unwrap();
+        symlink("bin/app", root.0.join("link")).unwrap();
+        root
+    }
+
+    #[test]
+    fn the_overlay_profile_accepts_directories_and_content_outside_the_overlay() {
+        let root = template();
+        validate_template(&root.0, &RuntimeLimits::default()).unwrap();
+    }
+
+    #[test]
+    fn overlay_entries_must_be_directories() {
+        let root = template();
+        std::fs::remove_dir_all(root.0.join("tmp")).unwrap();
+        std::fs::write(root.0.join("tmp"), b"collision").unwrap();
+        let error = validate_template(&root.0, &RuntimeLimits::default()).unwrap_err();
+        assert!(error.to_string().contains("collides"), "{error}");
+
+        let root = template();
+        std::fs::write(root.0.join("dev/null"), b"collision").unwrap();
+        let error = validate_template(&root.0, &RuntimeLimits::default()).unwrap_err();
+        assert!(error.to_string().contains("collides"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_directory_tree_below_the_overlay_is_legal() {
+        let root = template();
+        std::fs::create_dir_all(root.0.join("tmp/nested")).unwrap();
+        validate_template(&root.0, &RuntimeLimits::default()).unwrap();
+    }
+
+    #[test]
+    fn template_bounds_are_enforced() {
+        let root = template();
+        let limits = RuntimeLimits {
+            template_entries: 1,
+            ..RuntimeLimits::default()
+        };
+        assert!(validate_template(&root.0, &limits).is_err());
+
+        let limits = RuntimeLimits {
+            template_path_bytes: 2,
+            ..RuntimeLimits::default()
+        };
+        assert!(validate_template(&root.0, &limits).is_err());
+    }
+
+    #[test]
+    fn template_special_files_are_rejected() {
+        let root = template();
+        let fifo = std::ffi::CString::new(root.0.join("pipe").as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a live NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let error = validate_template(&root.0, &RuntimeLimits::default()).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn launch_validation_rejects_unsafe_and_privileged_values() {
+        let base = LaunchIdentity {
+            executable: "/bin/app".into(),
+            arguments: vec!["/bin/app".into()],
+            environment: vec!["MODE=test".into()],
+            working_directory: "/".into(),
+            uid: 65534,
+            gid: 65534,
+        };
+        validate_launch(&base).unwrap();
+
+        let mut escaping = base.clone();
+        escaping.executable = "/../bin/app".into();
+        assert!(validate_launch(&escaping).is_err());
+
+        let mut relative = base.clone();
+        relative.executable = "bin/app".into();
+        assert!(validate_launch(&relative).is_err());
+
+        let mut root = base.clone();
+        root.uid = 0;
+        assert!(validate_launch(&root).is_err());
+
+        let mut empty = base.clone();
+        empty.arguments.clear();
+        assert!(validate_launch(&empty).is_err());
+
+        let mut mismatched = base.clone();
+        mismatched.arguments = vec!["/bin/other".into()];
+        assert!(validate_launch(&mismatched).is_err());
+
+        let mut environment = base.clone();
+        environment.environment = vec!["MODE".into()];
+        assert!(validate_launch(&environment).is_err());
+
+        let mut relative_working = base;
+        relative_working.working_directory = "tmp".into();
+        assert!(validate_launch(&relative_working).is_err());
+    }
+}

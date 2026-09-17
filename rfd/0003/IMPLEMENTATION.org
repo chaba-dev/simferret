@@ -77,31 +77,31 @@ content-addressed guest workload, and preserve exact passive replay.
 
 * Phase 2 — Guest process runtime
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
-- [ ] Assemble binary and OCI workloads below the same reserved initramfs root
+- [X] Assemble binary and OCI workloads below the same reserved initramfs root
   while keeping the PID-1 agent and tools outside it.
-- [ ] Materialize a fresh writable root from an immutable template for every
+- [X] Materialize a fresh writable root from an immutable template for every
   invocation, synthesize deterministic ~/tmp~, ~/dev/null~, and ~/dev/zero~
   metadata, and reject overlay collisions.
-- [ ] In the child only, connect standard pipes, close inherited descriptors,
+- [X] In the child only, connect standard pipes, close inherited descriptors,
   chroot and change directory, clear groups, set ~no_new_privs~, drop to the
   normalized nonzero GID and UID, and exec without a shell.
-- [ ] Add generic versioned start, stdin-write, stdin-EOF, and fixed-SIGKILL
+- [X] Add generic versioned start, stdin-write, stdin-EOF, and fixed-SIGKILL
   termination commands with stable invocation identifiers and contiguous input
   offsets.
-- [ ] Emit bounded live stdout and stderr frames with invocation, stream offset,
+- [X] Emit bounded live stdout and stderr frames with invocation, stream offset,
   cross-stream sequence, exact bytes, and independently checked final totals and
   digests; make overflow or transport failure explicit and fatal.
-- [ ] Treat every non-agent guest process as invocation membership, kill and
+- [X] Treat every non-agent guest process as invocation membership, kill and
   reap through a process-table-and-pipe-EOF cleanup barrier, and refuse restart
   before cleanup completes.
-- [ ] Prove an escaped double-fork descendant retaining an output descriptor and
+- [X] Prove an escaped double-fork descendant retaining an output descriptor and
   first-invocation root mutations cannot satisfy later recovery.
-- [ ] Keep application protocol interpretation and assertions in the host
+- [X] Keep application protocol interpretation and assertions in the host
   scenario checker; limit the guest agent to generic process and byte facts.
-- [ ] Separate owner-only replay closure and optional bounded output bytes from
+- [X] Separate owner-only replay closure and optional bounded output bytes from
   default shareable failure metadata, which contains no environment values or
   stream bytes.
 
