@@ -4,11 +4,23 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::assertions::AssertionReport;
+use crate::workload::LaunchIdentity;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_LENGTH: usize = 1024 * 1024;
 pub const MAX_REQUEST_DATA_LENGTH: usize = 64 * 1024;
 pub const SERIAL_ACK: u8 = 0;
+
+/// The largest exact byte string one `stdin-write` command may carry.
+pub const MAX_STDIN_FRAME_BYTES: usize = 4096;
+/// The largest exact byte string one live output frame may carry.
+pub const MAX_OUTPUT_FRAME_BYTES: usize = 4096;
+/// The complete bounded input one invocation may accept.
+pub const MAX_INVOCATION_INPUT_BYTES: usize = 16 << 20;
+/// The complete bounded output one invocation may produce per stream.
+pub const MAX_INVOCATION_OUTPUT_BYTES: usize = 16 << 20;
+/// The initial profile's unconditional termination signal.
+pub const TERMINATION_SIGNAL: i32 = libc::SIGKILL;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -40,6 +52,23 @@ pub enum Command {
     Check {
         outage_event_bound: u64,
         liveness_event_bound: u64,
+    },
+    Start {
+        invocation: u64,
+        launch: LaunchIdentity,
+    },
+    StdinWrite {
+        invocation: u64,
+        offset: u64,
+        /// Lowercase hexadecimal exact bytes, bounded by
+        /// [`MAX_STDIN_FRAME_BYTES`].
+        bytes: String,
+    },
+    StdinEof {
+        invocation: u64,
+    },
+    Terminate {
+        invocation: u64,
     },
     Shutdown {},
 }
@@ -100,7 +129,99 @@ pub enum Event {
     AssertionsEvaluated {
         report: AssertionReport,
     },
+    WorkloadStarted {
+        invocation: u64,
+        launch: LaunchIdentity,
+    },
+    InputAccepted {
+        invocation: u64,
+        offset: u64,
+        bytes: u64,
+        eof: bool,
+    },
+    TerminationRequested {
+        invocation: u64,
+        signal: i32,
+    },
+    WorkloadOutput {
+        invocation: u64,
+        stream: OutputStream,
+        offset: u64,
+        sequence: u64,
+        /// Lowercase hexadecimal exact bytes, bounded by
+        /// [`MAX_OUTPUT_FRAME_BYTES`].
+        bytes: String,
+    },
+    WorkloadExited {
+        invocation: u64,
+        exit: ProcessExit,
+        stdout_bytes: u64,
+        stdout_sha256: String,
+        stderr_bytes: u64,
+        stderr_sha256: String,
+        frames: u64,
+    },
+    LaunchFailed {
+        invocation: u64,
+        failure: LaunchFailure,
+        detail: String,
+    },
+    CleanupComplete {
+        invocation: u64,
+        reaped: u64,
+    },
     AgentStopped {},
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl OutputStream {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ProcessExit {
+    Exited { code: i32 },
+    Signaled { signal: i32 },
+}
+
+impl ProcessExit {
+    pub fn status_code(self) -> i32 {
+        match self {
+            Self::Exited { code } => code,
+            Self::Signaled { signal } => 128 + signal,
+        }
+    }
+}
+
+/// Typed reasons a workload child could not be launched. The companion
+/// `detail` string is bounded and never contains environment values or output
+/// bytes. Limits, offsets, and transport failures are infrastructure errors
+/// rather than launch results, so they are reported by failing the agent
+/// instead of by this type.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchFailure {
+    NoRuntime,
+    InvocationActive,
+    InvocationRepeated,
+    Materialization,
+    Executable,
+    WorkingDirectory,
+    Pipe,
+    Fork,
+    Setup,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -284,6 +405,48 @@ pub fn require_version(version: u16) -> io::Result<()> {
     }
 }
 
+/// Encode exact bytes as the lowercase hexadecimal form used by bounded
+/// `stdin-write` and output frames.
+pub fn encode_bytes(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(DIGITS[(byte >> 4) as usize] as char);
+        output.push(DIGITS[(byte & 0xf) as usize] as char);
+    }
+    output
+}
+
+/// Decode the lowercase hexadecimal form of at most `limit` exact bytes.
+/// Rejects odd length, non-hexadecimal characters, and any encoded value
+/// longer than the limit, so a frame can never expand past its bound.
+pub fn decode_bytes(text: &str, limit: usize) -> io::Result<Vec<u8>> {
+    if !text.len().is_multiple_of(2) || text.len() > limit.saturating_mul(2) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("byte frame must encode at most {limit} bytes"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().as_chunks::<2>().0 {
+        let high = hex_digit(pair[0])?;
+        let low = hex_digit(pair[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_digit(byte: u8) -> io::Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "byte frame contains a non-hexadecimal character",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -337,6 +500,94 @@ mod tests {
                 .kind(),
             io::ErrorKind::UnexpectedEof
         );
+    }
+
+    #[test]
+    fn process_commands_and_events_round_trip() {
+        let launch = crate::workload::LaunchIdentity {
+            executable: "/bin/app".into(),
+            arguments: vec!["/bin/app".into(), "--flag".into()],
+            environment: vec!["MODE=test".into()],
+            working_directory: "/".into(),
+            uid: 65534,
+            gid: 65534,
+        };
+        let commands = [
+            Command::Start {
+                invocation: 1,
+                launch: launch.clone(),
+            },
+            Command::StdinWrite {
+                invocation: 1,
+                offset: 0,
+                bytes: encode_bytes(b"\x00\xff exact"),
+            },
+            Command::StdinEof { invocation: 1 },
+            Command::Terminate { invocation: 1 },
+        ];
+        for command in commands {
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &command).unwrap();
+            assert_eq!(read_frame(&mut bytes.as_slice()).unwrap(), Some(command));
+        }
+        let events = [
+            Event::WorkloadStarted {
+                invocation: 1,
+                launch,
+            },
+            Event::InputAccepted {
+                invocation: 1,
+                offset: 3,
+                bytes: 2,
+                eof: false,
+            },
+            Event::TerminationRequested {
+                invocation: 1,
+                signal: TERMINATION_SIGNAL,
+            },
+            Event::WorkloadOutput {
+                invocation: 1,
+                stream: OutputStream::Stdout,
+                offset: 0,
+                sequence: 1,
+                bytes: encode_bytes(b"hi"),
+            },
+            Event::WorkloadExited {
+                invocation: 1,
+                exit: ProcessExit::Signaled {
+                    signal: TERMINATION_SIGNAL,
+                },
+                stdout_bytes: 2,
+                stdout_sha256: "0".repeat(64),
+                stderr_bytes: 0,
+                stderr_sha256: "0".repeat(64),
+                frames: 1,
+            },
+            Event::LaunchFailed {
+                invocation: 1,
+                failure: LaunchFailure::Materialization,
+                detail: "the fresh root could not be created".into(),
+            },
+            Event::CleanupComplete {
+                invocation: 1,
+                reaped: 2,
+            },
+        ];
+        for event in events {
+            let mut bytes = Vec::new();
+            write_line_frame(&mut bytes, &event).unwrap();
+            assert_eq!(read_line_frame(&mut bytes.as_slice()).unwrap(), Some(event));
+        }
+    }
+
+    #[test]
+    fn byte_frames_are_exact_and_bounded() {
+        assert_eq!(encode_bytes(b"\x00\x01\xfe\xff"), "0001feff");
+        assert_eq!(decode_bytes("0001feff", 4).unwrap(), b"\x00\x01\xfe\xff");
+        assert!(decode_bytes("001fe", 4).is_err());
+        assert!(decode_bytes("0001ff", 1).is_err());
+        assert!(decode_bytes("zz", 4).is_err());
+        assert!(decode_bytes("", 4).unwrap().is_empty());
     }
 
     #[test]
