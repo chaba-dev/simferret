@@ -597,10 +597,15 @@ fn replay_graph(
             })
         }
         SourceKind::Oci => {
-            let manifest_digest = closure
+            // The recorded digest is a raw closure value, so it is validated
+            // before it can reach a diagnostic that names it.
+            let raw_digest = closure
                 .manifest_digest
                 .clone()
                 .ok_or_else(|| invalid("OCI closure has no manifest digest"))?;
+            let hex = super::spec::parse_digest(&raw_digest)
+                .map_err(|_| invalid("the OCI closure manifest digest is not a sha256 digest"))?;
+            let manifest_digest = format!("sha256:{hex}");
             let layer_count = closure.layers.len();
             let expected = expected_oci_roles(layer_count);
             if objects.len() != expected.len()

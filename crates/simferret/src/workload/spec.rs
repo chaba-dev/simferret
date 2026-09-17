@@ -484,7 +484,10 @@ pub fn normalize_working_directory(value: Option<&str>, tree: &Tree) -> io::Resu
     let relative = if stripped.is_empty() {
         ROOT_PATH.to_vec()
     } else {
-        super::tree::normalize_layer_path(stripped.as_bytes())?
+        // The helper reports the path it rejected, and a working directory is
+        // part of the launch identity, so only the field is reported here.
+        super::tree::normalize_layer_path(stripped.as_bytes())
+            .map_err(|_| invalid("the working directory is not a valid in-root path"))?
     };
     for ancestor in super::tree::ancestors(&relative)
         .into_iter()

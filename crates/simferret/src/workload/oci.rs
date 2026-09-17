@@ -306,13 +306,12 @@ fn select_manifest_descriptor(index: &Value, manifest_digest: &str) -> io::Resul
         })
         .collect();
     if selected.is_empty() {
-        return Err(invalid(format!(
-            "index has no descriptor for {manifest_digest}"
-        )));
+        // The digest is a raw closure value, so it is never echoed back.
+        return Err(invalid("index has no descriptor for the recorded manifest"));
     }
     if selected.len() > 1 {
         return Err(invalid(format!(
-            "index has {} descriptors for {manifest_digest}",
+            "index has {} descriptors for the recorded manifest",
             selected.len()
         )));
     }
@@ -394,7 +393,10 @@ fn normalize_launch(config: &Map<String, Value>, tree: &Tree) -> io::Result<Laun
     if !executable.starts_with('/') {
         return Err(invalid("the executable argument must be an absolute path"));
     }
-    let relative = normalize_layer_path(executable.trim_start_matches('/').as_bytes())?;
+    // The helper reports the path it rejected, and the executable argument is
+    // part of the launch identity, so only the field is reported here.
+    let relative = normalize_layer_path(executable.trim_start_matches('/').as_bytes())
+        .map_err(|_| invalid("the executable argument is not a valid in-root path"))?;
     let entry = tree
         .get(&relative)
         .ok_or_else(|| invalid("the executable argument is not a file in the workload"))?;
@@ -984,6 +986,25 @@ mod tests {
         let error = normalize_launch(&config_with(json!(["/bin/SECRET=launch-marker"])), &tree)
             .unwrap_err();
         assert!(!error.to_string().contains("launch-marker"), "{error}");
+
+        // A correctly typed entrypoint that escapes the workload root through a
+        // traversal component, whose path helper quotes the path it rejected.
+        let error = normalize_launch(&config_with(json!(["/bin/../SECRET=launch-marker"])), &tree)
+            .unwrap_err();
+        assert!(!error.to_string().contains("launch-marker"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_manifest_descriptor_never_quotes_the_digest() {
+        let index = json!({
+            "schemaVersion": 2,
+            "manifests": [{"digest": "sha256:aa", "mediaType": "x", "size": 1}],
+        });
+        let Err(error) = select_manifest_descriptor(&index, "SECRET=digest-marker") else {
+            panic!("the marker digest selects nothing");
+        };
+        assert!(!error.to_string().contains("digest-marker"), "{error}");
+        assert!(error.to_string().contains("recorded manifest"), "{error}");
     }
 
     #[test]
