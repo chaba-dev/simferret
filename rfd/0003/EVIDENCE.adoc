@@ -1393,7 +1393,12 @@ replaces every private path it knows — the staging directory, the runtime
 directory, and the whole runs directory, which holds the workload store, the
 guest image cache, and the run artifacts — with a fixed `<private-path>` label,
 so a diagnostic that names one of them cannot carry the operator's own path into
-the shareable report.
+the shareable report. Every representation is covered, because the path can be
+relative, QEMU comma-escaped, or Rust debug-escaped, and the replacement only
+applies at a path boundary so an unrelated longer name that shares a prefix
+survives. The store and cache rejections do not render the path at all: they name
+the object with a fixed label, and the record path derives the store and cache
+from the canonicalized runs directory.
 
 === Adversarial review hardening
 
@@ -1673,7 +1678,10 @@ manifest, and replay preflight are exercised without QEMU. The tests cover:
 * a trace whose input acknowledgements repeat a saturated offset, which must fail
   process safety; and
 * a record against a marked runs directory whose store is not owner-only, whose
-  retained report must replace the whole path.
+  retained report must name a fixed label; and
+* a sanitizer case covering the plain, QEMU-escaped, and debug-escaped
+  representations of a private path and a longer unrelated name that shares its
+  prefix.
 
 `crates/simferret/tests/rfd3_phase3.rs` pins the public contract: the strict
 versioned workload scenario, the seeded choice plan and its bounds, the request

@@ -356,6 +356,18 @@ content-addressed guest workload, and preserve exact passive replay.
   - [X] Add regression tests for each fix: two witness cases that precede their
     transition, a non-advancing input offset, and a record against a marked runs
     directory whose store is not owner-only.
+- [X] Harden the phase against the twelfth adversarial review, which confirmed the
+  two eleventh-round checker fixes and found the operational-path fix incomplete:
+  - [X] Name the store and guest image cache with fixed labels instead of their
+    host paths, because those rejections reach the shareable report.
+  - [X] Derive the workload store and image cache from the canonicalized runs
+    directory, so a relative `--runs-dir` cannot disagree with the path the report
+    sanitizer replaces.
+  - [X] Replace every representation of a private path in a retained report —
+    plain, QEMU comma-escaped, and Rust debug-escaped — and only at a path
+    boundary, so an unrelated longer name that shares a prefix survives.
+  - [X] Add regression tests for each fix: the fixed-label store rejection and a
+    sanitizer case covering all three representations plus the shared prefix.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
