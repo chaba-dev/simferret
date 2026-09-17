@@ -76,11 +76,14 @@ pub fn expected_network_line(request: &PlannedRequest, phase: RequestPhase) -> S
     }
 }
 
-/// One complete output line and the event that completed it.
+/// One complete output line, the event that completed it, and the event that
+/// carried its first byte. A line may complete in a later frame than it started,
+/// so the first byte is what must follow the command that produced it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CompletedLine {
     text: String,
     event_id: u64,
+    first_event_id: u64,
 }
 
 #[derive(Debug, Default)]
@@ -93,6 +96,11 @@ struct InvocationStreams {
     stderr_pending: Vec<u8>,
     stdout_lines: Vec<CompletedLine>,
     stderr_lines: Vec<CompletedLine>,
+    /// The event that carried the first byte of the current stdout line, while
+    /// that line is still incomplete.
+    stdout_line_event: Option<u64>,
+    /// The event that carried the first byte of the current stderr line.
+    stderr_line_event: Option<u64>,
     stdout_offset: u64,
     stderr_offset: u64,
     /// Whether the current stdout line has already exceeded the response bound.
@@ -106,8 +114,9 @@ struct InvocationStreams {
     /// The command identifiers of the accepted inputs, in arrival order.
     input_commands: Vec<u64>,
     /// Data acknowledgements, which must correspond one to one with the
-    /// responses the invocation produced.
-    data_inputs: u64,
+    /// responses the invocation produced. The event identifiers are retained so
+    /// a response can be required to follow the command it answers.
+    data_input_events: Vec<u64>,
     /// End-of-input acknowledgements, of which there must be exactly one and it
     /// must be the last accepted input.
     eof_inputs: u64,
@@ -135,18 +144,20 @@ impl InvocationStreams {
         }
         self.sequence = sequence;
         self.frames += 1;
-        let (stream_bytes, pending, lines, current_offset) = match stream {
+        let (stream_bytes, pending, lines, current_offset, line_event) = match stream {
             OutputStream::Stdout => (
                 &mut self.stdout,
                 &mut self.stdout_pending,
                 &mut self.stdout_lines,
                 &mut self.stdout_offset,
+                &mut self.stdout_line_event,
             ),
             OutputStream::Stderr => (
                 &mut self.stderr,
                 &mut self.stderr_pending,
                 &mut self.stderr_lines,
                 &mut self.stderr_offset,
+                &mut self.stderr_line_event,
             ),
         };
         if offset != *current_offset {
@@ -157,6 +168,9 @@ impl InvocationStreams {
         }
         *current_offset = offset.saturating_add(data.len() as u64);
         stream_bytes.extend_from_slice(data);
+        if pending.is_empty() && !data.is_empty() {
+            *line_event = Some(frame.event_id);
+        }
         pending.extend_from_slice(data);
         while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
             let line = pending.drain(..=index).collect::<Vec<u8>>();
@@ -173,9 +187,14 @@ impl InvocationStreams {
             lines.push(CompletedLine {
                 text,
                 event_id: frame.event_id,
+                first_event_id: line_event.take().unwrap_or(frame.event_id),
             });
             if stream == OutputStream::Stdout {
                 self.stdout_over_bound = false;
+            }
+            if !pending.is_empty() {
+                // The rest of this frame belongs to the next line.
+                *line_event = Some(frame.event_id);
             }
         }
         // A line that already exceeds the bound without a newline is a failing
@@ -247,7 +266,7 @@ impl InvocationStreams {
             self.eof_inputs += 1;
             self.input_eof = true;
         } else {
-            self.data_inputs += 1;
+            self.data_input_events.push(event_id);
         }
     }
 }
@@ -957,19 +976,37 @@ fn response_integrity(trace: &WorkloadTrace, choices: &WorkloadChoicePlan) -> As
         // acceptance contract ends the surviving invocation's input, so its end
         // of input is required, not merely permitted: a recording that omits it
         // has not exercised the scenario.
-        let (data_inputs, eof_inputs) = trace
+        let (data_input_events, eof_inputs) = trace
             .invocations
             .get(&invocation)
-            .map_or((0, 0), |streams| (streams.data_inputs, streams.eof_inputs));
+            .map_or((&[][..], 0), |streams| {
+                (streams.data_input_events.as_slice(), streams.eof_inputs)
+            });
         let expected_inputs = (expected.len() - 1) as u64;
         let expected_eofs = u64::from(invocation == 2);
-        if data_inputs != expected_inputs || eof_inputs != expected_eofs {
+        if data_input_events.len() as u64 != expected_inputs || eof_inputs != expected_eofs {
             return failed(
                 AssertionName::ResponseIntegrity,
                 format!(
-                    "invocation {invocation} acknowledged {data_inputs} input command(s) and {eof_inputs} end(s) of input; expected {expected_inputs} and {expected_eofs}"
+                    "invocation {invocation} acknowledged {} input command(s) and {eof_inputs} end(s) of input; expected {expected_inputs} and {expected_eofs}",
+                    data_input_events.len()
                 ),
             );
+        }
+        // A response cannot answer a command the invocation had not accepted
+        // yet, so each response line must begin after the acknowledgement it
+        // answers. The line's first byte is what must follow the
+        // acknowledgement, because a line may complete in a later frame than the
+        // one that started it.
+        for (index, acknowledged) in data_input_events.iter().enumerate() {
+            if actual[index + 1].first_event_id <= *acknowledged {
+                return failed(
+                    AssertionName::ResponseIntegrity,
+                    format!(
+                        "invocation {invocation} response line {index} was recorded before the input command it answers"
+                    ),
+                );
+            }
         }
     }
     let application_error = trace
@@ -1610,6 +1647,46 @@ mod tests {
         );
         let report = evaluate_workload(&events, &scenario(), &choices, &launch());
         assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
+    }
+
+    #[test]
+    fn a_response_recorded_before_its_input_acknowledgement_fails_response_integrity() {
+        // A response cannot answer a command the guest had not accepted yet, even
+        // though moving it earlier leaves the ordered lines and the aggregate
+        // acknowledgement counts unchanged.
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let wanted = format!("{FRESH_STATE_LINE}\n");
+        let index = events
+            .iter()
+            .position(|frame| {
+                matches!(
+                    &frame.event,
+                    Event::WorkloadOutput { invocation: 1, bytes, .. }
+                        if crate::protocol::decode_bytes(bytes, 1024).unwrap() == wanted.as_bytes()
+                )
+            })
+            .expect("the fixture reports the first invocation's fresh state");
+        assert!(
+            matches!(events[index - 1].event, Event::InputAccepted { .. }),
+            "{:?}",
+            events[index - 1]
+        );
+        events.swap(index - 1, index);
+        // Keep the identifiers increasing: the response keeps the earlier one.
+        let earlier = events[index].event_id;
+        let later = events[index - 1].event_id;
+        events[index - 1].event_id = earlier;
+        events[index].event_id = later;
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[1].passed, "{:#?}", report.assertions);
+        assert!(
+            report.assertions[1]
+                .detail
+                .contains("before the input command"),
+            "{}",
+            report.assertions[1].detail
+        );
     }
 
     #[test]

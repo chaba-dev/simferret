@@ -3125,6 +3125,9 @@ mod tests {
         exit_on_outage: bool,
         /// Report a stale root witness, as a reused workload root would.
         stale_root: bool,
+        /// Answer the state command during the preceding echo command, so the
+        /// response is buffered before the command it answers is accepted.
+        state_before_its_command: bool,
         /// Exit the invocation immediately after its startup line, before any
         /// input is read.
         exit_after_start: bool,
@@ -3235,6 +3238,7 @@ mod tests {
                 outage_active: false,
                 exit_on_outage: self.exit_on_outage,
                 stale_root: false,
+                state_before_its_command: false,
                 exit_after_start: false,
                 duplicate_input_accept: false,
                 mismatched_network: false,
@@ -3460,7 +3464,20 @@ mod tests {
                     OutputStream::Stdout,
                     &format!("echo value={token}\n"),
                 );
+                if self.state_before_its_command {
+                    // The next command's response is already buffered, so the
+                    // driver's next wait consumes it without a new frame.
+                    self.emit_output(
+                        command_id,
+                        invocation,
+                        OutputStream::Stdout,
+                        &format!("{FRESH_STATE_LINE}\n"),
+                    );
+                }
             } else if line == "state" {
+                if self.state_before_its_command {
+                    return;
+                }
                 let response = if self.stale_root {
                     "state value=stale root=stale\n".to_owned()
                 } else {
@@ -3970,6 +3987,7 @@ mod tests {
             outage_active: false,
             exit_on_outage: false,
             stale_root: false,
+            state_before_its_command: false,
             exit_after_start: false,
             duplicate_input_accept: false,
             mismatched_network: false,
@@ -5972,6 +5990,7 @@ mod tests {
             outage_active: false,
             exit_on_outage: false,
             stale_root: false,
+            state_before_its_command: false,
             exit_after_start: false,
             duplicate_input_accept: false,
             mismatched_network: false,
@@ -6003,6 +6022,25 @@ mod tests {
         let mut diagnostics = failure_diagnostics("record");
         drive_workload_scenario(scenario, choices, &workload_launch(), vm, &mut diagnostics)
             .expect("an application failure must not become an infrastructure failure")
+    }
+
+    #[test]
+    fn a_response_emitted_before_its_command_fails_response_integrity() {
+        // The driver consumes the next buffered line for the command it just
+        // sent, so a workload that answers a command before accepting it is
+        // accepted by the driver. Only the checker can reject the recording.
+        let mut vm = fake_workload_vm();
+        vm.state_before_its_command = true;
+        let (_, report) = drive_fake_workload(&mut vm);
+        assert!(!report.passed, "{:#?}", report.assertions);
+        assert!(!report.assertions[1].passed, "{:#?}", report.assertions);
+        assert!(
+            report.assertions[1]
+                .detail
+                .contains("before the input command"),
+            "{}",
+            report.assertions[1].detail
+        );
     }
 
     #[test]
@@ -6155,6 +6193,7 @@ mod tests {
             outage_active: false,
             exit_on_outage: false,
             stale_root: false,
+            state_before_its_command: false,
             exit_after_start: false,
             duplicate_input_accept: false,
             mismatched_network: false,
