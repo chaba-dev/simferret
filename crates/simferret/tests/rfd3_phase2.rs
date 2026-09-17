@@ -6,8 +6,14 @@
 //!
 //! The runtime changes the child root, drops to nonzero credentials, and
 //! creates the overlay device nodes, so these tests require root. They skip
-//! with an explicit diagnostic when the effective user is not root; the guest
-//! path exercises the same code as PID 1 in the QEMU acceptance.
+//! with an explicit diagnostic when the effective user is not root.
+//!
+//! The checked-in acceptance path is `scripts/rfd3-phase2-runtime.sh`, which
+//! runs this binary as PID 1 in a fresh PID namespace. The guest-wide cleanup
+//! barrier signals the whole process table, so it is only meaningful where the
+//! agent owns that table; the namespace gives it one without reaching the host.
+//! The same binary is what the guest image carries, but a recorded QEMU
+//! acceptance of the phase 2 runtime is Phase 3 work and is not claimed here.
 //!
 //! The fixture is the pinned static busybox, copied into the template and
 //! executed as the workload. It is ordinary Linux software with no SimFerret
@@ -19,6 +25,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use simferret::protocol::{Event, LaunchFailure, OutputStream, ProcessExit, encode_bytes};
@@ -78,6 +85,9 @@ fn template(label: &str) -> (TempDir, PathBuf) {
     // A second applet name so the escaped-descendant fixture can call `setsid`
     // without relying on busybox standalone applet lookup.
     std::os::unix::fs::symlink("sh", bin.join("setsid")).unwrap();
+    // The descendant fixtures block in `sleep`, which is an applet as well: a
+    // missing applet would make them exit immediately and pass vacuously.
+    std::os::unix::fs::symlink("sh", bin.join("sleep")).unwrap();
     fs::create_dir_all(template.join("tmp")).unwrap();
     fs::create_dir_all(template.join("dev")).unwrap();
     (root, shell)
@@ -207,39 +217,64 @@ fn restore_descriptor_limit(previous: u64) {
 }
 
 #[test]
-fn live_output_frames_carry_exact_bytes_offsets_and_sequence() {
+fn output_frames_are_contiguous_per_stream_and_sequenced() {
     if !require_root() {
         return;
     }
     let (root, _) = template("output");
     let mut runtime = runtime(&root);
     let events = run_script(&mut runtime, 1, "printf 'first\\n'; printf 'err\\n' 1>&2");
-    let stdout = stdout_bytes(&events);
-    assert_eq!(stdout, b"first\n");
-    let frames: Vec<_> = events
-        .iter()
-        .filter_map(|event| match event {
-            Event::WorkloadOutput {
-                stream,
-                offset,
-                sequence,
-                bytes,
-                ..
-            } => Some((*stream, *offset, *sequence, bytes.clone())),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(frames.len(), 2, "one frame per stream: {frames:#?}");
-    assert_eq!(frames[0].0, OutputStream::Stdout);
-    assert_eq!(frames[0].1, 0);
-    assert_eq!(frames[0].2, 1);
-    assert_eq!(frames[1].0, OutputStream::Stderr);
-    assert_eq!(frames[1].1, 0);
-    assert_eq!(frames[1].2, 2);
+    assert_eq!(stdout_bytes(&events), b"first\n");
+
+    // The contract is per stream, not per frame: offsets start at zero and are
+    // contiguous within a stream, sequence numbers are contiguous across the
+    // whole series of frames, and the concatenated bytes are exact. How the
+    // bytes are split into frames is not part of the contract.
+    let mut stdout_offset = 0_u64;
+    let mut stderr_offset = 0_u64;
+    let mut sequences = Vec::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    for event in &events {
+        let Event::WorkloadOutput {
+            stream,
+            offset,
+            sequence,
+            bytes,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let decoded = simferret::protocol::decode_bytes(bytes, 4096).unwrap();
+        match stream {
+            OutputStream::Stdout => {
+                assert_eq!(
+                    *offset, stdout_offset,
+                    "offsets must be contiguous per stream"
+                );
+                stdout_offset += decoded.len() as u64;
+                stdout.extend_from_slice(&decoded);
+            }
+            OutputStream::Stderr => {
+                assert_eq!(
+                    *offset, stderr_offset,
+                    "offsets must be contiguous per stream"
+                );
+                stderr_offset += decoded.len() as u64;
+                stderr.extend_from_slice(&decoded);
+            }
+        }
+        sequences.push(*sequence);
+    }
     assert_eq!(
-        simferret::protocol::decode_bytes(&frames[1].3, 4096).unwrap(),
-        b"err\n"
+        sequences,
+        (1..=sequences.len() as u64).collect::<Vec<_>>(),
+        "sequence numbers must be contiguous and start at one"
     );
+    assert_eq!(stdout, b"first\n");
+    assert_eq!(stderr, b"err\n");
+
     let (stdout_count, stdout_digest) = stream_summary(&events, OutputStream::Stdout);
     assert_eq!(stdout_count, 6);
     assert_eq!(stdout_digest, sha256_hex(b"first\n"));
@@ -483,12 +518,69 @@ fn an_escaped_descendant_cannot_outlive_the_cleanup_barrier() {
         scope: MemberScope::Guest,
     })
     .unwrap();
-    // The descendant calls setsid, so it escapes the invocation's process
+    // The descendant calls `setsid`, so it escapes the invocation's process
     // group, and it retains the inherited standard output pipe. The barrier can
     // only complete once the guest-wide sweep kills it.
-    let events = run_script(&mut runtime, 1, "(setsid sleep 30 &) ; printf 'escaped\\n'");
+    //
+    // The descendant publishes its own identifier after `setsid`, and the test
+    // confirms from the host that the descendant really became its own process
+    // group leader before it terminates the primary. Without that handshake the
+    // test would pass even if `setsid` had failed, because the group sweep would
+    // have killed the descendant anyway.
+    let mut events = runtime.start(
+        1,
+        &launch("(setsid sh -c 'printf %s $$ > /tmp/descendant.pid; sleep 30' &) ; printf 'escaped\\n'; sleep 30"),
+    );
+    let published = root.0.join("runtime/invocation-1/tmp/descendant.pid");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let descendant = loop {
+        events.extend(runtime.poll(Duration::from_millis(20)).unwrap());
+        if let Ok(contents) = fs::read_to_string(&published)
+            && let Ok(pid) = contents.trim().parse::<libc::pid_t>()
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the escaped descendant never published its identifier: {:?} {:?}",
+            fs::read_dir(root.0.join("runtime/invocation-1")).map(|entries| entries
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>()),
+            fs::read_dir(root.0.join("runtime/invocation-1/tmp")).map(|entries| entries
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>())
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stat = fs::read_to_string(format!("/proc/{descendant}/stat"))
+        .expect("the escaped descendant must be visible in the process table");
+    let fields: Vec<&str> = stat
+        .rsplit_once(')')
+        .expect("a stat line has a command terminator")
+        .1
+        .split_whitespace()
+        .collect();
+    // Fields after the command name start at the state, so the process group is
+    // at index 2 and the session at index 3.
+    assert_eq!(
+        fields[2].parse::<libc::pid_t>().unwrap(),
+        descendant,
+        "the descendant must lead its own process group: {stat}"
+    );
+    assert_eq!(
+        fields[3].parse::<libc::pid_t>().unwrap(),
+        descendant,
+        "the descendant must lead its own session: {stat}"
+    );
+
+    events.extend(runtime.terminate(1).unwrap());
+    poll_until_cleanup(&mut runtime, &mut events);
     assert_eq!(stdout_bytes(&events), b"escaped\n");
     assert!(matches!(events.last(), Some(Event::CleanupComplete { .. })));
+    assert!(
+        !std::path::Path::new(&format!("/proc/{descendant}")).exists(),
+        "the escaped descendant must not outlive the cleanup barrier"
+    );
 }
 
 #[test]
@@ -886,12 +978,30 @@ fn the_agent_drives_the_runtime_over_the_serial_control_channel() {
         simferret::agent::run_serial_with_runtime(&mut input, &mut output, Some(runtime))
     });
 
+    // Read the event channel while the agent runs. Every step below then waits
+    // for the agent to report the state it just reached, so the test never
+    // guesses with a sleep and never joins before the output is drained.
+    let collected = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&collected);
+    let reader = std::thread::spawn(move || {
+        let mut events = unsafe { fs::File::from_raw_fd(event_read) };
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match events.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => sink.lock().unwrap().extend_from_slice(&buffer[..read]),
+            }
+        }
+    });
+
     let mut commands = unsafe { fs::File::from_raw_fd(command_write) };
     let mut command_id = 0_u64;
+    let mut acknowledged = 0_usize;
     let mut send = |commands: &mut fs::File, command: Command| {
         command_id += 1;
+        let mut line = Vec::new();
         write_line_frame(
-            commands,
+            &mut line,
             &CommandFrame {
                 protocol_version: PROTOCOL_VERSION,
                 command_id,
@@ -899,6 +1009,10 @@ fn the_agent_drives_the_runtime_over_the_serial_control_channel() {
             },
         )
         .unwrap();
+        // The protocol acknowledges every byte of the command line, so the
+        // expected acknowledgement count is the number of bytes written.
+        acknowledged += line.len();
+        commands.write_all(&line).unwrap();
         commands.flush().unwrap();
         command_id
     };
@@ -909,7 +1023,13 @@ fn the_agent_drives_the_runtime_over_the_serial_control_channel() {
             launch: launch("while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done"),
         },
     );
-    std::thread::sleep(Duration::from_millis(300));
+    wait_for_frame(&collected, |frame| {
+        frame.command_id == start_id
+            && matches!(
+                frame.event,
+                simferret::protocol::Event::WorkloadStarted { .. }
+            )
+    });
     let write_id = send(
         &mut commands,
         Command::StdinWrite {
@@ -918,18 +1038,38 @@ fn the_agent_drives_the_runtime_over_the_serial_control_channel() {
             bytes: encode_bytes(b"live\n"),
         },
     );
-    std::thread::sleep(Duration::from_millis(300));
+    wait_for_frame(&collected, |frame| {
+        frame.command_id == write_id
+            && matches!(
+                frame.event,
+                simferret::protocol::Event::InputAccepted { eof: false, .. }
+            )
+    });
     let eof_id = send(&mut commands, Command::StdinEof { invocation: 1 });
-    std::thread::sleep(Duration::from_millis(300));
+    wait_for_frame(&collected, |frame| {
+        frame.command_id == eof_id
+            && matches!(
+                frame.event,
+                simferret::protocol::Event::InputAccepted { eof: true, .. }
+            )
+    });
+    wait_for_frame(&collected, |frame| {
+        matches!(
+            frame.event,
+            simferret::protocol::Event::CleanupComplete { .. }
+        )
+    });
     let shutdown_id = send(&mut commands, Command::Shutdown {});
+    wait_for_frame(&collected, |frame| {
+        frame.command_id == shutdown_id
+            && matches!(frame.event, simferret::protocol::Event::AgentStopped {})
+    });
     drop(commands);
 
     let status = agent.join().unwrap().unwrap();
     assert_eq!(status, 0);
-    let mut bytes = Vec::new();
-    unsafe { fs::File::from_raw_fd(event_read) }
-        .read_to_end(&mut bytes)
-        .unwrap();
+    reader.join().unwrap();
+    let bytes = collected.lock().unwrap().clone();
     let events = decode_serial_events(&bytes);
     assert!(
         events.iter().any(|frame| matches!(
@@ -970,8 +1110,32 @@ fn the_agent_drives_the_runtime_over_the_serial_control_channel() {
         &frame.event,
         simferret::protocol::Event::AgentStopped {}
     ) && frame.command_id == shutdown_id));
-    // Every command byte was acknowledged.
-    assert!(bytes.contains(&SERIAL_ACK));
+    // Every command byte was acknowledged exactly once, so no acknowledgement
+    // is lost, duplicated, or coalesced.
+    assert_eq!(
+        bytes.iter().filter(|byte| **byte == SERIAL_ACK).count(),
+        acknowledged,
+        "each of the {acknowledged} command bytes must be acknowledged exactly once"
+    );
+}
+
+/// Wait until the agent reports a frame matching `predicate`.
+fn wait_for_frame<F>(collected: &Arc<Mutex<Vec<u8>>>, predicate: F)
+where
+    F: Fn(&simferret::protocol::EventFrame) -> bool,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let frames = decode_serial_events(&collected.lock().unwrap());
+        if frames.iter().any(&predicate) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the agent did not report the expected state: {frames:#?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn pipe() -> (i32, i32) {
