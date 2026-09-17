@@ -47,8 +47,8 @@ no interpreter program header. A host-side protocol smoke produced:
 ----
 ready version=1
 echo value=asymmetric_42
-state value=fresh
-state value=stale
+state value=fresh root=fresh
+state value=stale root=stale
 stopped status=0
 ----
 
@@ -74,24 +74,24 @@ The captured measurements and identities are:
 | Object | Bytes | SHA-256
 
 | Fixture source
-| 8,049
-| `c7958b06f3ddbd292f8abd9b0466afa04e3afef13e5e5f7f219d1da37d1c2305`
+| 8,888
+| `34161feb2f7c3f8c28deef21dcf51a92e6f02df23cfe9e6bb3a62f730faf5a83`
 
 | Standalone executable
-| 70,760
-| `d54d4b2a92ace28707ce282a9734fbcdfec0cf30cf1bf0c4c7102bf7d95b6e5c`
+| 70,912
+| `582a51e4c5ed835752fa84809a8b5a2f5ecdf49736be7d93d72a6c23d069243f`
 
 | OCI config
 | 276
-| `63234a974712b148203f72a3336392013f55ab3505d032eaba829567ca229692`
+| `c7a8a586a744a35527d1e37cb3ebc9233d488b567ef5d58c115b59dd40bd7650`
 
 | OCI manifest
 | 399
-| `a143552c9fc2c01504eeb7c531d5661c4ab139fc488ca2175746e024787ee429`
+| `399efbdb79b760c5babc749882b385b36d6a8db1c5f68ecb411f76030aeb4e6d`
 
 | OCI layer and DiffID
 | 81,920
-| `f18056523d5c0125fffaf16b26766c7160fa01ef38a047a9cda41ae5a92dcbab`
+| `e80ac2d42a82e47fb34715c714da972d1aa4bf5e08bea87ffb3921d7ad230550`
 |===
 
 The complete five-file OCI layout is 82,932 bytes. These observations establish
@@ -161,14 +161,14 @@ path. Both are little-endian x86-64 Linux ELF executables.
 | Source object | Bytes | Interpreter | SHA-256
 
 | Static executable
-| 70,760
+| 70,912
 | none
-| `d54d4b2a92ace28707ce282a9734fbcdfec0cf30cf1bf0c4c7102bf7d95b6e5c`
+| `582a51e4c5ed835752fa84809a8b5a2f5ecdf49736be7d93d72a6c23d069243f`
 
 | Dynamic executable
-| 17,464
+| 21,648
 | `/lib64/ld-linux-x86-64.so.2`
-| `564436ee235a187b6cd77c30331a66a4d65b243d5ab8aa23a3cabc0e27f9c227`
+| `37cb51e280ffddd038442c878db111b407261f414ecbbdda3fcc6d025e18f1db`
 
 | In-image loader
 | 263,056
@@ -191,23 +191,23 @@ dynamic workload executed from its in-image loader and library closure.
 
 | Static, one uncompressed layer
 | 82,862
-| `sha256:a143552c9fc2c01504eeb7c531d5661c4ab139fc488ca2175746e024787ee429`
+| `sha256:399efbdb79b760c5babc749882b385b36d6a8db1c5f68ecb411f76030aeb4e6d`
 
 | Dynamic, gzip base layer plus uncompressed upper layer
-| 1,161,232
-| `sha256:a4247157fc885f8240537a0438859f66bf87035c299ba3c68ed688fc4d533440`
+| 1,171,472
+| `sha256:846176de46401217327ea8e25c3268f5ce46a3835b8308ddb91fe2a83cb18ad8`
 
 | Layer-semantics, two uncompressed layers
 | 113,807
-| `sha256:2b5049c261612fe971e11d4fcde29ebea2290fa84006d6045e634c8cd56602a0`
+| `sha256:0125b5e9911fcf46bb1af087942366823e37431e82bf63fbae9fca5ca9c932bc`
 
 | Root-opacity, two uncompressed layers
 | ---
-| `sha256:52ca65520ee15a147a6f837765114fcf3b4829d9e4dbe679f1b6141a874333ff`
+| `sha256:144d0c9fb7bd1486b2b922c04634d8173f80ac173c59c0969ceeecd54ccf6215`
 |===
 
 The static layout reproduces the entry gate's config and manifest digests
-exactly (`63234a97...` and `a143552c...`), which confirms the canonical JSON and
+exactly (`c7a8a586...` and `399efbdb...`), which confirms the canonical JSON and
 layer encoding are reproducible across independent generators. The entry gate's
 index annotation changes only `index.json` and therefore neither digest.
 
@@ -299,22 +299,22 @@ same limitation RFD 3 records for content digests generally.
 | Source | Raw bytes | Expanded bytes | Canonical digest | Assembly
 
 | Binary
-| 70,932
-| 70,760
-| `a94f6f18...fe8da3c1`
-| 68.1 ms
+| 71,084
+| 70,912
+| `9190efc1...2ee9e4af`
+| 69.6 ms
 
 | Static OCI
 | 82,862
-| 70,760
-| `a94f6f18...fe8da3c1`
-| 69.0 ms
+| 70,912
+| `9190efc1...2ee9e4af`
+| 71.7 ms
 
 | Dynamic OCI
-| 1,161,232
-| 2,685,424
-| `37967c0d...5ff32a273`
-| 92.6 ms
+| 1,171,472
+| 2,689,608
+| `773718c1...cd4b10ca6`
+| 97.1 ms
 |===
 
 The standalone static executable and the static OCI layout converged on the
@@ -343,36 +343,35 @@ empty initramfs.
 | Source | Initramfs bytes | Growth over baseline | Workload tree bytes | Record | Replay 1 | Replay 2
 
 | Binary
-| 52,336
-| 31,397
-| 70,760
-| 6.66 s
-| 12.79 s
-| 12.75 s
+| 53,079
+| 32,078
+| 70,912
+| 6.20 s
+| 10.71 s
+| 10.80 s
 
 | Static OCI
-| 52,337
-| 31,398
-| 70,760
-| 6.27 s
-| 10.26 s
-| 10.24 s
+| 53,080
+| 32,079
+| 70,912
+| 6.28 s
+| 10.96 s
+| 10.86 s
 
 | Dynamic OCI
-| 1,172,605
-| 1,151,666
-| 2,685,424
-| 6.63 s
-| 11.82 s
-| 11.84 s
+| 1,172,482
+| 1,151,481
+| 2,689,608
+| 6.01 s
+| 9.27 s
+| 9.35 s
 |===
 
-The workload-free baseline is 20,939 bytes. Replay logs were 10,488,297,
-7,578,583, and 10,066,941 bytes. Record serial streams had SHA-256 digests
-`a5bce29a...a3cc6c565`, `e3ad35b9...432f06702`, and `e9ab5d7e...20b150cb`; both
-replays of each source matched their record byte for byte, and those digests are
-unchanged from the pre-fix runs, so the supervisor's concurrent draining
-preserved the guest-visible output exactly. The initramfs is smaller than the
+The workload-free baseline is 21,001 bytes. Replay logs were 8,523,815,
+8,134,856, and 5,835,881 bytes. Record serial streams had SHA-256 digests
+`cc564e42...5ccc0bddafa`, `da3b4c38...cc73b0141b6`, and `328bb993...6af86a4aaf4c31`; both
+replays of each source matched their record byte for byte, so the supervisor's
+concurrent draining preserved the guest-visible output exactly. The initramfs is smaller than the
 workload tree for the static sources because the archive is gzip-compressed.
 Repeated independent runs reproduced every canonical digest and serial digest
 exactly; only durations and replay-log sizes moved with host scheduling, so no
@@ -427,7 +426,7 @@ materialized, and each left no partial directory:
 | `layer 0 descriptor digest does not match stored bytes`
 
 | Missing stored blob
-| `cannot open file 'blobs/sha256/f1805652...a92dcbab'`
+| `cannot open file 'blobs/sha256/e80ac2d4...d7ad230550'`
 
 | Nonempty whiteout marker
 | `whiteout marker at '.wh.victim' is not an empty regular file`
@@ -636,34 +635,34 @@ A representative run produced:
 | Measurement | Value
 
 | Fixture source SHA-256
-| `c7958b06...37d1c2305`
+| `34161feb...30faf5a83`
 
 | Static executable
-| 70,760 bytes, `d54d4b2a...f7d95b6e5c`
+| 70,912 bytes, `582a51e4...d069243f`
 
 | OCI layout
-| 82,854 bytes, selected manifest `sha256:69aa8d92...4773d34186f`
+| 82,854 bytes, selected manifest `sha256:3fa49528...c0798493`
 
 | Binary canonical / tree / template
-| `2fce0cfb...0a3c8faead` / `8b2c67a9...7c47d07f` / `10885d3e...da153c83`
+| `bfb6c8c9...87f8c91` / `0f30f1ef...0c7ccfe66` / `cc1946f3...4eac1db6`
 
 | OCI canonical / tree / template
 | identical to the binary source
 
 | Binary closure
-| `5c9368fe...00a4336635` (2 raw objects)
+| `2ad827ac...3f6e93e62` (2 raw objects)
 
 | OCI closure
-| `52bf3413...6d98b8bc` (5 raw objects)
+| `671b85dc...c312751ca` (5 raw objects)
 
 | Canonical entries / expanded bytes
-| 3 / 70,760 for both sources
+| 3 / 70,912 for both sources
 
 | Assembly duration (both sources)
-| 30.2 ms warm, 979 ms cold; durations move with host scheduling
+| 23.6 ms warm; durations move with host scheduling
 
 | Store bytes (binary / OCI)
-| 144,106 / 156,685
+| 144,410 / 156,837
 
 | Re-assembly
 | byte-identical summary and closure
@@ -1275,64 +1274,72 @@ is always strictly inside the sequence and distinct from both transitions.
 For each source form the script records the acceptance scenario, records the
 same scenario with a corrupted fixture response, removes the entire live source
 directory, passively replays the recording twice, and checks that a
-self-consistently changed workload lock, a changed derived cache entry, and a
-missing raw closure are each refused before QEMU starts. A representative
-unprivileged run produced:
+self-consistently changed workload lock, a changed derived cache entry, a missing
+raw closure, and a removed closure-referenced raw object are each refused before
+QEMU starts. It also requires two fresh-root witnesses per form, and requires the
+run directory, the guest image cache, and the workload store to be owner-only. A
+representative unprivileged run produced:
 
 [source,text]
 ----
 qemu_version=QEMU emulator version 11.1.0
 kernel=/nix/store/s40h0m3746r0l287laa9sxa9345bkykf-linux-6.18.49/bzImage
-static_fixture_sha256=d54d4b2a92ace28707ce282a9734fbcdfec0cf30cf1bf0c4c7102bf7d95b6e5c
-dynamic_fixture_sha256=564436ee235a187b6cd77c30331a66a4d65b243d5ab8aa23a3cabc0e27f9c227
+static_fixture_sha256=582a51e4c5ed835752fa84809a8b5a2f5ecdf49736be7d93d72a6c23d069243f
+dynamic_fixture_sha256=37cb51e280ffddd038442c878db111b407261f414ecbbdda3fcc6d025e18f1db
 dynamic_interpreter=/lib64/ld-linux-x86-64.so.2
-static_manifest_digest=sha256:69aa8d92ec10024ddf8fd22cf64ef67db48de0b9f2c1f9685960c4773d34186f
-dynamic_manifest_digest=sha256:a4247157fc885f8240537a0438859f66bf87035c299ba3c68ed688fc4d533440
-binary_canonical=2fce0cfb5c4741d5ec51555fa1d2848abc75fa9f2731902646afdd0a3c8faead
-binary_closure=5c9368fec665b1c8d4f842d3531ee6eb2c237078e78be0c45f11cc00a4336635
-binary_record_duration_ns=13988018779
-binary_replay_1_duration_ns=22061555510
-binary_replay_2_duration_ns=22278262480
-binary_store_bytes=144106
-binary_initramfs_bytes=2176547
-binary_semantic_outcome=96651af69f5eed265934f531ef3b02002836798ebd58e99e0314c252a57ddaed
+static_manifest_digest=sha256:3fa49528561cec23ff1f30d929a6362f2240add059f6a197b53073c0c0798493
+dynamic_manifest_digest=sha256:846176de46401217327ea8e25c3268f5ce46a3835b8308ddb91fe2a83cb18ad8
+binary_canonical=bfb6c8c9fe7ee7f612dca4b0dc76695c826ec2970bca968b3a401c21087f8c91
+binary_closure=2ad827acc0e604d1f806ba18a4e0930fddfaf7cb67916b4694d74873f6e93e62
+binary_record_duration_ns=9120231509
+binary_replay_1_duration_ns=15285330573
+binary_replay_2_duration_ns=15489995932
+binary_store_bytes=144410
+binary_initramfs_bytes=2187979
+binary_semantic_outcome=40431f4144c9aca39048191fff665b896b796cd68f3646d76ef6fdceb1be08bb
 binary_events=36
-binary_replay_log_bytes=9428509
-oci-static_canonical=2fce0cfb5c4741d5ec51555fa1d2848abc75fa9f2731902646afdd0a3c8faead
-oci-static_closure=52bf34133228d5cb42dafb30a0028ec522ed3cf282bff108362897696d98b8bc
-oci-static_record_duration_ns=19047738322
-oci-static_replay_1_duration_ns=26399053321
-oci-static_replay_2_duration_ns=26389992438
-oci-static_store_bytes=156685
-oci-static_initramfs_bytes=2176547
-oci-static_semantic_outcome=96651af69f5eed265934f531ef3b02002836798ebd58e99e0314c252a57ddaed
+binary_replay_log_bytes=6612322
+oci-static_canonical=bfb6c8c9fe7ee7f612dca4b0dc76695c826ec2970bca968b3a401c21087f8c91
+oci-static_closure=671b85dca94869d0f8e7b8a820bcd3892ea7334883ab5d95b3d4c1fc312751ca
+oci-static_record_duration_ns=20045197096
+oci-static_replay_1_duration_ns=27262514510
+oci-static_replay_2_duration_ns=27370961242
+oci-static_store_bytes=156837
+oci-static_initramfs_bytes=2187979
+oci-static_semantic_outcome=40431f4144c9aca39048191fff665b896b796cd68f3646d76ef6fdceb1be08bb
 oci-static_events=36
-oci-static_replay_log_bytes=8549284
-oci-dynamic_canonical=1112b7b8f52611a6b76a34885866f02e108056ca8f674e3d863db66786fb7832
-oci-dynamic_closure=0ddae3b8380960dca11e8304f64027df42eaca81fb5e546b2105c426b5346a41
-oci-dynamic_record_duration_ns=15317098605
-oci-dynamic_replay_1_duration_ns=21344324320
-oci-dynamic_replay_2_duration_ns=21383266879
-oci-dynamic_store_bytes=3850895
-oci-dynamic_initramfs_bytes=3300960
-oci-dynamic_semantic_outcome=6db37564f3d593328bda0565867d71517844b120aa528843ecc4a8a038ee8712
+oci-static_replay_log_bytes=8711357
+oci-dynamic_canonical=445d1445fe4532202a9860803cd6aaeb45e223125a9970a44a6b70cf7e9daf89
+oci-dynamic_closure=65fce5916519c4c9ec6cef0f0abcbe130823d4cbffd7598c11f2d1eee717868d
+oci-dynamic_record_duration_ns=16260407970
+oci-dynamic_replay_1_duration_ns=23074207592
+oci-dynamic_replay_2_duration_ns=23194709343
+oci-dynamic_store_bytes=3865319
+oci-dynamic_initramfs_bytes=3308963
+oci-dynamic_semantic_outcome=226712a5057bc1b95e9273b463c44e1ca58b05ff5c383bd63cf908034e4b6f04
 oci-dynamic_events=36
-oci-dynamic_replay_log_bytes=6715020
+oci-dynamic_replay_log_bytes=7682064
 intentional_divergence=process_safety and response_integrity failed with CLI status 1
 workload_lock_tamper_error=simferret: the workload lock identity differs from the manifest
 derived_template_tamper_error=simferret: derived guest template does not match the raw closure
+missing_raw_closure_error=simferret: raw closure raw/closure.json is missing
+missing_raw_object_error=simferret: raw object sha256:582a51e4c5ed835752fa84809a8b5a2f5ecdf49736be7d93d72a6c23d069243f is missing
+private_artifacts=run directory, guest image cache, and workload store are owner-only
+fresh_root_witnesses=state value=fresh root=fresh observed once per invocation
 ----
 
 The standalone binary and static OCI sources converge on one canonical digest
-(`2fce0cfb...`) and one semantic outcome digest (`96651af6...`), and both replay
+(`bfb6c8c9...`) and one semantic outcome digest (`40431f41...`), and both replay
 twice with byte-identical normalized events and assertions. The dynamically
-linked OCI source has its own canonical tree (`1112b7b8...`), executes from the
+linked OCI source has its own canonical tree (`445d1445...`), executes from the
 in-image interpreter and library closure, and replays twice with its own stable
 semantic outcome digest. Every replay begins after the form's whole source
 directory has been removed, so no live source, registry, daemon, host mount, or
 fixture interaction participates. Intentional response corruption makes
 `process_safety` and `response_integrity` fail and returns CLI status 1 for both
-source forms.
+source forms. Each form also reports the strengthened fresh-root witness twice,
+proves its run directory, guest image cache, and store are owner-only, and names
+the missing raw evidence in both tamper cases.
 
 === Two integration fixes
 
@@ -1372,13 +1379,79 @@ directory and carries bounded protocol metadata, counts, digests, and typed
 errors only; a regression test asserts that neither the recorded environment
 value nor a recorded workload output line appears anywhere in it.
 
+=== Adversarial review hardening
+
+The first adversarial review of the Phase 3 stack found fifteen issues, and every
+one of them was addressed in the same phase rather than deferred:
+
+* *Value-free diagnostics.* Every divergence, envelope, and parser diagnostic now
+  names the event kind and its non-secret coordinates (invocation, stream,
+  offsets, byte lengths, digests) instead of formatting whole events, commands,
+  or environment entries. A divergence or a malformed `NAME=VALUE` entry can no
+  longer put the recorded launch environment or exact stream bytes into
+  `failure.json` or the CLI error text. `Event::kind`/`Event::describe` and
+  `Command::kind`/`Command::describe` are the single source of those
+  descriptions, and a protocol unit test pins the tag names against the wire form
+  and asserts that no marker value survives.
+* *Owner-only image cache.* The `.images` cache is created `0700` with `0600`
+  entries, a reused entry has its mode repaired instead of trusted, and a
+  non-regular or foreign-owned entry is refused.
+* *Complete stream evaluation.* Per-invocation offset, sequence, and input-stream
+  violations are now evaluated alongside the trace-level ones; sequences must
+  start at one and stay contiguous; each accepted input must advance the accepted
+  offset by exactly its byte count and name a distinct later command; every
+  invocation must end on a complete stdout line; and no invocation may write a
+  single stderr byte.
+* *Process evidence.* The first cleanup barrier must reap at least two processes
+  (the terminated primary and the escaped descendant) and the escaped-descendant
+  line must precede the termination request, with termination, exit, and cleanup
+  ordered by event identifier.
+* *Restart recovery bound.* `bounded_recovery` now requires the restarted
+  invocation to answer its first command within the scenario's liveness bound, so
+  the first invocation's responses can no longer satisfy the property.
+* *Strict response matching.* The driver requires each invocation's *next*
+  complete line to equal the expected line. A wrong response therefore fails the
+  property through the checker instead of blocking until the VM deadline.
+* *Outage bookkeeping.* The driver tracks the administrative outage and restores
+  the network before an early shutdown, because the agent refuses to stop while
+  an outage is active. The fake guest enforces the same refusal, so forgetting
+  the restore is a test failure rather than a production-only infrastructure
+  error.
+* *Process-command safety.* The driver waits for an invocation's startup line
+  before its first command, folds every already-queued event before each process
+  command, and treats a terminal event observed while awaiting a response as an
+  orderly end. Passive replay can deliver events ahead of the commands that own
+  them, so a drain parks those events and preserves the exact read order.
+* *Envelope and acknowledgement correlation.* Every event's command identifier is
+  bounded by the last issued command, synchronous acknowledgements must name the
+  awaited command, `input-accepted` contents are validated against the sent
+  bytes, and the shutdown drain accepts only workload events.
+* *Preparation-time bounds.* `payload_bytes` is constrained to the fixture's
+  hex-encoded token limit (63 bytes) and the serialized start and widest input
+  frames are preflighted in both record and replay, so an undeliverable launch
+  identity or input fails before QEMU starts. The recorded event stream is
+  required to fit the replay artifact budget before anything is published.
+* *Acceptance harness.* The missing-raw case asserts the intended diagnostic
+  instead of any nonzero exit, and a removed closure-referenced raw object is
+  covered too. Only the acceptance report, process status, and shareable failure
+  bundles are uploaded from the Phase 3 diagnostics artifact.
+* *Stronger fresh-root witness.* The fixture mutates its own executable's mode in
+  the immutable workload root, outside the writable overlay, and each invocation
+  must report `state value=fresh root=fresh`. A reused workload root is therefore
+  observable even if the overlay alone were recreated.
+
 === Phase 3 regression tests
 
 `crates/simferret/src/checker.rs` unit tests cover a complete structured run and
-each individual failure: a reused root reported as `stale`, a mismatched
-response line, a cleanup barrier that reaped nothing, a missing restoration, exit
-totals that disagree with the recorded frames, and a typed launch failure that
-cannot satisfy a workload property.
+each individual failure: a reused root reported as `stale` (including a stale
+root witness while the `/tmp` marker is fresh), a mismatched response line, a
+cleanup barrier that reaped fewer than two processes, a sequence that does not
+start at one, a sequence gap, a non-contiguous output offset, a non-contiguous
+input offset, a replayed input command identifier, an unterminated stdout line, a
+stderr byte, a missing restoration, an outage response that arrives only after
+restoration, a restart that answers outside the liveness bound, exit totals that
+disagree with the recorded frames, and a typed launch failure that cannot satisfy
+a workload property.
 
 `crates/simferret/src/run.rs` drives the whole pipeline against a deterministic
 fake VM that models the pinned fixture's line protocol, so the driver, checker,
@@ -1395,7 +1468,22 @@ manifest, and replay preflight are exercised without QEMU. The tests cover:
   `response_integrity`, publishes a complete run, and reproduces the same failing
   report on replay with CLI status 1;
 * owner-only run directories and artifacts, and a failure bundle that contains
-  neither the recorded environment value nor a workload output line.
+  neither the recorded environment value nor a workload output line;
+* an application failure inside the outage window, which must restore the network
+  before the shutdown handshake because the guest refuses to stop while an outage
+  is active;
+* a wrong response line, which must fail the property with the guest stopped
+  instead of blocking the driver;
+* a workload that exits before its first command, whose queued exit must be
+  observed rather than raced by a process command;
+* a duplicated input acknowledgement, which must fail `process_safety` as a
+  stream-structure violation;
+* the preparation-time preflight of an undeliverable launch identity and an
+  oversized planned input;
+* the owner-only guest image cache, including repair of a world-readable entry
+  and refusal of a non-regular one; and
+* a replayed launch-identity divergence, whose error text and shareable failure
+  bundle must carry no environment value and no workload stream byte.
 
 `crates/simferret/tests/rfd3_phase3.rs` pins the public contract: the strict
 versioned workload scenario, the seeded choice plan and its bounds, the request
@@ -1417,3 +1505,13 @@ directory and refuses a second, different raw closure, so each source form uses
 its own runs directory. The chunked command write is a host-side transport
 change: the wire format, the guest's per-byte acknowledgement, and the versioned
 protocol are unchanged.
+
+The workload driver folds every already-queued event before it issues a process
+command, and it treats a terminal event observed while awaiting a response as an
+orderly end, so an invocation that has already exited is reported as an
+application failure rather than raced. The residual window is the interval
+between that drain and the guest reading the command: if the invocation is
+released inside it, the guest answers with the exit record and the protocol
+classifies the acknowledgement mismatch as an infrastructure error. Closing that
+window completely would require a typed rejection event for a command that races
+a process exit, which is a protocol change and is left to a later increment.

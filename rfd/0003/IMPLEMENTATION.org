@@ -139,6 +139,42 @@ content-addressed guest workload, and preserve exact passive replay.
   default shareable failure metadata, which contains no environment values or
   stream bytes. The Phase 1 store already publishes owner-only objects, but the
   run-level classification belongs with the run manifest, which this phase owns.
+- [X] Harden the phase against the first adversarial review of the stack, with a
+  regression test for each finding:
+  - [X] Make every divergence, envelope, and parser diagnostic value-free, so a
+    shareable failure report names the event kind and its coordinates without the
+    recorded launch environment or exact stream bytes.
+  - [X] Publish the guest image cache owner-only (0700 directory, 0600 entries),
+    repair a reused entry's mode, and refuse a non-regular entry.
+  - [X] Evaluate per-invocation stream violations, require sequences to start at
+    one and stay contiguous, require accepted inputs to advance by their byte
+    count as distinct later commands, and require complete stdout lines and no
+    stderr bytes at exit.
+  - [X] Require the first cleanup barrier to reap the escaped descendant as well
+    as the primary, and order termination, exit, cleanup, and the escaped line.
+  - [X] Bound the restarted invocation's first answer with the scenario's
+    liveness bound so the first invocation cannot satisfy recovery.
+  - [X] Match each invocation's next complete response line strictly, so a wrong
+    response fails the property instead of blocking until the VM deadline.
+  - [X] Track the administrative outage in the driver and restore the network
+    before an early shutdown, and make the fake guest enforce the agent's refusal.
+  - [X] Wait for the startup line before the first command, drain queued events
+    before every process command, and treat a terminal event observed while
+    awaiting a response as an orderly end.
+  - [X] Bound every command identifier by the last issued command, require
+    synchronous acknowledgements to name the awaited command, validate
+    input-accepted contents, and restrict the shutdown drain to workload events.
+  - [X] Constrain `payload_bytes` to the fixture's hex-encoded token limit and
+    preflight the serialized start and input frames in record and replay.
+  - [X] Enforce the replay artifact budget on the recorded event stream before
+    publication.
+  - [X] Assert the intended missing-raw diagnostics and cover a removed
+    closure-referenced raw object in the acceptance script.
+  - [X] Strengthen the fresh-root witness so the fixture also mutates its own
+    executable's mode in the immutable workload root and each invocation reports
+    `state value=fresh root=fresh`.
+  - [X] Upload only the acceptance report, process status, and shareable failure
+    bundles from the Phase 3 diagnostics artifact.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
