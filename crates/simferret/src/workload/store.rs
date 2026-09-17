@@ -236,6 +236,7 @@ pub fn load(store: &Path) -> io::Result<LoadedWorkload> {
     }
     let objects = read_objects(&root, &closure)?;
     let graph = replay_graph(&closure, &objects)?;
+    super::validate_overlay_compatibility(&graph.tree, &graph.launch)?;
     if graph.launch != closure.launch {
         return Err(invalid(
             "re-derived launch identity does not match the raw closure",
@@ -422,6 +423,7 @@ fn oci_roles(objects: &OciObjects) -> Vec<(String, Vec<u8>)> {
 
 fn publish(store: &Path, graph: WorkloadGraph) -> io::Result<AssembledWorkload> {
     validate_canonical_tree(&graph.tree, MAX_VIEW_ENTRIES, MAX_EXPANDED_LAYER_BYTES)?;
+    super::validate_overlay_compatibility(&graph.tree, &graph.launch)?;
     let expanded_bytes = graph.tree.expanded_bytes();
     let canonical_digest = graph.tree.canonical_digest();
     let tree_bytes = graph.tree.encode();

@@ -79,6 +79,51 @@ pub const MAX_TEMPLATE_BYTES: usize =
 
 pub use store::{assemble, load};
 
+/// The runtime overlay directories the guest runtime replaces with fresh
+/// metadata and content.
+const OVERLAY_TMP: &[u8] = b"tmp";
+const OVERLAY_DEV: &[u8] = b"dev";
+
+/// Reject a canonical tree whose package entries collide with the runtime
+/// overlay, or whose launch paths the overlay replacement would invalidate.
+///
+/// The guest runtime copies a template into a fresh root while skipping the
+/// `/tmp` and `/dev` subtrees, then synthesizes both directories itself. An entry
+/// at either path must therefore be a directory, nothing below them survives, and
+/// no launch path may depend on it. Enforcing this during assembly means a
+/// template the runtime would refuse is never published, and replay re-derives
+/// the same decision from the raw closure instead of reaching the runtime
+/// boundary with a template it will reject.
+pub fn validate_overlay_compatibility(tree: &Tree, launch: &LaunchIdentity) -> io::Result<()> {
+    let below_or_at = |path: &[u8]| {
+        path == OVERLAY_TMP
+            || path == OVERLAY_DEV
+            || path.starts_with(b"tmp/")
+            || path.starts_with(b"dev/")
+    };
+    for (path, entry) in tree.iter() {
+        if below_or_at(path) && entry.kind != EntryKind::Directory {
+            return Err(invalid(format!(
+                "workload entry {:?} collides with the runtime overlay",
+                String::from_utf8_lossy(path)
+            )));
+        }
+    }
+    let executable = launch.executable.trim_start_matches('/');
+    if below_or_at(executable.as_bytes()) {
+        return Err(invalid(
+            "the workload executable is replaced by the runtime overlay",
+        ));
+    }
+    let working_directory = launch.working_directory.trim_start_matches('/');
+    if working_directory.starts_with("tmp/") || working_directory.starts_with("dev/") {
+        return Err(invalid(
+            "the workload working directory does not survive the runtime overlay",
+        ));
+    }
+    Ok(())
+}
+
 /// The native little-endian x86-64 program-header size the guest loader requires.
 const NATIVE_PROGRAM_HEADER_BYTES: usize = 56;
 /// The largest program table the guest loader accepts.
@@ -257,4 +302,60 @@ fn read_u64(bytes: &[u8], offset: usize) -> io::Result<u64> {
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn launch(executable: &str, working_directory: &str) -> LaunchIdentity {
+        LaunchIdentity {
+            executable: executable.into(),
+            arguments: vec![executable.into()],
+            environment: Vec::new(),
+            working_directory: working_directory.into(),
+            uid: 65534,
+            gid: 65534,
+        }
+    }
+
+    #[test]
+    fn overlay_collisions_are_refused_during_assembly() {
+        let mut tree = Tree::new();
+        tree.insert_default_directory(b".");
+        tree.insert_default_directory(b"tmp");
+        tree.insert_default_directory(b"dev");
+        assert!(validate_overlay_compatibility(&tree, &launch("/bin/app", "/")).is_ok());
+
+        let mut file_at_tmp = tree.clone();
+        file_at_tmp.insert(b"tmp".to_vec(), Entry::file(b"x".to_vec(), 0o644, 0, 0, 0));
+        assert!(validate_overlay_compatibility(&file_at_tmp, &launch("/bin/app", "/")).is_err());
+
+        let mut file_below_dev = tree.clone();
+        file_below_dev.insert(
+            b"dev/null".to_vec(),
+            Entry::file(b"x".to_vec(), 0o644, 0, 0, 0),
+        );
+        assert!(validate_overlay_compatibility(&file_below_dev, &launch("/bin/app", "/")).is_err());
+
+        let mut link_below_tmp = tree;
+        link_below_tmp.insert(
+            b"tmp/link".to_vec(),
+            Entry::symlink(b"/etc/passwd".to_vec(), 0, 0, 0),
+        );
+        assert!(validate_overlay_compatibility(&link_below_tmp, &launch("/bin/app", "/")).is_err());
+    }
+
+    #[test]
+    fn launch_paths_the_overlay_invalidates_are_refused_during_assembly() {
+        let mut tree = Tree::new();
+        tree.insert_default_directory(b".");
+        tree.insert_default_directory(b"tmp");
+        // A working directory of `/tmp` is recreated by the overlay.
+        assert!(validate_overlay_compatibility(&tree, &launch("/bin/app", "/tmp")).is_ok());
+        // Nothing below it survives.
+        assert!(validate_overlay_compatibility(&tree, &launch("/bin/app", "/tmp/work")).is_err());
+        assert!(validate_overlay_compatibility(&tree, &launch("/tmp/app", "/")).is_err());
+        assert!(validate_overlay_compatibility(&tree, &launch("/dev/app", "/")).is_err());
+    }
 }
