@@ -35,6 +35,8 @@ impl TempDir {
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
+        // A previous run in the same PID namespace can leave this path behind.
+        let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         Self(path)
     }
@@ -433,6 +435,42 @@ fn an_overlay_collision_is_rejected_before_any_invocation() {
 }
 
 #[test]
+fn a_full_stdin_pipe_does_not_block_the_control_loop() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("stdin-full");
+    let mut runtime = runtime(&root);
+    // The shell itself never reads stdin, so its pipe fills and stays full.
+    let mut events = runtime.start(1, &launch("while :; do sleep 1; done"));
+    assert!(matches!(events[0], Event::WorkloadStarted { .. }));
+    // The child never reads stdin, so its pipe fills after about 64 KiB. Every
+    // frame must still be accepted into the bounded queue instead of blocking
+    // the control loop, which would also block `terminate`.
+    let frame = vec![b'x'; 4096];
+    let mut offset = 0_u64;
+    // SAFETY: installing a SIGALRM handler has no other effect and `alarm` only
+    // schedules the signal. The handler exits explicitly, because PID 1 in a
+    // fresh PID namespace ignores a signal whose disposition is the default.
+    let handler = watchdog_expired as *const () as libc::sighandler_t;
+    let previous = unsafe { libc::signal(libc::SIGALRM, handler) };
+    unsafe { libc::alarm(15) };
+    for _ in 0..32 {
+        let accepted = runtime.stdin_write(1, offset, &encode_bytes(&frame));
+        assert!(
+            accepted.is_ok(),
+            "a full stdin pipe must not block: {accepted:?}"
+        );
+        offset += frame.len() as u64;
+    }
+    unsafe { libc::alarm(0) };
+    unsafe { libc::signal(libc::SIGALRM, previous) };
+    // Termination must still be reachable while input remains queued.
+    events.extend(runtime.terminate(1).unwrap());
+    poll_until_cleanup(&mut runtime, &mut events);
+}
+
+#[test]
 fn an_invocation_identifier_cannot_be_reused() {
     if !require_root() {
         return;
@@ -735,6 +773,14 @@ fn decode_output(events: &[simferret::protocol::EventFrame]) -> Vec<u8> {
         }
     }
     output
+}
+
+/// Bounds a regression that would otherwise hang the suite. PID 1 in a fresh
+/// PID namespace ignores a signal whose disposition is the default, so the
+/// handler exits explicitly.
+extern "C" fn watchdog_expired(_: libc::c_int) {
+    // SAFETY: `_exit` is async-signal-safe.
+    unsafe { libc::_exit(99) };
 }
 
 fn sha256_hex(data: &[u8]) -> String {
