@@ -263,6 +263,25 @@ content-addressed guest workload, and preserve exact passive replay.
     the four guest-reported string fields, and an end-to-end record canary that
     scans both the CLI text and the failure bundle for a rejected activation's
     marker.
+- [X] Harden the phase against the seventh adversarial review, which confirmed all
+  three sixth-round fixes and found three further defects:
+  - [X] Correlate responses with the commands they answer: the trace retains each
+    data acknowledgement's event identifier and the event that carried each
+    response line's first byte, and response integrity requires every response to
+    begin after its acknowledgement, so a response emitted before the command it
+    answers cannot pass on ordered lines and matching aggregate counts alone.
+  - [X] Make the over-bound response condition sticky: completing an oversized
+    line with a newline no longer clears the driver's health test, so a
+    known-invalid response cannot become a receive timeout instead of a failing
+    report.
+  - [X] Name raw-closure objects by position instead of by value, so a tampered
+    `closure.json` cannot carry an unknown role or an unvalidated digest into the
+    CLI text or the failure bundle of the replay that rejects it.
+  - [X] Add regression tests for each fix: a checker case that moves a response
+    before its acknowledgement, a fake-guest run that answers the state command
+    during the preceding echo command, a completed oversized line and a split
+    oversized line in the end-of-input regression, and a replay canary that
+    tampers a raw-closure role and digest independently.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
