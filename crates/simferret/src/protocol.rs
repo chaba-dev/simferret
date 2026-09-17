@@ -240,7 +240,10 @@ impl Event {
     }
 
     /// The value-free coordinates of one event: the fields a shareable failure
-    /// report may name, never a launch environment value or a stream byte.
+    /// report may name, never a launch environment value, a stream byte, or a
+    /// free-form string a guest reported. A diverging frame can carry any bytes
+    /// in its string fields, so only tags, enums, and numeric coordinates are
+    /// named.
     pub fn describe(&self) -> String {
         match self {
             Self::WorkloadStarted { invocation, .. } => {
@@ -285,24 +288,21 @@ impl Event {
             Self::CleanupComplete { invocation, reaped } => {
                 format!("cleanup_complete(invocation {invocation}, reaped {reaped})")
             }
-            Self::NetworkConfigured { gateway, .. } => {
-                format!("network_configured(gateway {gateway})")
+            Self::NetworkConfigured { .. } => "network_configured".to_owned(),
+            Self::OutageActivated { .. } => "outage_activated".to_owned(),
+            Self::NetworkRestored { .. } => "network_restored".to_owned(),
+            Self::RequestAttempted { phase, .. } => {
+                format!("request_attempted(phase {phase:?})")
             }
-            Self::OutageActivated { peer_cidr, .. } => {
-                format!("outage_activated(peer_cidr {peer_cidr})")
+            Self::RequestSucceeded { phase, .. } => {
+                format!("request_succeeded(phase {phase:?})")
             }
-            Self::NetworkRestored { peer_cidr } => {
-                format!("network_restored(peer_cidr {peer_cidr})")
-            }
-            Self::RequestAttempted { request_id, .. } => {
-                format!("request_attempted(request_id {request_id})")
-            }
-            Self::RequestSucceeded { request_id, .. } => {
-                format!("request_succeeded(request_id {request_id})")
-            }
-            Self::RequestUnavailable { request_id, .. } => {
-                format!("request_unavailable(request_id {request_id})")
-            }
+            Self::RequestUnavailable {
+                phase,
+                error,
+                errno,
+                ..
+            } => format!("request_unavailable(phase {phase:?}, error {error:?}, errno {errno:?})"),
             Self::AssertionsEvaluated { report } => {
                 format!("assertions_evaluated(passed {})", report.passed)
             }
@@ -762,15 +762,20 @@ mod tests {
 
     #[test]
     fn event_and_command_tags_match_the_wire_and_descriptions_are_value_free() {
-        // Every launch-visible value and every byte payload carries a marker that
-        // must never appear in a shareable description.
-        const SECRETS: [&str; 6] = [
+        // Every launch-visible value, every byte payload, and every free-form
+        // string a guest reports carries a marker that must never appear in a
+        // shareable description.
+        const SECRETS: [&str; 10] = [
             "SECRET-ARGUMENT",
             "SECRET-ENVIRONMENT",
             "SECRET-PAYLOAD",
             "SECRET-RESPONSE",
             "SECRET-OUTPUT",
             "SECRET-DETAIL",
+            "SECRET-GATEWAY",
+            "SECRET-PEER",
+            "SECRET-REQUEST",
+            "SECRET-RULE",
         ];
         let launch = crate::workload::LaunchIdentity {
             executable: "/bin/app".into(),
@@ -785,29 +790,29 @@ mod tests {
             Event::NetworkConfigured {
                 interface: "eth0".into(),
                 guest_cidr: "10.0.2.15/24".into(),
-                gateway: "10.0.2.2".into(),
+                gateway: "SECRET-GATEWAY".into(),
             },
             Event::OutageActivated {
-                peer_cidr: "10.0.2.2/32".into(),
-                rule: "prohibit 10.0.2.2/32".into(),
+                peer_cidr: "SECRET-PEER".into(),
+                rule: "SECRET-RULE".into(),
             },
             Event::NetworkRestored {
-                peer_cidr: "10.0.2.2/32".into(),
+                peer_cidr: "SECRET-PEER".into(),
             },
             Event::RequestAttempted {
-                request_id: "request-0000".into(),
+                request_id: "SECRET-REQUEST".into(),
                 payload: "SECRET-PAYLOAD".into(),
                 phase: RequestPhase::PreOutage,
             },
             Event::RequestSucceeded {
-                request_id: "request-0000".into(),
+                request_id: "SECRET-REQUEST".into(),
                 request_payload: "SECRET-PAYLOAD".into(),
-                response_id: "request-0000".into(),
+                response_id: "SECRET-REQUEST".into(),
                 response_payload: "SECRET-RESPONSE".into(),
                 phase: RequestPhase::PreOutage,
             },
             Event::RequestUnavailable {
-                request_id: "request-0000".into(),
+                request_id: "SECRET-REQUEST".into(),
                 phase: RequestPhase::Outage,
                 error: RequestError::AdministrativeProhibited,
                 errno: Some(libc::EACCES),
