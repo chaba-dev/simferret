@@ -4,6 +4,7 @@ pub mod fixture;
 pub mod guest;
 pub mod protocol;
 pub mod run;
+pub mod runtime;
 pub mod scenario;
 pub mod vm;
 pub mod workload;
