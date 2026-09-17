@@ -15,6 +15,7 @@
 //! workload would be.
 
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -154,6 +155,55 @@ fn stream_summary(events: &[Event], stream: OutputStream) -> (u64, String) {
             _ => None,
         })
         .expect("the invocation must report an exit record")
+}
+
+fn exit_record(events: &[Event]) -> ProcessExit {
+    events
+        .iter()
+        .find_map(|event| match event {
+            Event::WorkloadExited { exit, .. } => Some(*exit),
+            _ => None,
+        })
+        .expect("the invocation must report an exit record")
+}
+
+/// Raise the descriptor limit so a descriptor can be allocated above the scan
+/// cap the runtime used to stop at, and return the previous soft limit.
+fn raise_descriptor_limit(target: u64) -> Option<u64> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is writable and the call has no other effects.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return None;
+    }
+    let previous = limit.rlim_cur;
+    if limit.rlim_cur < target {
+        let next = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: limit.rlim_max.max(target),
+        };
+        // SAFETY: `next` is a valid limit the caller is allowed to set.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &next) } != 0 {
+            return None;
+        }
+    }
+    Some(previous)
+}
+
+fn restore_descriptor_limit(previous: u64) {
+    let mut limit = libc::rlimit {
+        rlim_cur: previous,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is writable and the call has no other effects.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return;
+    }
+    limit.rlim_cur = previous;
+    // SAFETY: `limit` keeps the current hard limit and only lowers the soft one.
+    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
 }
 
 #[test]
@@ -439,6 +489,147 @@ fn an_escaped_descendant_cannot_outlive_the_cleanup_barrier() {
     let events = run_script(&mut runtime, 1, "(setsid sleep 30 &) ; printf 'escaped\\n'");
     assert_eq!(stdout_bytes(&events), b"escaped\n");
     assert!(matches!(events.last(), Some(Event::CleanupComplete { .. })));
+}
+
+#[test]
+fn an_invocation_does_not_steal_an_unrelated_child() {
+    if !require_root() {
+        return;
+    }
+    // A host test shares the agent's process table, so an unrelated child is a
+    // zombie by the time the invocation runs. A reap of the whole table would
+    // consume it, and this test would no longer be able to observe its status.
+    let mut unrelated = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exit 7")
+        .spawn()
+        .expect("the unrelated child must spawn");
+    // The child must already be a zombie when the invocation runs, and the
+    // test must not reap it: `try_wait` would consume it.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (root, _) = template("scoped-reap");
+    let mut runtime = runtime(&root);
+    let events = run_script(&mut runtime, 1, "printf 'done\\n'");
+    assert_eq!(stdout_bytes(&events), b"done\n");
+    assert!(matches!(events.last(), Some(Event::CleanupComplete { .. })));
+
+    let status = unrelated
+        .wait()
+        .expect("the invocation must not reap an unrelated child");
+    assert_eq!(status.code(), Some(7));
+}
+
+#[test]
+fn an_inherited_descriptor_above_the_scan_cap_does_not_leak() {
+    if !require_root() {
+        return;
+    }
+    const HIGH: i32 = 70_000;
+    let Some(previous) = raise_descriptor_limit(HIGH as u64 + 1) else {
+        eprintln!("skipping: cannot raise the descriptor limit");
+        return;
+    };
+    let (root, _) = template("descriptor-leak");
+    // The descriptor must be writable, or the probe would fail for the wrong
+    // reason. `F_DUPFD` deliberately does not set close-on-exec, so the
+    // descriptor is inherited by every child that does not close it.
+    let scratch = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(root.0.join("scratch"))
+        .unwrap();
+    let high = unsafe { libc::fcntl(scratch.as_raw_fd(), libc::F_DUPFD, HIGH) };
+    if high < 0 {
+        restore_descriptor_limit(previous);
+        eprintln!("skipping: cannot allocate a descriptor above the scan cap");
+        return;
+    }
+
+    let mut runtime = runtime(&root);
+    let identity = launch(&format!(
+        "if printf 'leak' >&{HIGH} 2>/dev/null; then printf 'leaked\\n'; else printf 'closed\\n'; fi"
+    ));
+    let mut events = runtime.start(1, &identity);
+    poll_until_cleanup(&mut runtime, &mut events);
+
+    // SAFETY: the descriptor was just created and is owned by this test.
+    unsafe { libc::close(high) };
+    restore_descriptor_limit(previous);
+
+    assert_eq!(stdout_bytes(&events), b"closed\n");
+}
+
+/// The child's standard input pipe only lands on descriptor 0 when the agent's
+/// own descriptor 0 is closed. `dup2(0, 0)` is a no-op that does not clear
+/// close-on-exec, so the descriptor must be made inheritable explicitly.
+#[test]
+fn a_standard_pipe_that_lands_on_descriptor_zero_survives_exec() {
+    if !require_root() {
+        return;
+    }
+    // SAFETY: `dup` and `close` operate on the live standard input descriptor.
+    let saved = unsafe { libc::dup(libc::STDIN_FILENO) };
+    if saved < 0 {
+        eprintln!("skipping: the test process has no standard input to save");
+        return;
+    }
+
+    struct Restore(i32);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: the descriptor was saved by `dup` above.
+            unsafe {
+                libc::dup2(self.0, libc::STDIN_FILENO);
+                libc::close(self.0);
+            }
+        }
+    }
+
+    let _restore = Restore(saved);
+    // SAFETY: descriptor 0 is saved and restored by the guard above.
+    unsafe { libc::close(libc::STDIN_FILENO) };
+
+    let (root, _) = template("descriptor-zero");
+    let mut runtime = runtime(&root);
+    let mut events = runtime.start(
+        1,
+        &launch("IFS= read -r line; printf 'got:%s\\n' \"$line\""),
+    );
+    events.extend(
+        runtime
+            .stdin_write(1, 0, &encode_bytes(b"alpha\n"))
+            .unwrap(),
+    );
+    events.extend(runtime.stdin_eof(1).unwrap());
+    poll_until_cleanup(&mut runtime, &mut events);
+    assert_eq!(stdout_bytes(&events), b"got:alpha\n");
+}
+
+/// Rust ignores `SIGPIPE` process-wide, and an ignored disposition survives
+/// `execve`, so the workload must be given the default disposition back.
+#[test]
+fn the_workload_starts_with_the_default_sigpipe_disposition() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("sigpipe");
+    let mut runtime = runtime(&root);
+    // An ignored `SIGPIPE` lets the shell survive its own signal and print;
+    // the default disposition kills it.
+    let events = run_script(&mut runtime, 1, "kill -PIPE $$; printf 'alive\\n'");
+    assert!(
+        stdout_bytes(&events).is_empty(),
+        "the workload kept an inherited SIGPIPE disposition: {events:#?}"
+    );
+    assert_eq!(
+        exit_record(&events),
+        ProcessExit::Signaled {
+            signal: libc::SIGPIPE
+        }
+    );
 }
 
 #[test]

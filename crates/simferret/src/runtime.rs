@@ -77,6 +77,8 @@ mod child_status {
     pub const NO_NEW_PRIVS: u8 = 5;
     pub const CREDENTIALS: u8 = 6;
     pub const EXEC: u8 = 7;
+    pub const GROUP: u8 = 8;
+    pub const SIGNALS: u8 = 9;
 
     pub fn failure(code: u8) -> (&'static str, &'static str) {
         match code {
@@ -90,6 +92,8 @@ mod child_status {
             NO_NEW_PRIVS => ("setup", "could not set no_new_privs"),
             CREDENTIALS => ("setup", "could not apply the workload credentials"),
             EXEC => ("executable", "could not execute the workload"),
+            GROUP => ("setup", "could not isolate the workload process group"),
+            SIGNALS => ("setup", "could not reset the workload signal dispositions"),
             _ => ("setup", "unknown workload setup failure"),
         }
     }
@@ -552,7 +556,7 @@ impl Runtime {
         if active.exit.is_none() {
             active.flush_input()?;
             drain_ready(active, &self.config.limits, timeout, &mut events)?;
-            active.reaped += reap_children(active);
+            active.reaped += reap_children(active, self.config.scope);
         }
         if active.exit.is_some() && !active.cleanup_complete {
             cleanup(active, self.config.scope, &self.config.limits, &mut events)?;
@@ -1088,8 +1092,11 @@ fn spawn(
         // SAFETY: the child is a single-threaded forked process that only calls
         // async-signal-safe functions before `execve`.
         unsafe {
-            if scope == MemberScope::ProcessGroup {
-                libc::setpgid(0, 0);
+            // Isolating the process group is what makes the scoped reap and the
+            // scoped signal safe, so a failure here must not be ignored: the
+            // parent would otherwise wait on a group that does not exist.
+            if scope == MemberScope::ProcessGroup && libc::setpgid(0, 0) != 0 {
+                fail_child(error_write, child_status::GROUP);
             }
             child_exec(
                 child_stdin,
@@ -1173,7 +1180,23 @@ unsafe fn child_exec(
         {
             fail_child(error_write, child_status::DUP);
         }
+        // `dup2` leaves the close-on-exec flag alone when the two descriptors
+        // are equal, and every pipe end is created with `O_CLOEXEC`. A pipe
+        // that happened to land on 0, 1, or 2 would therefore be closed by
+        // `execve`, so the flag is cleared explicitly for each standard
+        // descriptor.
+        for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                fail_child(error_write, child_status::DUP);
+            }
+        }
         close_inherited_descriptors(error_write);
+        // Rust ignores `SIGPIPE` process-wide, and an ignored disposition
+        // survives `execve`, so the workload would otherwise start with a
+        // signal disposition it never asked for.
+        if libc::signal(libc::SIGPIPE, libc::SIG_DFL) == libc::SIG_ERR {
+            fail_child(error_write, child_status::SIGNALS);
+        }
         if libc::chroot(root.as_ptr()) != 0 {
             fail_child(error_write, child_status::CHROOT);
         }
@@ -1204,8 +1227,42 @@ unsafe fn fail_child(error_write: RawFd, code: u8) -> ! {
     }
 }
 
+/// Close every inherited descriptor except `preserve`.
+///
+/// `close_range` covers the whole descriptor table in two syscalls, so a
+/// descriptor above any scan cap cannot leak into the workload. The kernel
+/// fallback scans the table bounded by the descriptor limit; the arbitrary cap
+/// the scan used before would have leaked every descriptor above it.
 unsafe fn close_inherited_descriptors(preserve: RawFd) {
-    let mut limit = 4096_u64;
+    let preserve = preserve as libc::c_uint;
+    let mut ranged = true;
+    if preserve > 3 {
+        // SAFETY: `close_range` only closes descriptors, and the ranges bracket
+        // the setup pipe write end, which must survive until `execve`.
+        ranged &= unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                preserve - 1,
+                0 as libc::c_uint,
+            )
+        } == 0;
+    }
+    // SAFETY: see above.
+    ranged &= unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            preserve.saturating_add(1).max(3),
+            libc::c_uint::MAX,
+            0 as libc::c_uint,
+        )
+    } == 0;
+    if ranged {
+        return;
+    }
+
+    // Fallback for a kernel without `close_range`.
+    let mut limit = MAX_DESCRIPTOR_SCAN;
     let mut rlimit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -1213,11 +1270,12 @@ unsafe fn close_inherited_descriptors(preserve: RawFd) {
     // SAFETY: `rlimit` is writable and the call has no other effects.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlimit) } == 0
         && rlimit.rlim_cur != libc::RLIM_INFINITY
+        && rlimit.rlim_cur > 0
     {
-        limit = rlimit.rlim_cur.min(MAX_DESCRIPTOR_SCAN);
+        limit = rlimit.rlim_cur;
     }
     for fd in 3..limit as RawFd {
-        if fd != preserve {
+        if fd != preserve as RawFd {
             // SAFETY: closing an unused descriptor is harmless; EBADF is
             // ignored because most descriptors in the range are unused.
             unsafe { libc::close(fd) };
@@ -1457,14 +1515,24 @@ fn record_reaped(active: &mut Invocation, pid: libc::pid_t, status: i32) {
     };
 }
 
-/// Reap every child that has exited, recording the primary's status.
-fn reap_children(active: &mut Invocation) -> u64 {
+/// Reap every exited member, recording the primary's status.
+///
+/// The wait is scoped to the invocation: under [`MemberScope::ProcessGroup`]
+/// only the invocation's own process group is reaped, so a host test that
+/// shares the agent's process table can never steal an unrelated child.
+fn reap_children(active: &mut Invocation, scope: MemberScope) -> u64 {
+    let target = match scope {
+        // The child isolates itself into its own process group, so the group
+        // identifier is the child's process identifier.
+        MemberScope::ProcessGroup => -active.pid,
+        MemberScope::Guest => -1,
+    };
     let mut reaped = 0;
     loop {
         let mut status = 0;
-        // SAFETY: `status` is writable; only the agent's own children are
-        // reaped, which is exactly the invocation's direct members.
-        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        // SAFETY: `status` is writable; only the invocation's own members are
+        // reaped, which is exactly the scope above.
+        let pid = unsafe { libc::waitpid(target, &mut status, libc::WNOHANG) };
         if pid <= 0 {
             break;
         }
@@ -1495,7 +1563,7 @@ fn cleanup(
     let deadline = Instant::now() + CLEANUP_TIMEOUT;
     loop {
         signal_members(active.pid, scope, TERMINATION_SIGNAL)?;
-        active.reaped += reap_children(active);
+        active.reaped += reap_children(active, scope);
         drain_batch(active, limits, events)?;
         let members = members_remain(scope, active.pid)?;
         let drained = active.stdout_state.eof && active.stderr_state.eof;
@@ -1514,7 +1582,7 @@ fn cleanup(
     }
     // One final reap after end of file, so a member that exited while the pipes
     // were draining is never left as an unreaped zombie.
-    active.reaped += reap_children(active);
+    active.reaped += reap_children(active, scope);
     let exit = active
         .exit
         .ok_or_else(|| io::Error::other("the workload primary process was not reaped"))?;
