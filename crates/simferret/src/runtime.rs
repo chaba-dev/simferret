@@ -181,8 +181,19 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Build a runtime and validate the immutable template's overlay profile.
+    /// Build a runtime, validate its limits, and validate the immutable
+    /// template's overlay profile.
     pub fn new(config: RuntimeConfig) -> io::Result<Self> {
+        validate_limits(&config.limits)?;
+        // The guest-wide scope signals every process in the process table, so it
+        // is permitted only where the agent owns that table. Enforcing this at
+        // construction keeps the destructive boundary safe for a mistaken host
+        // caller.
+        if config.scope == MemberScope::Guest && std::process::id() != 1 {
+            return Err(invalid(
+                "the guest-wide cleanup scope requires the agent to be PID 1",
+            ));
+        }
         validate_template(&config.template_root, &config.limits)?;
         Ok(Self {
             config,
@@ -465,6 +476,34 @@ impl Drop for Runtime {
 // ---------------------------------------------------------------------------
 // Template validation and materialization
 // ---------------------------------------------------------------------------
+
+/// Reject a runtime configuration whose bounds would silently change behavior.
+///
+/// A zero frame size is the important case: `read` with a zero-length buffer
+/// returns zero, which the drain loop would mistake for end of file and report
+/// as an empty stream for a workload that produced output.
+fn validate_limits(limits: &RuntimeLimits) -> io::Result<()> {
+    if limits.input_frame_bytes == 0
+        || limits.input_frame_bytes > MAX_STDIN_FRAME_BYTES
+        || limits.output_frame_bytes == 0
+        || limits.output_frame_bytes > MAX_OUTPUT_FRAME_BYTES
+    {
+        return Err(invalid(
+            "runtime frame limits must be positive and within the protocol bounds",
+        ));
+    }
+    if limits.input_bytes < limits.input_frame_bytes
+        || limits.output_bytes < limits.output_frame_bytes
+    {
+        return Err(invalid(
+            "runtime byte limits must cover at least one whole frame",
+        ));
+    }
+    if limits.template_entries == 0 || limits.template_path_bytes == 0 {
+        return Err(invalid("runtime template limits must be positive"));
+    }
+    Ok(())
+}
 
 /// Walk the immutable template and enforce the versioned overlay profile.
 ///
@@ -1529,6 +1568,66 @@ mod tests {
         let root = template();
         std::fs::create_dir_all(root.0.join("tmp/nested")).unwrap();
         validate_template(&root.0, &RuntimeLimits::default()).unwrap();
+    }
+
+    #[test]
+    fn invalid_limits_are_rejected_before_any_invocation() {
+        let root = template();
+        let cases = [
+            RuntimeLimits {
+                output_frame_bytes: 0,
+                ..RuntimeLimits::default()
+            },
+            RuntimeLimits {
+                input_frame_bytes: 0,
+                ..RuntimeLimits::default()
+            },
+            RuntimeLimits {
+                output_frame_bytes: MAX_OUTPUT_FRAME_BYTES + 1,
+                ..RuntimeLimits::default()
+            },
+            RuntimeLimits {
+                output_bytes: 1,
+                ..RuntimeLimits::default()
+            },
+            RuntimeLimits {
+                template_entries: 0,
+                ..RuntimeLimits::default()
+            },
+            RuntimeLimits {
+                template_path_bytes: 0,
+                ..RuntimeLimits::default()
+            },
+        ];
+        for limits in cases {
+            let error = Runtime::new(RuntimeConfig {
+                template_root: root.0.clone(),
+                runtime_root: root.0.join("runtime"),
+                limits,
+                scope: MemberScope::ProcessGroup,
+            })
+            .err()
+            .expect("an invalid limit must be rejected");
+            assert!(error.to_string().contains("runtime"), "{error}");
+        }
+        assert!(!root.0.join("runtime").exists());
+    }
+
+    #[test]
+    fn guest_scope_requires_pid_one() {
+        let root = template();
+        let result = Runtime::new(RuntimeConfig {
+            template_root: root.0.clone(),
+            runtime_root: root.0.join("runtime"),
+            limits: RuntimeLimits::default(),
+            scope: MemberScope::Guest,
+        });
+        if std::process::id() == 1 {
+            result.unwrap();
+        } else {
+            let error = result.err().expect("guest scope must be refused off PID 1");
+            assert!(error.to_string().contains("PID 1"), "{error}");
+        }
     }
 
     #[test]
