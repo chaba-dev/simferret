@@ -18,6 +18,7 @@ use super::root::{Root, invalid, staging_name};
 use super::spec::{
     BinarySource, CanonicalBinarySpec, LaunchIdentity, OciSource, SourceKind, normalize_arguments,
     normalize_environment, normalize_required_user, normalize_working_directory, parse_digest,
+    validate_launch_identity,
 };
 use super::tree::{
     Entry, ROOT_PATH, Tree, ancestors, normalize_layer_path, sha256_bytes, validate_canonical_tree,
@@ -387,6 +388,7 @@ fn binary_tree_and_launch(
         uid: input.uid,
         gid: input.gid,
     };
+    validate_launch_identity(&launch)?;
     Ok((tree, launch))
 }
 
