@@ -1439,7 +1439,10 @@ one of them was addressed in the same phase rather than deferred:
   symbolic-link target, the media type, or a raw header field, and the tar
   parser's own errors are reduced to fixed context. The replay identity
   comparisons and the version check name the differing field only, because a
-  recorded identity can carry an arbitrary string or a private host path.
+  recorded identity can carry an arbitrary string or a private host path. The
+  binary and OCI assembly boundaries reduce a source-locator failure to the field
+  it belongs to and the error's category, because the root's own diagnostics
+  quote the locator and it is a user-authored specification value.
 * *Owner-only image cache.* The `.images` cache is created `0700` with `0600`
   entries, and a reused entry is validated before it is opened: its type,
   ownership, and mode are checked first and repaired where possible, then it is
@@ -1652,7 +1655,11 @@ manifest, and replay preflight are exercised without QEMU. The tests cover:
 * a pending stdout byte folded by the end-of-input acknowledgement, before and
   after it, which must end the exit wait; and
 * a replay whose recorded version or VM identity differs, whose diagnostic must
-  name the field without either value.
+  name the field without either value;
+* a missing binary path and a missing OCI layout, whose locator must not appear
+  in the CLI text or the failure bundle; and
+* a recording whose output sequence is the maximum value, whose next frame must
+  report the structural violation instead of overflowing the comparison.
 
 `crates/simferret/tests/rfd3_phase3.rs` pins the public contract: the strict
 versioned workload scenario, the seeded choice plan and its bounds, the request

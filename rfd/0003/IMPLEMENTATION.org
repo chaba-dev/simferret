@@ -325,6 +325,19 @@ content-addressed guest workload, and preserve exact passive replay.
     VM tests, and a layer canary that presents rejected raw headers and
     tree-level collisions and asserts that a marker in the artifact appears in no
     diagnostic.
+- [X] Harden the phase against the tenth adversarial review, which confirmed all
+  three ninth-round items and found two further defects:
+  - [X] Reduce a source-locator failure at the binary and OCI assembly boundaries
+    to the field it belongs to and the error's category, because the root's own
+    diagnostics quote the locator and it is a user-authored specification value
+    that reaches the shareable bundle.
+  - [X] Compare the next output sequence with a checked addition: the trace
+    retains a rejected sequence, so a recording whose sequence was the maximum
+    value panicked in an overflow-checked build instead of reporting the
+    structural violation.
+  - [X] Add regression tests for each fix: a record-path canary for a missing
+    binary path and a missing OCI layout, and a checker case that folds a maximal
+    sequence followed by another frame.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
