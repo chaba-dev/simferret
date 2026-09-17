@@ -295,7 +295,12 @@ pub fn load(store: &Path) -> io::Result<LoadedWorkload> {
 }
 
 fn binary_graph(root: &Root, source: &BinarySource) -> io::Result<WorkloadGraph> {
-    let executable = root.read_file(&source.path, MAX_FILE_BYTES)?;
+    // The locator is a user-authored specification value and the root's own
+    // diagnostics quote it, so the boundary names the field and the error
+    // category instead.
+    let executable = root
+        .read_file(&source.path, MAX_FILE_BYTES)
+        .map_err(|error| source_locator_error("the workload executable", &error))?;
     super::validate_static_elf(&executable)?;
     let (uid, gid) = normalize_required_user(&source.user)?;
     let install = normalize_layer_path(BINARY_INSTALL_PATH.as_bytes())?;
@@ -399,7 +404,9 @@ fn binary_tree_and_launch(
 }
 
 fn oci_graph(root: &Root, source: &OciSource) -> io::Result<WorkloadGraph> {
-    let layout = root.open_directory(&source.layout)?;
+    let layout = root
+        .open_directory(&source.layout)
+        .map_err(|error| source_locator_error("the workload layout directory", &error))?;
     let objects = oci::read_objects(&layout, &source.manifest_digest)?;
     let graph = oci::parse_graph(&objects)?;
     Ok(WorkloadGraph {
@@ -410,6 +417,17 @@ fn oci_graph(root: &Root, source: &OciSource) -> io::Result<WorkloadGraph> {
         launch: graph.launch,
         layers: graph.layers,
     })
+}
+
+/// Reduce a source-locator failure to the field it belongs to and the error's
+/// category. The root's diagnostics quote the locator they failed on, and that
+/// string comes from the user-authored specification and reaches the shareable
+/// failure bundle.
+fn source_locator_error(field: &str, error: &io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{field} is unavailable ({:?})", error.kind()),
+    )
 }
 
 fn oci_roles(objects: &OciObjects) -> Vec<(String, Vec<u8>)> {

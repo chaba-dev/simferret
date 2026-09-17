@@ -5871,6 +5871,42 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_workload_source_never_reaches_the_failure_bundle() {
+        // The locator is a user-authored specification value, and the root's own
+        // diagnostics quote it, so the assembly boundary must reduce the failure
+        // to the field and the error category.
+        for (kind, specification) in [
+            (
+                "binary",
+                "version = 1\nkind = \"binary\"\npath = \"SECRET=CANARY\"\nargs = []\nenv = []\nworking_directory = \"/\"\nuser = \"65534:65534\"\n",
+            ),
+            (
+                "oci",
+                "version = 1\nkind = \"oci\"\nlayout = \"SECRET=CANARY\"\nmanifest_digest = \"sha256:0000000000000000000000000000000000000000000000000000000000000000\"\n",
+            ),
+        ] {
+            let root = temporary_root(&format!("source-locator-{kind}"));
+            let options = workload_options(&root, false);
+            let path = options.workload.clone().expect("the workload is specified");
+            fs::write(&path, specification).unwrap();
+            let adapter = fake_adapter(None);
+            let error = record_with_adapter(&options, &adapter).unwrap_err();
+            assert!(!error.to_string().contains("CANARY"), "{kind}: {error}");
+            assert!(
+                error.to_string().contains("is unavailable"),
+                "{kind}: {error}"
+            );
+            let bundle = only_failure_bundle(&options.runs_directory);
+            let report = fs::read(bundle.join("failure.json")).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&report).contains("CANARY"),
+                "{kind}: {report:?}"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn a_tampered_manifest_scenario_name_never_reaches_the_failure_bundle() {
         // The recorded scenario name is a user-authored string, so a mismatch must
         // not quote either side of the comparison.
