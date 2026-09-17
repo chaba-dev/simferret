@@ -368,6 +368,94 @@ fn parse_user(value: &str) -> io::Result<(u32, u32)> {
     Ok((uid, gid))
 }
 
+/// Validate one already-normalized launch identity against the versioned
+/// profile bounds.
+///
+/// The assembler and the guest runtime share this check so the two phases
+/// implement one launch contract. Diagnostics name the field and never include
+/// an argument, environment value, or environment name, because those may be
+/// secret.
+pub fn validate_launch_identity(launch: &LaunchIdentity) -> io::Result<()> {
+    validate_launch_path("executable", &launch.executable)?;
+    if launch.arguments.is_empty() {
+        return Err(invalid("the workload argument vector is empty"));
+    }
+    if launch.arguments.len() > MAX_ARGUMENTS {
+        return Err(invalid(format!(
+            "the workload argument vector exceeds {MAX_ARGUMENTS} entries"
+        )));
+    }
+    for argument in &launch.arguments {
+        if argument.len() > MAX_ARGUMENT_BYTES {
+            return Err(invalid(format!(
+                "a workload argument exceeds {MAX_ARGUMENT_BYTES} bytes"
+            )));
+        }
+        if argument.contains('\0') {
+            return Err(invalid("a workload argument contains a NUL byte"));
+        }
+    }
+    // The first argument is the guest-visible program name and must name an
+    // absolute in-root path, but it need not be byte-identical to the path the
+    // runtime executes: OCI normalization canonicalizes the executable while
+    // preserving the caller's argument vector.
+    validate_launch_path("the first workload argument", &launch.arguments[0])?;
+    if launch.environment.len() > MAX_ENVIRONMENT_ENTRIES {
+        return Err(invalid(format!(
+            "the workload environment exceeds {MAX_ENVIRONMENT_ENTRIES} entries"
+        )));
+    }
+    let mut total = 0;
+    let mut names: Vec<&str> = Vec::new();
+    for entry in &launch.environment {
+        if entry.len() > MAX_ENVIRONMENT_ENTRY_BYTES {
+            return Err(invalid(format!(
+                "a workload environment entry exceeds {MAX_ENVIRONMENT_ENTRY_BYTES} bytes"
+            )));
+        }
+        total += entry.len();
+        if total > MAX_ENVIRONMENT_BYTES {
+            return Err(invalid(format!(
+                "the workload environment exceeds {MAX_ENVIRONMENT_BYTES} bytes"
+            )));
+        }
+        if entry.contains('\0') {
+            return Err(invalid("a workload environment entry contains a NUL byte"));
+        }
+        let Some((name, _)) = entry.split_once('=') else {
+            return Err(invalid("a workload environment entry is not NAME=VALUE"));
+        };
+        if name.is_empty() {
+            return Err(invalid("a workload environment entry is not NAME=VALUE"));
+        }
+        if names.contains(&name) {
+            return Err(invalid("the workload environment has a duplicate name"));
+        }
+        names.push(name);
+    }
+    validate_launch_path("the workload working directory", &launch.working_directory)?;
+    if launch.uid == 0 || launch.gid == 0 {
+        return Err(invalid("root credentials are not supported"));
+    }
+    if launch.uid == super::RESERVED_OWNER || launch.gid == super::RESERVED_OWNER {
+        return Err(invalid("the reserved owner identifier is not a credential"));
+    }
+    Ok(())
+}
+
+fn validate_launch_path(field: &str, value: &str) -> io::Result<()> {
+    if value.is_empty() || !value.starts_with('/') {
+        return Err(invalid(format!("{field} must be an absolute in-root path")));
+    }
+    if value.contains('\0') {
+        return Err(invalid(format!("{field} contains a NUL byte")));
+    }
+    if value.split('/').any(|component| component == "..") {
+        return Err(invalid(format!("{field} escapes the workload root")));
+    }
+    Ok(())
+}
+
 /// Treat null, absence, or an empty string as `/`. Otherwise require an
 /// absolute path that resolves to a directory inside the final workload root
 /// without traversing a symbolic link.
