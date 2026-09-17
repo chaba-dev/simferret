@@ -218,6 +218,15 @@ impl Tree {
     /// alone would place a path such as `!data` before the root sentinel `.`,
     /// so emitting the root first is what keeps every child extractable.
     pub fn template(&self, root_name: &str) -> io::Result<Vec<u8>> {
+        let mut output = self.template_entries(root_name)?;
+        append_cpio(&mut output, b"TRAILER!!!", 0, 0, 0, 0, &[])?;
+        Ok(output)
+    }
+
+    /// The same `newc` entries without the trailing archive marker, so an
+    /// initramfs assembler can concatenate the workload template with the
+    /// agent's own entries into one archive.
+    pub fn template_entries(&self, root_name: &str) -> io::Result<Vec<u8>> {
         let root = self
             .entries
             .get(ROOT_PATH)
@@ -237,7 +246,6 @@ impl Tree {
             name.extend_from_slice(path);
             append_template_entry(&mut output, &name, entry)?;
         }
-        append_cpio(&mut output, b"TRAILER!!!", 0, 0, 0, 0, &[])?;
         Ok(output)
     }
 }
