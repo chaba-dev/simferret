@@ -88,6 +88,9 @@ fn template(label: &str) -> (TempDir, PathBuf) {
     // The descendant fixtures block in `sleep`, which is an applet as well: a
     // missing applet would make them exit immediately and pass vacuously.
     std::os::unix::fs::symlink("sh", bin.join("sleep")).unwrap();
+    // The removal fixtures build a deep directory tree to exhaust the
+    // descriptor budget that recursive removal needs.
+    std::os::unix::fs::symlink("sh", bin.join("mkdir")).unwrap();
     fs::create_dir_all(template.join("tmp")).unwrap();
     fs::create_dir_all(template.join("dev")).unwrap();
     (root, shell)
@@ -200,6 +203,51 @@ fn raise_descriptor_limit(target: u64) -> Option<u64> {
         }
     }
     Some(previous)
+}
+
+/// Lower the descriptor limit for the duration of a test and restore it on drop.
+struct DescriptorLimit(u64);
+
+impl DescriptorLimit {
+    fn lower_to(target: u64) -> Option<Self> {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is writable and the call has no other effects.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return None;
+        }
+        let previous = limit.rlim_cur;
+        if previous <= target {
+            return None;
+        }
+        let next = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: `next` is a valid limit the caller is allowed to set.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &next) } != 0 {
+            return None;
+        }
+        Some(Self(previous))
+    }
+}
+
+impl Drop for DescriptorLimit {
+    fn drop(&mut self) {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is writable and the call has no other effects.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return;
+        }
+        limit.rlim_cur = self.0;
+        // SAFETY: `limit` keeps the current hard limit and only raises the soft one.
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    }
 }
 
 fn restore_descriptor_limit(previous: u64) {
@@ -885,6 +933,125 @@ fn output_offsets_advance_across_multiple_frames_per_stream() {
         reported, frames,
         "the exit record must count the frames that were emitted"
     );
+}
+
+/// A failed start whose root cannot be removed must report the removal failure,
+/// refuse the next start while the root is still on disk, and recover once the
+/// root can be removed.
+#[test]
+fn a_failed_start_reports_a_root_that_cannot_be_removed_and_refuses_the_next_start() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("failed-start-removal");
+    // The template is deeper than the descriptor budget the test installs, so
+    // both copying and removing the root exhaust the table.
+    let mut deep = root.0.join("template/deep");
+    fs::create_dir(&deep).unwrap();
+    for _ in 0..200 {
+        deep.push("d");
+        fs::create_dir(&deep).unwrap();
+    }
+
+    let mut runtime = runtime(&root);
+    let Some(limit) = DescriptorLimit::lower_to(64) else {
+        eprintln!("skipping: cannot lower the descriptor limit");
+        return;
+    };
+
+    let mut missing = launch("printf 'unused\\n'");
+    missing.executable = "/bin/missing".into();
+    missing.arguments = vec!["/bin/missing".into()];
+    let events = runtime.start(1, &missing);
+    let detail = match &events[0] {
+        Event::LaunchFailed {
+            failure: LaunchFailure::Materialization,
+            detail,
+            ..
+        } => detail.clone(),
+        other => panic!("expected a materialization failure: {other:?}"),
+    };
+    assert!(
+        detail.contains("invocation root"),
+        "the removal failure must be reported with the launch failure: {detail}"
+    );
+
+    // The root is still on disk, so the next start must be refused.
+    let events = runtime.start(2, &launch("printf 'unused\\n'"));
+    assert!(
+        matches!(
+            events[0],
+            Event::LaunchFailed {
+                failure: LaunchFailure::Materialization,
+                ..
+            }
+        ),
+        "a start on top of an unremoved root must be refused: {events:#?}"
+    );
+
+    // Once the root can be removed again the runtime recovers.
+    drop(limit);
+    let mut events = runtime.start(3, &launch("printf 'recovered\\n'"));
+    assert!(
+        matches!(events[0], Event::WorkloadStarted { .. }),
+        "{events:#?}"
+    );
+    poll_until_cleanup(&mut runtime, &mut events);
+    assert_eq!(stdout_bytes(&events), b"recovered\n");
+}
+
+/// A completed invocation whose root cannot be removed must not report a
+/// completed barrier or release the single-workload slot.
+#[test]
+fn a_completed_invocation_reports_a_root_that_cannot_be_removed() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("completed-removal");
+    let mut runtime = runtime(&root);
+    let Some(limit) = DescriptorLimit::lower_to(64) else {
+        eprintln!("skipping: cannot lower the descriptor limit");
+        return;
+    };
+    // The workload builds a tree deeper than the descriptor budget, so the
+    // barrier's root removal exhausts the table.
+    let mut events = runtime.start(
+        1,
+        &launch(
+            "cd /tmp; i=0; while [ $i -lt 200 ]; do mkdir d; cd d; i=$((i+1)); done; printf 'deep\\n'",
+        ),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let failure = loop {
+        match runtime.poll(Duration::from_millis(50)) {
+            Ok(more) => events.extend(more),
+            Err(error) => break error,
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the barrier must report the removal failure: {events:#?}"
+        );
+    };
+    assert!(failure.to_string().contains("invocation root"), "{failure}");
+    // The barrier did not complete and the slot is still occupied.
+    assert!(runtime.is_active());
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::CleanupComplete { .. }))
+    );
+    let events = runtime.start(2, &launch("printf 'unused\\n'"));
+    assert!(
+        matches!(
+            events[0],
+            Event::LaunchFailed {
+                failure: LaunchFailure::InvocationActive,
+                ..
+            }
+        ),
+        "{events:#?}"
+    );
+    drop(limit);
 }
 
 #[test]
