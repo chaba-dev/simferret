@@ -136,7 +136,7 @@ impl InvocationStreams {
         sequence: u64,
         data: &[u8],
     ) {
-        if sequence != self.sequence + 1 {
+        if self.sequence.checked_add(1) != Some(sequence) {
             self.violations.push(format!(
                 "invocation {invocation} sequence jumped from {} to {sequence} at event {}",
                 self.sequence, frame.event_id
@@ -2075,6 +2075,23 @@ mod tests {
         mutate_output(&mut events, 2, true, |_, sequence, _| *sequence = 99);
         let report = evaluate_workload(&events, &scenario(), &choices, &launch());
         assert!(!report.assertions[0].passed);
+    }
+
+    #[test]
+    fn a_maximal_sequence_does_not_overflow_the_next_frame() {
+        // The rejected value is retained, so the comparison against the next
+        // frame cannot add to the maximum and panic instead of reporting the
+        // structural violation.
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        mutate_output(&mut events, 1, false, |_, sequence, _| *sequence = u64::MAX);
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
+        assert!(
+            report.assertions[0].detail.contains("sequence"),
+            "{}",
+            report.assertions[0].detail
+        );
     }
 
     #[test]
