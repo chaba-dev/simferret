@@ -93,7 +93,13 @@ struct InvocationStreams {
     input_offset: u64,
     /// The command identifiers of the accepted inputs, in arrival order.
     input_commands: Vec<u64>,
-    input_events: u64,
+    /// Data acknowledgements, which must correspond one to one with the
+    /// responses the invocation produced.
+    data_inputs: u64,
+    /// End-of-input acknowledgements, of which there must be exactly one and it
+    /// must be the last accepted input.
+    eof_inputs: u64,
+    input_eof: bool,
     sequence: u64,
     frames: u64,
     violations: Vec<String>,
@@ -159,8 +165,9 @@ impl InvocationStreams {
     /// Fold one `input-accepted` event. The guest reports the cumulative accepted
     /// offset after each command, so the offset must advance by exactly the
     /// accepted byte count, every accepted command must be a distinct later
-    /// command, an end-of-input must carry no bytes, and a data input must carry
-    /// bytes, so a dropped, replayed, or empty input command cannot pass.
+    /// command, an end-of-input must carry no bytes and be the last accepted
+    /// input, and a data input must carry bytes, so a dropped, replayed, or empty
+    /// input command cannot pass.
     fn push_input(
         &mut self,
         invocation: u64,
@@ -186,6 +193,16 @@ impl InvocationStreams {
                 "invocation {invocation} accepted an empty input command at event {event_id}"
             ));
         }
+        if eof && self.input_eof {
+            self.violations.push(format!(
+                "invocation {invocation} accepted a second end-of-input at event {event_id}"
+            ));
+        }
+        if !eof && self.input_eof {
+            self.violations.push(format!(
+                "invocation {invocation} accepted an input command after the end of input at event {event_id}"
+            ));
+        }
         if let Some(previous) = self.input_commands.last()
             && command_id <= *previous
         {
@@ -195,7 +212,12 @@ impl InvocationStreams {
         }
         self.input_commands.push(command_id);
         self.input_offset = offset;
-        self.input_events += 1;
+        if eof {
+            self.eof_inputs += 1;
+            self.input_eof = true;
+        } else {
+            self.data_inputs += 1;
+        }
     }
 }
 
@@ -423,6 +445,16 @@ impl WorkloadTrace {
         self.launch_failures
             .iter()
             .any(|failure| failure.invocation == invocation)
+    }
+
+    /// The number of stderr bytes one invocation has written. The pinned fixture
+    /// writes to stderr only when it is failing, so the driver stops waiting for a
+    /// response line once any stderr byte is observed and lets the checker report
+    /// the application failure.
+    pub fn stderr_bytes(&self, invocation: u64) -> usize {
+        self.invocations.get(&invocation).map_or(0, |streams| {
+            streams.stderr.len() + streams.stderr_pending.len()
+        })
     }
 
     fn stdout_lines(&self, invocation: u64) -> &[CompletedLine] {
@@ -707,6 +739,23 @@ fn response_integrity(trace: &WorkloadTrace, choices: &WorkloadChoicePlan) -> As
                 );
             }
         }
+        // Every response line but the startup line answers one accepted input
+        // command, and an invocation that reached its end of input acknowledged
+        // it exactly once and last, so a recording cannot drop or duplicate the
+        // acknowledgements of the commands whose responses it produced.
+        let (data_inputs, eof_inputs) = trace
+            .invocations
+            .get(&invocation)
+            .map_or((0, 0), |streams| (streams.data_inputs, streams.eof_inputs));
+        let expected_inputs = (expected.len() - 1) as u64;
+        if data_inputs != expected_inputs || eof_inputs > 1 {
+            return failed(
+                AssertionName::ResponseIntegrity,
+                format!(
+                    "invocation {invocation} acknowledged {data_inputs} input command(s) and {eof_inputs} end(s) of input; expected {expected_inputs} and at most 1"
+                ),
+            );
+        }
     }
     let application_error = trace
         .stderr_lines(1)
@@ -798,15 +847,20 @@ fn fault_properties(
     choices: &WorkloadChoicePlan,
 ) -> FaultProperties {
     let peer = format!("{}/32", scenario.fixture_peer);
+    // The configured gateway is part of the fixed private profile, so the
+    // activation must follow a configuration that reported it and must name the
+    // scenario's peer. Deriving the expected peer from the scenario, rather than
+    // from whatever the guest reported, keeps the property independent of the
+    // event it is checking.
     let activation = trace
         .configured
         .as_ref()
-        .and_then(|(gateway, configured_id)| {
-            let expected = format!("{gateway}/32");
+        .filter(|(gateway, _)| gateway == &scenario.fixture_peer)
+        .and_then(|(_, configured_id)| {
             trace
                 .activations
                 .iter()
-                .find(|(peer_cidr, event_id)| peer_cidr == &expected && *event_id > *configured_id)
+                .find(|(peer_cidr, event_id)| peer_cidr == &peer && *event_id > *configured_id)
         });
     let restoration = activation.and_then(|(activated_peer, activation_id)| {
         trace
