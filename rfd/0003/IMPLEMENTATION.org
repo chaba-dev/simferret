@@ -215,6 +215,18 @@ content-addressed guest workload, and preserve exact passive replay.
     exhausting the VM deadline.
   - [X] Require the acceptance harness to observe one fresh-root witness in each
     of the two invocations, counting only newline-completed lines.
+- [X] Harden the phase against the fourth adversarial review:
+  - [X] Make semantic launch validation value-free as well, so the user, working
+    directory, executable argument, and digest diagnostics name the field and the
+    expected shape, and add record-path canaries that assert both the CLI text and
+    the shareable failure bundle.
+  - [X] Reject a second termination record and a termination for an invocation
+    that has already exited, and require exactly one termination record for the
+    acceptance profile.
+  - [X] Give an already-observed response failure precedence over a matching line,
+    and gate every process command and the end-of-input step on the same health
+    test, so an over-long unfinished tail stops the drive instead of reaching the
+    VM deadline.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:

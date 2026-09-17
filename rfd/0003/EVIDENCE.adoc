@@ -1399,7 +1399,11 @@ one of them was addressed in the same phase rather than deferred:
   with escaping a redactor cannot reliably undo. The generic frame readers, the
   retained canonical specification, and the surplus-event diagnostic all use the
   same reduction, and canaries place the secret in the offending value itself,
-  including one that embeds the delimiter the parser quotes it with.
+  including one that embeds the delimiter the parser quotes it with. Semantic
+  launch validation is value-free too: the user, working directory, executable
+  argument, and digest diagnostics name the field and the expected shape rather
+  than the value, and record-path canaries assert that neither the CLI text nor
+  the shareable failure bundle carries a marker placed in those fields.
 * *Owner-only image cache.* The `.images` cache is created `0700` with `0600`
   entries, and a reused entry is validated before it is opened: its type,
   ownership, and mode are checked first and repaired where possible, then it is
@@ -1409,9 +1413,12 @@ one of them was addressed in the same phase rather than deferred:
   synchronously await, so the checker validates them instead: a start, exit,
   termination, cleanup, or launch failure for an unknown invocation, a duplicate
   start, exit, cleanup, network configuration, activation, or restoration, a
-  cleanup before its exit or without reaping a process, a configuration that is
-  not the fixed private profile, and an activation without its prohibition rule
-  are all stream-structure violations.
+  termination after its exit or a second termination, a cleanup before its exit
+  or without reaping a process, a configuration that is not the fixed private
+  profile, and an activation without its prohibition rule are all
+  stream-structure violations. `process_safety` also requires exactly one
+  termination record, for the first invocation, which is what the acceptance
+  profile performs.
 * *Complete stream evaluation.* Per-invocation offset, sequence, and input-stream
   violations are now evaluated alongside the trace-level ones; sequences must
   start at one and stay contiguous; each accepted input must advance the accepted
@@ -1427,12 +1434,15 @@ one of them was addressed in the same phase rather than deferred:
   invocation to answer its first command within the scenario's liveness bound, so
   the first invocation's responses can no longer satisfy the property.
 * *Strict response matching.* The driver requires each invocation's *next*
-  complete line to equal the expected line, and it stops the wait as soon as the
-  invocation writes to stderr or its current stdout line already exceeds the
-  response bound, because the pinned fixture writes to stderr only when it is
-  failing and a line over the bound can never be valid. A wrong response, a
-  reported application error, or an over-long unfinished line therefore fails the
-  property through the checker instead of blocking until the VM deadline.
+  complete line to equal the expected line, and an already-observed failure takes
+  precedence over a matching line: it stops as soon as the invocation writes to
+  stderr or its current stdout line exceeds the response bound, because the
+  pinned fixture writes to stderr only when it is failing and a line over the
+  bound can never be valid. The same health test gates every process command and
+  the end-of-input step, so a failure observed by the pre-command drain stops the
+  drive as well. A wrong response, a reported application error, or an over-long
+  unfinished line therefore fails the property through the checker instead of
+  blocking until the VM deadline.
 * *Outage bookkeeping.* The driver tracks the administrative outage and restores
   the network before an early shutdown, because the agent refuses to stop while
   an outage is active. A network acknowledgement also folds the lifecycle events
@@ -1533,7 +1543,13 @@ manifest, and replay preflight are exercised without QEMU. The tests cover:
   a malformed protocol frame whose launch field carries the marker, neither of
   which may quote it; and
 * an over-bound unfinished stdout line, which must stop the wait instead of
-  reaching the VM deadline.
+  reaching the VM deadline, including when it follows a matching response in a
+  separate frame;
+* a termination for an invocation that already exited, and a duplicated
+  termination, both of which must fail process safety; and
+* a correctly typed but invalid user or working directory, and an OCI entrypoint
+  whose first argument is not absolute or not in the workload, none of which may
+  quote the value in the CLI text or the failure bundle.
 
 `crates/simferret/tests/rfd3_phase3.rs` pins the public contract: the strict
 versioned workload scenario, the seeded choice plan and its bounds, the request
