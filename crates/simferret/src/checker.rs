@@ -36,6 +36,12 @@ pub const FRESH_STATE_LINE: &str = "state value=fresh root=fresh";
 pub const STATE_LINE_PREFIX: &str = "state value=";
 /// The fixed line the fixture emits once its escaped descendant is ready.
 pub const ESCAPED_DESCENDANT_LINE: &str = "descendant state=escaped";
+/// The fixed private interface the acceptance profile configures.
+pub const NETWORK_INTERFACE: &str = "eth0";
+/// The fixed guest address the acceptance profile configures.
+pub const GUEST_CIDR: &str = "10.0.2.15/24";
+/// The fixed private peer the acceptance profile configures and faults.
+pub const FIXTURE_PEER: &str = "10.0.2.2";
 
 /// The deterministic echo token for one invocation. The host checker derives the
 /// expected response from the recorded input, so a workload that answers with
@@ -89,6 +95,8 @@ struct InvocationStreams {
     stderr_lines: Vec<CompletedLine>,
     stdout_offset: u64,
     stderr_offset: u64,
+    /// Whether the current stdout line has already exceeded the response bound.
+    stdout_over_bound: bool,
     /// The accepted input offset after the last `input-accepted` event.
     input_offset: u64,
     /// The command identifiers of the accepted inputs, in arrival order.
@@ -159,6 +167,19 @@ impl InvocationStreams {
                 text,
                 event_id: frame.event_id,
             });
+            self.stdout_over_bound = false;
+        }
+        // A line that already exceeds the bound without a newline is a failing
+        // response too, and waiting for the newline would only reach the VM
+        // deadline, so it is recorded as soon as it is observed.
+        if stream == OutputStream::Stdout
+            && !self.stdout_over_bound
+            && pending.len() > MAX_RESPONSE_LINE_BYTES
+        {
+            self.stdout_over_bound = true;
+            self.violations.push(format!(
+                "invocation {invocation} stdout line exceeds the response bound before its newline"
+            ));
         }
     }
 
@@ -260,6 +281,13 @@ struct LaunchFailureRecord {
     failure: LaunchFailure,
 }
 
+/// The one network configuration an acceptance run records.
+#[derive(Debug, Clone)]
+struct ConfiguredRecord {
+    gateway: String,
+    event_id: u64,
+}
+
 /// The process and byte facts one workload run records, reconstructed from the
 /// normalized event stream alone.
 #[derive(Debug, Default)]
@@ -271,7 +299,7 @@ pub struct WorkloadTrace {
     launch_failures: Vec<LaunchFailureRecord>,
     activations: Vec<(String, u64)>,
     restorations: Vec<(String, u64)>,
-    configured: Option<(String, u64)>,
+    configured: Option<ConfiguredRecord>,
     invocations: BTreeMap<u64, InvocationStreams>,
     violations: Vec<String>,
 }
@@ -279,14 +307,29 @@ pub struct WorkloadTrace {
 impl WorkloadTrace {
     /// Fold one received frame into the trace. An output frame for an invocation
     /// that never started is a structural violation rather than untracked bytes.
+    ///
+    /// Events that arrive outside a synchronous acknowledgement wait — output,
+    /// lifecycle, and network events — are validated here, because the driver
+    /// folds them without an expectation of its own.
     pub fn push(&mut self, frame: &EventFrame) {
         let event_id = frame.event_id;
         match &frame.event {
-            Event::WorkloadStarted { invocation, launch } => self.starts.push(StartRecord {
-                invocation: *invocation,
-                launch: launch.clone(),
-                event_id,
-            }),
+            Event::WorkloadStarted { invocation, launch } => {
+                if self
+                    .starts
+                    .iter()
+                    .any(|start| start.invocation == *invocation)
+                {
+                    self.violations.push(format!(
+                        "invocation {invocation} started twice, the second time at event {event_id}"
+                    ));
+                }
+                self.starts.push(StartRecord {
+                    invocation: *invocation,
+                    launch: launch.clone(),
+                    event_id,
+                })
+            }
             Event::WorkloadExited {
                 invocation,
                 exit,
@@ -295,43 +338,153 @@ impl WorkloadTrace {
                 stderr_bytes,
                 stderr_sha256,
                 frames,
-            } => self.exits.push(ExitRecord {
-                invocation: *invocation,
-                exit: *exit,
-                stdout_bytes: *stdout_bytes,
-                stdout_sha256: stdout_sha256.clone(),
-                stderr_bytes: *stderr_bytes,
-                stderr_sha256: stderr_sha256.clone(),
-                frames: *frames,
-                event_id,
-            }),
+            } => {
+                if !self.started(*invocation) {
+                    self.violations.push(format!(
+                        "workload-exited at event {event_id} names invocation {invocation} before it started"
+                    ));
+                    return;
+                }
+                if self.exited(*invocation) {
+                    self.violations.push(format!(
+                        "invocation {invocation} exited twice, the second time at event {event_id}"
+                    ));
+                    return;
+                }
+                self.exits.push(ExitRecord {
+                    invocation: *invocation,
+                    exit: *exit,
+                    stdout_bytes: *stdout_bytes,
+                    stdout_sha256: stdout_sha256.clone(),
+                    stderr_bytes: *stderr_bytes,
+                    stderr_sha256: stderr_sha256.clone(),
+                    frames: *frames,
+                    event_id,
+                })
+            }
             Event::TerminationRequested { invocation, signal } => {
+                if !self.started(*invocation) {
+                    self.violations.push(format!(
+                        "termination-requested at event {event_id} names invocation {invocation} before it started"
+                    ));
+                    return;
+                }
                 self.terminations.push(TerminationRecord {
                     invocation: *invocation,
                     signal: *signal,
                     event_id,
                 })
             }
-            Event::CleanupComplete { invocation, reaped } => self.cleanups.push(CleanupRecord {
-                invocation: *invocation,
-                reaped: *reaped,
-                event_id,
-            }),
+            Event::CleanupComplete { invocation, reaped } => {
+                if !self.started(*invocation) {
+                    self.violations.push(format!(
+                        "cleanup-complete at event {event_id} names invocation {invocation} before it started"
+                    ));
+                    return;
+                }
+                if self
+                    .cleanups
+                    .iter()
+                    .any(|cleanup| cleanup.invocation == *invocation)
+                {
+                    self.violations.push(format!(
+                        "invocation {invocation} completed cleanup twice, the second time at event {event_id}"
+                    ));
+                    return;
+                }
+                let Some(exit) = self
+                    .exits
+                    .iter()
+                    .find(|exit| exit.invocation == *invocation)
+                else {
+                    self.violations.push(format!(
+                        "invocation {invocation} completed cleanup at event {event_id} before it exited"
+                    ));
+                    return;
+                };
+                if exit.event_id > event_id {
+                    self.violations.push(format!(
+                        "invocation {invocation} completed cleanup at event {event_id} before its exit record"
+                    ));
+                    return;
+                }
+                if *reaped == 0 {
+                    self.violations.push(format!(
+                        "invocation {invocation} completed cleanup at event {event_id} without reaping a process"
+                    ));
+                    return;
+                }
+                self.cleanups.push(CleanupRecord {
+                    invocation: *invocation,
+                    reaped: *reaped,
+                    event_id,
+                })
+            }
             Event::LaunchFailed {
                 invocation,
                 failure,
                 ..
-            } => self.launch_failures.push(LaunchFailureRecord {
-                invocation: *invocation,
-                failure: *failure,
-            }),
-            Event::NetworkConfigured { gateway, .. } => {
-                self.configured = Some((gateway.clone(), event_id));
+            } => {
+                if !self.started(*invocation) {
+                    self.violations.push(format!(
+                        "launch-failed at event {event_id} names invocation {invocation} before it started"
+                    ));
+                    return;
+                }
+                self.launch_failures.push(LaunchFailureRecord {
+                    invocation: *invocation,
+                    failure: *failure,
+                })
             }
-            Event::OutageActivated { peer_cidr, .. } => {
+            Event::NetworkConfigured {
+                interface,
+                guest_cidr,
+                gateway,
+            } => {
+                if let Some(configured) = &self.configured {
+                    self.violations.push(format!(
+                        "a second network configuration arrived at event {event_id} after event {}",
+                        configured.event_id
+                    ));
+                    return;
+                }
+                if interface != NETWORK_INTERFACE
+                    || guest_cidr != GUEST_CIDR
+                    || gateway != FIXTURE_PEER
+                {
+                    self.violations.push(format!(
+                        "the network configuration at event {event_id} is not the fixed private profile"
+                    ));
+                    return;
+                }
+                self.configured = Some(ConfiguredRecord {
+                    gateway: gateway.clone(),
+                    event_id,
+                });
+            }
+            Event::OutageActivated { peer_cidr, rule } => {
+                if let Some((_, activation_id)) = self.activations.first() {
+                    let activation_id = *activation_id;
+                    self.violations.push(format!(
+                        "a second outage activation arrived at event {event_id} after event {activation_id}"
+                    ));
+                    return;
+                }
+                if rule != &format!("prohibit {peer_cidr}") {
+                    self.violations.push(format!(
+                        "the outage activation at event {event_id} does not name its prohibition rule"
+                    ));
+                    return;
+                }
                 self.activations.push((peer_cidr.clone(), event_id));
             }
             Event::NetworkRestored { peer_cidr } => {
+                if let Some((_, restoration_id)) = self.restorations.first() {
+                    self.violations.push(format!(
+                        "a second network restoration arrived at event {event_id} after event {restoration_id}"
+                    ));
+                    return;
+                }
                 self.restorations.push((peer_cidr.clone(), event_id));
             }
             Event::WorkloadOutput {
@@ -341,11 +494,7 @@ impl WorkloadTrace {
                 sequence,
                 bytes,
             } => {
-                let started = self
-                    .starts
-                    .iter()
-                    .any(|start| start.invocation == *invocation);
-                if !started {
+                if !self.started(*invocation) {
                     self.violations.push(format!(
                         "output frame at event {event_id} names invocation {invocation} before it started"
                     ));
@@ -380,11 +529,7 @@ impl WorkloadTrace {
                 bytes,
                 eof,
             } => {
-                if !self
-                    .starts
-                    .iter()
-                    .any(|start| start.invocation == *invocation)
-                {
+                if !self.started(*invocation) {
                     self.violations.push(format!(
                         "input-accepted at event {event_id} names invocation {invocation} before it started"
                     ));
@@ -407,6 +552,13 @@ impl WorkloadTrace {
             }
             _ => {}
         }
+    }
+
+    /// Whether one invocation has a start record.
+    fn started(&self, invocation: u64) -> bool {
+        self.starts
+            .iter()
+            .any(|start| start.invocation == invocation)
     }
 
     /// Every stream-structure violation, including the per-invocation offset,
@@ -455,6 +607,15 @@ impl WorkloadTrace {
         self.invocations.get(&invocation).map_or(0, |streams| {
             streams.stderr.len() + streams.stderr_pending.len()
         })
+    }
+
+    /// Whether one invocation's current stdout line has already exceeded the
+    /// response bound. The driver stops waiting for a line that can no longer be
+    /// valid instead of reaching the VM deadline.
+    pub fn over_bound_line(&self, invocation: u64) -> bool {
+        self.invocations
+            .get(&invocation)
+            .is_some_and(|streams| streams.stdout_over_bound)
     }
 
     fn stdout_lines(&self, invocation: u64) -> &[CompletedLine] {
@@ -855,12 +1016,12 @@ fn fault_properties(
     let activation = trace
         .configured
         .as_ref()
-        .filter(|(gateway, _)| gateway == &scenario.fixture_peer)
-        .and_then(|(_, configured_id)| {
+        .filter(|configured| configured.gateway == scenario.fixture_peer)
+        .and_then(|configured| {
             trace
                 .activations
                 .iter()
-                .find(|(peer_cidr, event_id)| peer_cidr == &peer && *event_id > *configured_id)
+                .find(|(peer_cidr, event_id)| peer_cidr == &peer && *event_id > configured.event_id)
         });
     let restoration = activation.and_then(|(activated_peer, activation_id)| {
         trace
@@ -1324,6 +1485,107 @@ mod tests {
         if let Event::WorkloadOutput { bytes, .. } = &mut frame.event {
             *bytes = crate::protocol::encode_bytes(to);
         }
+    }
+
+    /// Insert one frame before `index`, keeping event identifiers increasing.
+    fn insert_event(events: &mut Vec<EventFrame>, index: usize, event: Event, command_id: u64) {
+        for later in events[index..].iter_mut() {
+            later.event_id += 1;
+        }
+        let event_id = events[index].event_id - 1;
+        events.insert(
+            index,
+            EventFrame {
+                protocol_version: PROTOCOL_VERSION,
+                event_id,
+                command_id,
+                event,
+                diagnostics: DiagnosticFields::default(),
+            },
+        );
+    }
+
+    /// The frame index of one invocation's exit record.
+    fn exit_index(events: &[EventFrame], invocation: u64) -> usize {
+        events
+            .iter()
+            .position(|frame| {
+                matches!(frame.event, Event::WorkloadExited { invocation: existing, .. } if existing == invocation)
+            })
+            .expect("the invocation has an exit record")
+    }
+
+    #[test]
+    fn a_lifecycle_event_for_an_unknown_invocation_fails_process_safety() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let index = exit_index(&events, 2);
+        insert_event(
+            &mut events,
+            index,
+            Event::CleanupComplete {
+                invocation: 99,
+                reaped: 0,
+            },
+            1,
+        );
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
+    }
+
+    #[test]
+    fn a_duplicated_cleanup_barrier_fails_process_safety() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let index = exit_index(&events, 2);
+        insert_event(
+            &mut events,
+            index,
+            Event::CleanupComplete {
+                invocation: 1,
+                reaped: 2,
+            },
+            1,
+        );
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
+    }
+
+    #[test]
+    fn a_second_network_configuration_fails_process_safety() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let index = events
+            .iter()
+            .position(|frame| matches!(frame.event, Event::WorkloadStarted { invocation: 1, .. }))
+            .expect("the first invocation starts");
+        insert_event(
+            &mut events,
+            index,
+            Event::NetworkConfigured {
+                interface: "lo".into(),
+                guest_cidr: "10.0.2.15/24".into(),
+                gateway: "10.0.2.2".into(),
+            },
+            1,
+        );
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
+    }
+
+    #[test]
+    fn a_cleanup_that_reaped_nothing_fails_process_safety() {
+        let choices = fixed_choices();
+        let mut events = passing_events(&choices);
+        let frame = events
+            .iter_mut()
+            .find(|frame| matches!(frame.event, Event::CleanupComplete { invocation: 2, .. }))
+            .expect("the second invocation completes cleanup");
+        if let Event::CleanupComplete { reaped, .. } = &mut frame.event {
+            *reaped = 0;
+        }
+        let report = evaluate_workload(&events, &scenario(), &choices, &launch());
+        assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
     }
 
     #[test]
