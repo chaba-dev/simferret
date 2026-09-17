@@ -71,6 +71,7 @@ jobs:
             env SIMFERRET_PHASE2_TEST_BINARY="$binary" \
             ./scripts/rfd3-phase2-runtime.sh
       - run: nix develop --command ./scripts/phase4-acceptance-test.sh
+      - run: nix develop --command ./scripts/rfd3-phase3-acceptance.sh
       - run: nix develop --command ./scripts/qemu-replay-smoke.sh
       - run: nix develop --command ./scripts/qemu-network-replay-smoke.sh
       - run: nix develop --command ./scripts/phase4-acceptance.sh
@@ -83,4 +84,5 @@ jobs:
             .poc/qemu-network-replay-smoke/
             .poc/phase4-acceptance/
             .poc/rfd3-phase1-evidence/
+            .poc/rfd3-phase3-acceptance/
           if-no-files-found: ignore
