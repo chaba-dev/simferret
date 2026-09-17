@@ -1771,7 +1771,8 @@ impl<'a> WorkloadController<'a> {
     /// The line must be the *next* complete line of that invocation, so a wrong
     /// response fails the run through the checker instead of being skipped over
     /// until the VM deadline. Returns `false` when the invocation exits first,
-    /// writes to stderr, or answers with a different line.
+    /// writes to stderr, produces a line that already exceeds the response bound,
+    /// or answers with a different line.
     fn wait_for_line(&mut self, invocation: u64, expected: &str) -> io::Result<bool> {
         loop {
             let consumed = self.consumed_lines.get(&invocation).copied().unwrap_or(0);
@@ -1783,6 +1784,7 @@ impl<'a> WorkloadController<'a> {
             if self.trace.exited(invocation)
                 || self.trace.launch_failed(invocation)
                 || self.trace.stderr_bytes(invocation) > 0
+                || self.trace.over_bound_line(invocation)
             {
                 return Ok(false);
             }
@@ -2460,9 +2462,17 @@ fn artifact_digests(root: &Path, workload: bool) -> io::Result<BTreeMap<String, 
     if workload {
         names.push(WORKLOAD_LOCK_PATH);
     }
+    // Each artifact is hashed through the same reader the replay path uses, so a
+    // run that exceeds any replay limit is refused before it is published rather
+    // than published and then rejected on replay.
     names
         .into_iter()
-        .map(|name| Ok((name.into(), sha256_file(&root.join(name))?)))
+        .map(|name| {
+            Ok((
+                name.into(),
+                sha256_regular_file(&root.join(name), artifact_limit(name))?,
+            ))
+        })
         .collect()
 }
 
@@ -3017,6 +3027,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::checker::MAX_RESPONSE_LINE_BYTES;
     use crate::protocol::{DiagnosticFields, OutputStream, ProcessExit};
 
     /// A deterministic model of the pinned acceptance fixture's line protocol,
@@ -3076,6 +3087,9 @@ mod tests {
         /// Write to stderr without exiting, so only the driver's stderr check can
         /// end the wait for a response line.
         stderr_without_exit: bool,
+        /// Write a stdout line that already exceeds the response bound, without a
+        /// newline and without exiting.
+        over_bound_line_without_exit: bool,
     }
 
     struct FakeAdapter {
@@ -3155,6 +3169,7 @@ mod tests {
                 future_command_event: false,
                 pending_cleanup: None,
                 stderr_without_exit: false,
+                over_bound_line_without_exit: false,
             })
         }
     }
@@ -3402,6 +3417,15 @@ mod tests {
                     // The barrier is serialized separately, so the host reads it
                     // only with the command that follows the exit record.
                     self.pending_cleanup = Some((invocation, 1));
+                } else if self.over_bound_line_without_exit && self.workload.fetched == 1 {
+                    // A response line that can never be valid, without a newline:
+                    // only the response bound can end the wait.
+                    self.emit_output(
+                        command_id,
+                        invocation,
+                        OutputStream::Stdout,
+                        &"x".repeat(MAX_RESPONSE_LINE_BYTES + 1),
+                    );
                 } else if self.stderr_without_exit && self.workload.fetched == 1 {
                     // A failing application that stays alive: only the driver's
                     // stderr check can end the wait for its response line.
@@ -3785,6 +3809,7 @@ mod tests {
             future_command_event: false,
             pending_cleanup: None,
             stderr_without_exit: false,
+            over_bound_line_without_exit: false,
         };
         let mut diagnostics = failure_diagnostics("record");
         let (events, report) =
@@ -5469,6 +5494,97 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn an_over_bound_unfinished_line_stops_the_wait_instead_of_timing_out() {
+        // A response line that already exceeds the bound can never be valid, so
+        // the driver must stop waiting for its newline.
+        let mut vm = fake_workload_vm();
+        vm.over_bound_line_without_exit = true;
+        let (events, report) = drive_fake_workload(&mut vm);
+        assert!(!report.passed);
+        assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
+        assert!(
+            report.assertions[0]
+                .detail
+                .contains("exceeds the response bound"),
+            "{}",
+            report.assertions[0].detail
+        );
+        assert!(
+            events
+                .iter()
+                .any(|frame| matches!(frame.event, Event::AgentStopped {}))
+        );
+    }
+
+    #[test]
+    fn an_oversized_published_artifact_is_refused_before_publication() {
+        let root = temporary_root("artifact-bounds");
+        let staging = root.join("staging");
+        fs::create_dir_all(staging.join("logs")).unwrap();
+        for name in ARTIFACT_NAMES {
+            fs::write(staging.join(name), b"x").unwrap();
+        }
+        // The diagnostic log exceeds the limit the replay path enforces, so the
+        // run must be refused rather than published and then rejected on replay.
+        fs::write(
+            staging.join("logs/qemu.log"),
+            vec![b'x'; MAX_DIAGNOSTIC_ARTIFACT_BYTES + 1],
+        )
+        .unwrap();
+        let error = artifact_digests(&staging, false).unwrap_err();
+        assert!(error.to_string().contains("qemu.log"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_malformed_canonical_specification_never_quotes_the_environment() {
+        let root = temporary_root("canonical-specification-privacy");
+        let options = workload_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        let store = options.runs_directory.join(WORKLOAD_STORE_NAME);
+
+        // Rewrite the retained canonical specification so a launch field has the
+        // wrong type and carries a marker, then make the raw closure agree with
+        // the new object so the parser is reached.
+        let closure_path = store.join("raw/closure.json");
+        let mut closure: serde_json::Value =
+            serde_json::from_slice(&fs::read(&closure_path).unwrap()).unwrap();
+        let objects = closure["objects"].as_array_mut().unwrap();
+        let record = objects
+            .iter_mut()
+            .find(|record| record["role"] == "workload-specification")
+            .expect("the closure retains the canonical specification");
+        let digest = record["digest"].as_str().unwrap().to_owned();
+        let object_path = store.join(format!("raw/sha256/{}", &digest["sha256:".len()..]));
+        let mut specification: serde_json::Value =
+            serde_json::from_slice(&fs::read(&object_path).unwrap()).unwrap();
+        specification["uid"] = serde_json::Value::String("SECRET=canonical-marker".into());
+        let bytes = serde_json::to_vec(&specification).unwrap();
+        let new_digest = format!("sha256:{}", sha256_bytes(&bytes));
+        let new_path = store.join(format!("raw/sha256/{}", &new_digest["sha256:".len()..]));
+        fs::write(&new_path, &bytes).unwrap();
+        fs::remove_file(&object_path).unwrap();
+        record["digest"] = serde_json::Value::String(new_digest);
+        record["bytes"] = serde_json::Value::from(bytes.len());
+        fs::write(&closure_path, serde_json::to_vec(&closure).unwrap()).unwrap();
+
+        let error = replay_with_adapter(
+            &replay_options(&options, recorded.directory.clone()),
+            &adapter,
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("canonical-marker"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("malformed canonical specification"),
+            "{error}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// A fake guest and scenario for driving the workload control loop directly,
     /// without a record or replay publication.
     fn workload_scenario_fixture() -> WorkloadScenario {
@@ -5521,6 +5637,7 @@ mod tests {
             future_command_event: false,
             pending_cleanup: None,
             stderr_without_exit: false,
+            over_bound_line_without_exit: false,
         }
     }
 
@@ -5674,6 +5791,7 @@ mod tests {
             future_command_event: false,
             pending_cleanup: None,
             stderr_without_exit: false,
+            over_bound_line_without_exit: false,
         }
     }
 
