@@ -5,6 +5,10 @@
 //! keep the same public surface so the agent, the guest image assembler, and the
 //! CLI still compile, but every entry point reports `Unsupported`. The protocol
 //! types and the workload assembler are portable and remain available.
+//!
+//! This module must mirror every public item of the Linux runtime: the CI
+//! macOS job is the only thing that compiles it, so a missing item shows up as
+//! a `macos-latest` failure rather than a local one.
 
 use std::io;
 use std::os::fd::RawFd;
@@ -80,6 +84,13 @@ impl Runtime {
 
     pub fn is_active(&self) -> bool {
         false
+    }
+
+    /// The write end of the active invocation's bounded input queue, or `None`
+    /// when no invocation is active. Off Linux no invocation can be active, so
+    /// the control loop never has an input descriptor to poll.
+    pub fn input_fd(&self) -> Option<RawFd> {
+        None
     }
 
     pub fn output_fds(&self) -> Vec<RawFd> {
