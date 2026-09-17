@@ -1401,9 +1401,12 @@ one of them was addressed in the same phase rather than deferred:
   same reduction, and canaries place the secret in the offending value itself,
   including one that embeds the delimiter the parser quotes it with. Semantic
   launch validation is value-free too: the user, working directory, executable
-  argument, and digest diagnostics name the field and the expected shape rather
-  than the value, and record-path canaries assert that neither the CLI text nor
-  the shareable failure bundle carries a marker placed in those fields.
+  argument, digest, and manifest-descriptor diagnostics name the field and the
+  expected shape rather than the value, the working-directory and executable
+  paths map the layer-path helper's value-bearing error onto a field-specific
+  one, and the recorded OCI manifest digest is validated before it can be named.
+  Record-path canaries assert that neither the CLI text nor the shareable failure
+  bundle carries a marker placed in those fields, including a traversal path.
 * *Owner-only image cache.* The `.images` cache is created `0700` with `0600`
   entries, and a reused entry is validated before it is opened: its type,
   ownership, and mode are checked first and repaired where possible, then it is
@@ -1411,10 +1414,11 @@ one of them was addressed in the same phase rather than deferred:
   so a writer-less FIFO or a device node is rejected instead of blocking the run.
 * *Validated asynchronous events.* The driver folds events it does not
   synchronously await, so the checker validates them instead: a start, exit,
-  termination, cleanup, or launch failure for an unknown invocation, a duplicate
-  start, exit, cleanup, network configuration, activation, or restoration, a
-  termination after its exit or a second termination, a cleanup before its exit
-  or without reaping a process, a configuration that is not the fixed private
+  termination, cleanup, launch failure, or input acknowledgement for an unknown
+  invocation, an input acknowledgement after the invocation was terminated, a
+  duplicate start, exit, termination, cleanup, network configuration, activation,
+  or restoration, a termination after its exit, a cleanup before its exit or
+  without reaping a process, a configuration that is not the fixed private
   profile, and an activation without its prohibition rule are all
   stream-structure violations. `process_safety` also requires exactly one
   termination record, for the first invocation, which is what the acceptance
@@ -1440,9 +1444,19 @@ one of them was addressed in the same phase rather than deferred:
   pinned fixture writes to stderr only when it is failing and a line over the
   bound can never be valid. The same health test gates every process command and
   the end-of-input step, so a failure observed by the pre-command drain stops the
-  drive as well. A wrong response, a reported application error, or an over-long
-  unfinished line therefore fails the property through the checker instead of
-  blocking until the VM deadline.
+  drive as well, and the wait for an exit is interruptible by an output frame
+  that fails the same test instead of running to the VM deadline. A wrong
+  response, a reported application error, or an over-long unfinished line
+  therefore fails the property through the checker instead of blocking until the
+  VM deadline.
+* *Schedule-free passive replay.* A replayed guest reproduces the recorded
+  execution, including the input it received, so the host sends nothing. Passive
+  replay therefore consumes the recorded event stream in order, requires every
+  event to match byte for byte, requires the stream to end with the agent-stopped
+  acknowledgement, and lets the checker recompute the report from those events.
+  It no longer re-decides the command schedule from its own queue timing, so a
+  recording whose failing response became visible one command later than it would
+  in a faster replay still replays to the same failing report.
 * *Outage bookkeeping.* The driver tracks the administrative outage and restores
   the network before an early shutdown, because the agent refuses to stop while
   an outage is active. A network acknowledgement also folds the lifecycle events
@@ -1548,8 +1562,16 @@ manifest, and replay preflight are exercised without QEMU. The tests cover:
 * a termination for an invocation that already exited, and a duplicated
   termination, both of which must fail process safety; and
 * a correctly typed but invalid user or working directory, and an OCI entrypoint
-  whose first argument is not absolute or not in the workload, none of which may
-  quote the value in the CLI text or the failure bundle.
+  whose first argument is not absolute, not in the workload, or escapes it
+  through a traversal component, none of which may quote the value in the CLI
+  text or the failure bundle, plus a manifest descriptor selected by a marker
+  digest;
+* an input acknowledgement after an invocation was terminated, and a termination
+  that arrives after the invocation completed cleanup;
+* an over-bound tail that becomes visible only after the end-of-input
+  acknowledgement, which must still stop the run; and
+* a recording whose failing response became visible one command later than a
+  faster replay would observe it, which must still replay to the same report.
 
 `crates/simferret/tests/rfd3_phase3.rs` pins the public contract: the strict
 versioned workload scenario, the seeded choice plan and its bounds, the request

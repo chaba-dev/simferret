@@ -227,6 +227,21 @@ content-addressed guest workload, and preserve exact passive replay.
     and gate every process command and the end-of-input step on the same health
     test, so an over-long unfinished tail stops the drive instead of reaching the
     VM deadline.
+- [X] Harden the phase against the fifth adversarial review:
+  - [X] Map the layer-path helper's value-bearing error onto field-specific
+    diagnostics for the working directory and the executable argument, validate
+    the recorded OCI manifest digest before it can be named, and extend the
+    canaries with a traversal path and a missing manifest descriptor.
+  - [X] Reject an input acknowledgement for an invocation that has already been
+    terminated, and reject a termination that arrives after the invocation
+    completed cleanup.
+  - [X] Make the wait for an exit interruptible by an output frame that fails the
+    response health test, so a tail observed after the end-of-input
+    acknowledgement cannot run to the VM deadline.
+  - [X] Stop re-deciding the command schedule during passive replay: a replay now
+    consumes and compares the recorded event stream in order and lets the checker
+    recompute the report, so a recording that observed a failing response one
+    command later than a faster replay still replays to the same report.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
