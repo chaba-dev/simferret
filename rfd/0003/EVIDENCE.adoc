@@ -441,6 +441,17 @@ materialized, and each left no partial directory:
 | `whiteout marker '.wh.a' is not a basename`
 |===
 
+The rejections above are the Phase 0 prototype's observed output, kept verbatim
+as spike evidence. The shipped assembler refuses the same constructs with
+value-free diagnostics: every layer rejection names the layer and member position
+plus a fixed category (`absolute layer paths are unsupported`, `layer paths must
+not contain '..' components`, `a layer contains duplicate normalized paths`,
+`a layer marker traverses a symbolic link`, `layer 0 member 3 has an unsupported
+mode`, `layer 0 member 3 is a hard link, which is unsupported`, and so on), never
+the path, media type, link target, or raw header field that caused it. The tar
+parser's own errors, which quote the pathname and the invalid numeric field, are
+reduced to fixed context for the same reason.
+
 The prototype also rejects FIFOs, sockets, sparse files, empty or malformed
 digests, empty manifests, numeric metadata outside its serializable range, an
 opaque marker whose parent is still a non-directory after the layer is applied,
@@ -1423,7 +1434,12 @@ one of them was addressed in the same phase rather than deferred:
   the overlay collision names the fixed `/tmp` or `/dev` subtree instead of the
   colliding entry path, the replay scenario-name comparison names the
   disagreement instead of either name, and a repeated raw-closure role names the
-  object's position.
+  object's position. The layer reader is value-free as well: a rejected member
+  names the layer and member position plus a fixed category, never the path, the
+  symbolic-link target, the media type, or a raw header field, and the tar
+  parser's own errors are reduced to fixed context. The replay identity
+  comparisons and the version check name the differing field only, because a
+  recorded identity can carry an arbitrary string or a private host path.
 * *Owner-only image cache.* The `.images` cache is created `0700` with `0600`
   entries, and a reused entry is validated before it is opened: its type,
   ownership, and mode are checked first and repaired where possible, then it is
@@ -1482,8 +1498,9 @@ one of them was addressed in the same phase rather than deferred:
   sticky for the invocation: a line that completes with a newline still fails the
   health test, so a known-invalid response cannot become a timeout merely because
   its terminator arrived. The exit wait also ends on any complete stdout line the
-  driver did not consume: every expected line has been consumed by then, so a
-  further line can only be a response the checker must reject. A wrong
+  driver did not consume and on a pending byte: every expected response is
+  complete and consumed by then, so a further line or even one byte can only be a
+  response the checker must reject. A wrong
   response, a reported application error, or an over-long unfinished line
   therefore fails the property through the checker instead of blocking until the
   VM deadline.
@@ -1631,7 +1648,11 @@ manifest, and replay preflight are exercised without QEMU. The tests cover:
 * a complete short stdout line the driver never asked for, folded by the
   end-of-input acknowledgement, which must end the exit wait; and
 * a tampered manifest scenario name, which must not appear in the CLI text or the
-  failure bundle.
+  failure bundle;
+* a pending stdout byte folded by the end-of-input acknowledgement, before and
+  after it, which must end the exit wait; and
+* a replay whose recorded version or VM identity differs, whose diagnostic must
+  name the field without either value.
 
 `crates/simferret/tests/rfd3_phase3.rs` pins the public contract: the strict
 versioned workload scenario, the seeded choice plan and its bounds, the request

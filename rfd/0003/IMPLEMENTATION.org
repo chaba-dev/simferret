@@ -304,6 +304,27 @@ content-addressed guest workload, and preserve exact passive replay.
     regression, overlay and scenario-name canaries, a duplicate-role variant in
     the raw-closure canary, and checker cases that move each witness's
     acknowledgement before its transition.
+- [X] Harden the phase against the ninth adversarial review, which confirmed all
+  four eighth-round fixes, found two further defects, and ruled the layer
+  diagnostics in scope:
+  - [X] End the exit wait on a pending stdout byte as well: every expected
+    response is complete and consumed by the time the driver waits for an exit,
+    so a single byte cannot become a valid response, and a workload that emitted
+    one and then stayed silent must not block until the VM deadline.
+  - [X] Name a differing replay identity field without its values, and stop
+    quoting the recorded version in the version diagnostic, because a recorded
+    identity can carry an arbitrary string or a private host path.
+  - [X] Make the layer reader value-free: every layer rejection names the layer
+    and member position plus a fixed category instead of the member path, the
+    symbolic-link target, the media type, or a raw numeric header field; the
+    forwarded tar parser errors are reduced to fixed context; and the path,
+    symbolic-link, overlay, marker, and traversal helpers name the rule they
+    enforce.
+  - [X] Add regression tests for each fix: pending-byte variants in the
+    end-of-input regression, identity and version value-freedom assertions in the
+    VM tests, and a layer canary that presents rejected raw headers and
+    tree-level collisions and asserts that a marker in the artifact appears in no
+    diagnostic.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
