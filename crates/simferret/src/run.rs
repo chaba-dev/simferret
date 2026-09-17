@@ -2927,9 +2927,14 @@ fn retain_failure_bundle(
     let temporary = root.join(format!(".{bundle_id}.tmp-{}", std::process::id()));
     fs::DirBuilder::new().mode(0o700).create(&temporary)?;
     let result = (|| {
+        // The runs directory holds the workload store, the guest image cache,
+        // and the staging and run directories, and its own name can carry a
+        // private marker. It is listed last so the longer paths above are
+        // replaced first.
         let private_paths = diagnostic_source
             .into_iter()
             .chain(runtime_directory)
+            .chain([runs_directory])
             .collect::<Vec<_>>();
         let error = String::from_utf8(sanitize_diagnostic_log(
             report.error.as_bytes(),
@@ -3006,8 +3011,8 @@ fn sanitize_diagnostic_log(bytes: &[u8], private_paths: &[&Path]) -> Vec<u8> {
         if let Some(path) = path.to_str()
             && !path.is_empty()
         {
-            log = log.replace(&qemu_escape_path(path), "<runtime-directory>");
-            log = log.replace(path, "<runtime-directory>");
+            log = log.replace(&qemu_escape_path(path), "<private-path>");
+            log = log.replace(path, "<private-path>");
         }
     }
     if log.len() <= MAX_FAILURE_TEXT_BYTES {
@@ -4437,7 +4442,7 @@ mod tests {
         assert!(report["diagnostics"]["network"]["replay_filter"].is_object());
         let qemu_log = fs::read_to_string(bundle.join("logs/qemu.log")).unwrap();
         assert!(qemu_log.contains("distinctive replay failure"));
-        assert!(qemu_log.contains("<runtime-directory>/qmp.sock"));
+        assert!(qemu_log.contains("<private-path>/qmp.sock"));
         assert!(!qemu_log.contains("/tmp/sf-"));
         fs::remove_dir_all(root).unwrap();
     }
@@ -4791,9 +4796,7 @@ mod tests {
         assert!(!String::from_utf8_lossy(&retained_log).contains(&escaped));
         let retained_serial = fs::read_to_string(bundle.join("logs/serial.log")).unwrap();
         assert!(
-            retained_serial
-                .lines()
-                .all(|line| line == "<runtime-directory>"),
+            retained_serial.lines().all(|line| line == "<private-path>"),
             "{retained_serial}"
         );
         let expanded = sanitize_diagnostic_log(&vec![0xff; MAX_FAILURE_LOG_BYTES], &[]);
@@ -5867,6 +5870,31 @@ mod tests {
                 .contains("malformed canonical specification"),
             "{error}"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_operational_path_never_reaches_the_failure_bundle() {
+        // The runs directory holds the workload store, the guest image cache, and
+        // the run and staging directories, and its own name can carry a private
+        // marker, so the retained report replaces it.
+        let root = temporary_root("operational-path-privacy");
+        let mut options = workload_options(&root, false);
+        // The marker is split so it cannot be confused with a real secret.
+        let runs = root.join(format!("runs-{}", ["SECRET", "=CANARY"].join("")));
+        let store = runs.join(WORKLOAD_STORE_NAME);
+        fs::create_dir_all(&store).unwrap();
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).unwrap();
+        options.runs_directory = runs;
+        let adapter = fake_adapter(None);
+        let error = record_with_adapter(&options, &adapter).unwrap_err();
+        assert!(error.to_string().contains("owner-only"), "{error}");
+
+        let bundle = only_failure_bundle(&options.runs_directory);
+        let report = fs::read(bundle.join("failure.json")).unwrap();
+        let text = String::from_utf8_lossy(&report);
+        assert!(!text.contains("CANARY"), "{text}");
+        assert!(text.contains("<private-path>"), "{text}");
         fs::remove_dir_all(root).unwrap();
     }
 
