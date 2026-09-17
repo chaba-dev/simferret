@@ -596,9 +596,25 @@ fn an_invocation_does_not_steal_an_unrelated_child() {
         .arg("exit 7")
         .spawn()
         .expect("the unrelated child must spawn");
-    // The child must already be a zombie when the invocation runs, and the
-    // test must not reap it: `try_wait` would consume it.
-    std::thread::sleep(Duration::from_millis(300));
+    // `waitid` with `WNOWAIT` blocks until the child has exited and leaves the
+    // status unconsumed, so the test cannot race a sleep and the zombie is
+    // guaranteed to exist before the invocation starts.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        // SAFETY: `info` is writable and `pid` is the live child.
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                unrelated.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        },
+        0,
+        "waitid must report the unrelated child's exit"
+    );
+    // SAFETY: `info` was filled by the successful `waitid` above.
+    assert_eq!(unsafe { info.si_pid() }, unrelated.id() as libc::pid_t);
 
     let (root, _) = template("scoped-reap");
     let mut runtime = runtime(&root);
@@ -721,6 +737,153 @@ fn the_workload_starts_with_the_default_sigpipe_disposition() {
         ProcessExit::Signaled {
             signal: libc::SIGPIPE
         }
+    );
+}
+
+#[test]
+fn terminating_an_invocation_with_queued_input_is_not_an_infrastructure_error() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("terminate-queued-input");
+    let mut runtime = runtime(&root);
+    // The workload never reads its standard input, so the pipe fills and the
+    // remainder stays in the bounded queue.
+    let mut events = runtime.start(1, &launch("sleep 30"));
+    let chunk = vec![b'x'; 4096];
+    let mut offset = 0_u64;
+    let mut queued = 0_usize;
+    for _ in 0..32 {
+        match runtime.stdin_write(1, offset, &encode_bytes(&chunk)) {
+            Ok(accepted) => {
+                events.extend(accepted);
+                offset += chunk.len() as u64;
+                queued += chunk.len();
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(queued > 64 * 1024, "the queue must hold more than the pipe");
+
+    events.extend(runtime.terminate(1).unwrap());
+    // Wait until the killed readers are gone, so the queued input has nowhere
+    // to go. A poll that flushed it first would report a broken pipe as an
+    // infrastructure failure instead of the requested termination.
+    std::thread::sleep(Duration::from_millis(300));
+    poll_until_cleanup(&mut runtime, &mut events);
+    assert!(matches!(events.last(), Some(Event::CleanupComplete { .. })));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Event::WorkloadExited {
+                exit: ProcessExit::Signaled { .. },
+                ..
+            }
+        )),
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn a_continuously_ready_stream_does_not_starve_the_other() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("fairness");
+    let mut runtime = runtime(&root);
+    // The filler keeps standard output continuously readable, so a batch that
+    // serves one stream to exhaustion would never reach the other.
+    let filler = "x".repeat(1024);
+    let mut events = runtime.start(
+        1,
+        &launch(&format!(
+            "printf 'err\\n' 1>&2; while :; do printf '%s' '{filler}'; done"
+        )),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut stderr_seen = false;
+    while !stderr_seen && std::time::Instant::now() < deadline {
+        events.extend(runtime.poll(Duration::from_millis(20)).unwrap());
+        stderr_seen = events.iter().any(|event| {
+            matches!(
+                event,
+                Event::WorkloadOutput {
+                    stream: OutputStream::Stderr,
+                    ..
+                }
+            )
+        });
+    }
+    assert!(
+        stderr_seen,
+        "standard error was starved by a continuously ready standard output"
+    );
+    events.extend(runtime.terminate(1).unwrap());
+    poll_until_cleanup(&mut runtime, &mut events);
+}
+
+#[test]
+fn output_offsets_advance_across_multiple_frames_per_stream() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("offset-advance");
+    // A frame limit smaller than either stream forces every stream to split, so
+    // an implementation that always reports offset zero cannot pass.
+    let mut runtime = Runtime::new(RuntimeConfig {
+        template_root: root.0.join("template"),
+        runtime_root: root.0.join("runtime"),
+        limits: RuntimeLimits {
+            output_frame_bytes: 4,
+            ..RuntimeLimits::default()
+        },
+        scope: MemberScope::ProcessGroup,
+    })
+    .unwrap();
+    let events = run_script(&mut runtime, 1, "printf 'abcdefgh'; printf 'ijklmnop' 1>&2");
+
+    let mut stdout_offsets = Vec::new();
+    let mut stderr_offsets = Vec::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut frames = 0_u64;
+    for event in &events {
+        let Event::WorkloadOutput {
+            stream,
+            offset,
+            bytes,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        frames += 1;
+        let decoded = simferret::protocol::decode_bytes(bytes, 4096).unwrap();
+        match stream {
+            OutputStream::Stdout => {
+                stdout_offsets.push(*offset);
+                stdout.extend_from_slice(&decoded);
+            }
+            OutputStream::Stderr => {
+                stderr_offsets.push(*offset);
+                stderr.extend_from_slice(&decoded);
+            }
+        }
+    }
+    assert_eq!(stdout_offsets, vec![0, 4], "stdout offsets must advance");
+    assert_eq!(stderr_offsets, vec![0, 4], "stderr offsets must advance");
+    assert_eq!(stdout, b"abcdefgh");
+    assert_eq!(stderr, b"ijklmnop");
+    let reported = events
+        .iter()
+        .find_map(|event| match event {
+            Event::WorkloadExited { frames, .. } => Some(*frames),
+            _ => None,
+        })
+        .expect("the invocation must report an exit record");
+    assert_eq!(
+        reported, frames,
+        "the exit record must count the frames that were emitted"
     );
 }
 
@@ -1045,6 +1208,17 @@ fn the_agent_drives_the_runtime_over_the_serial_control_channel() {
                 simferret::protocol::Event::InputAccepted { eof: false, .. }
             )
     });
+    // The response must be delivered while the shell is still blocked waiting
+    // for another input line, so an implementation that buffers all output
+    // until process exit cannot pass.
+    wait_for_frame(&collected, |frame| match &frame.event {
+        simferret::protocol::Event::WorkloadOutput {
+            stream: OutputStream::Stdout,
+            bytes,
+            ..
+        } => simferret::protocol::decode_bytes(bytes, 4096).unwrap() == b"got:live\n",
+        _ => false,
+    });
     let eof_id = send(&mut commands, Command::StdinEof { invocation: 1 });
     wait_for_frame(&collected, |frame| {
         frame.command_id == eof_id
@@ -1096,7 +1270,10 @@ fn the_agent_drives_the_runtime_over_the_serial_control_channel() {
             )
         })
         .expect("a live output frame must be emitted");
-    assert!(output_frame.command_id <= eof_id, "{events:#?}");
+    assert_eq!(
+        output_frame.command_id, write_id,
+        "live output must be attributed to the command in flight: {events:#?}"
+    );
     assert_eq!(
         decode_output(&events),
         b"got:live\n",
