@@ -1521,8 +1521,12 @@ fn record_reaped(active: &mut Invocation, pid: libc::pid_t, status: i32) {
 /// only the invocation's own process group is reaped, so a host test that
 /// shares the agent's process table can never steal an unrelated child.
 fn reap_children(active: &mut Invocation, scope: MemberScope) -> u64 {
-    let target = -1;
-    let _ = scope;
+    let target = match scope {
+        // The child isolates itself into its own process group, so the group
+        // identifier is the child's process identifier.
+        MemberScope::ProcessGroup => -active.pid,
+        MemberScope::Guest => -1,
+    };
     let mut reaped = 0;
     loop {
         let mut status = 0;
