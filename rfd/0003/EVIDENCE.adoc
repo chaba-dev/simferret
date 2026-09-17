@@ -1419,7 +1419,11 @@ one of them was addressed in the same phase rather than deferred:
   raw-closure reader follows the same rule: an unknown object role and an object
   that exceeds its policy limit are named by their position, so a tampered
   `closure.json` cannot carry a marker into the CLI text or the failure bundle of
-  a replay that rejects it.
+  a replay that rejects it. Three more semantic rejections follow the same rule:
+  the overlay collision names the fixed `/tmp` or `/dev` subtree instead of the
+  colliding entry path, the replay scenario-name comparison names the
+  disagreement instead of either name, and a repeated raw-closure role names the
+  object's position.
 * *Owner-only image cache.* The `.images` cache is created `0700` with `0600`
   entries, and a reused entry is validated before it is opened: its type,
   ownership, and mode are checked first and repaired where possible, then it is
@@ -1433,7 +1437,10 @@ one of them was addressed in the same phase rather than deferred:
   or restoration, a termination after its exit, a cleanup before its exit or
   without reaping a process, a configuration that is not the fixed private
   profile, and an activation without its prohibition rule are all
-  stream-structure violations. `process_safety` also requires exactly one
+  stream-structure violations. A launch failure is an alternative outcome to a
+  start record rather than an event of a running invocation, so it is retained for
+  an invocation that never started; it may still not repeat, and it may not arrive
+  after the invocation exited. `process_safety` also requires exactly one
   termination record, for the first invocation, which is what the acceptance
   profile performs.
 * *Complete stream evaluation.* Per-invocation offset, sequence, and input-stream
@@ -1451,6 +1458,10 @@ one of them was addressed in the same phase rather than deferred:
   acknowledgement's event identifier and the event that carried each response
   line's first byte, so a response recorded before the command it answers is a
   violation even though the ordered lines and the aggregate counts are unchanged.
+  The same evidence anchors the fault witnesses: `controlled_outage` and
+  `bounded_recovery` require the witness's acknowledgement to follow the
+  activation or restoration, so a response whose bytes were already present before
+  the transition cannot count once its newline arrives.
 * *Process evidence.* The first cleanup barrier must reap at least two processes
   (the terminated primary and the escaped descendant) and the escaped-descendant
   line must precede the termination request, with termination, exit, and cleanup
@@ -1470,7 +1481,9 @@ one of them was addressed in the same phase rather than deferred:
   ends the wait instead of becoming a receive error. The over-bound condition is
   sticky for the invocation: a line that completes with a newline still fails the
   health test, so a known-invalid response cannot become a timeout merely because
-  its terminator arrived. A wrong
+  its terminator arrived. The exit wait also ends on any complete stdout line the
+  driver did not consume: every expected line has been consumed by then, so a
+  further line can only be a response the checker must reject. A wrong
   response, a reported application error, or an over-long unfinished line
   therefore fails the property through the checker instead of blocking until the
   VM deadline.
@@ -1531,7 +1544,8 @@ cleanup barrier that reaped fewer than two processes, a sequence that does not
 start at one, a sequence gap, a non-contiguous output offset, a non-contiguous
 input offset, a replayed input command identifier, a missing input
 acknowledgement, a missing end of input for the restarted invocation, a response
-recorded before the input acknowledgement it answers, an
+recorded before the input acknowledgement it answers, a witness acknowledged
+before the activation or restoration it is measured against, an
 unterminated stdout line, a stderr byte, a missing restoration, an outage response that arrives only after
 restoration, a restart that answers outside the liveness bound, exit totals that
 disagree with the recorded frames, and a typed launch failure that cannot satisfy
@@ -1611,7 +1625,13 @@ manifest, and replay preflight are exercised without QEMU. The tests cover:
   which the driver accepts because the line is already buffered and only the
   checker can reject; and
 * a tampered raw closure whose role and digest carry a marker, neither of which
-  may appear in the CLI text or the failure bundle.
+  may appear in the CLI text or the failure bundle; and
+* a failed start for each invocation, which must publish a failing report with a
+  typed launch failure instead of waiting for a startup line that never arrives;
+* a complete short stdout line the driver never asked for, folded by the
+  end-of-input acknowledgement, which must end the exit wait; and
+* a tampered manifest scenario name, which must not appear in the CLI text or the
+  failure bundle.
 
 `crates/simferret/tests/rfd3_phase3.rs` pins the public contract: the strict
 versioned workload scenario, the seeded choice plan and its bounds, the request

@@ -282,6 +282,28 @@ content-addressed guest workload, and preserve exact passive replay.
     during the preceding echo command, a completed oversized line and a split
     oversized line in the end-of-input regression, and a replay canary that
     tampers a raw-closure role and digest independently.
+- [X] Harden the phase against the eighth adversarial review, which confirmed all
+  three seventh-round fixes and found four further defects:
+  - [X] Retain a launch failure for an invocation that never started: an
+    unsuccessful start reports only the typed failure, so requiring a start record
+    discarded it and left the driver waiting for a startup line that could never
+    arrive. A failure may still not repeat or arrive after an exit.
+  - [X] End the exit wait on any complete stdout line the driver did not consume,
+    because every expected line has already been consumed by then, so a short
+    unexpected tail cannot become a receive timeout.
+  - [X] Make three more semantic diagnostics value-free: the overlay collision
+    names the fixed `/tmp` or `/dev` subtree, the replay scenario-name comparison
+    names the disagreement, and a repeated raw-closure role names the object's
+    position.
+  - [X] Require a fault witness's acknowledgement to follow the activation or
+    restoration it is measured against, so a response whose bytes were already
+    present before the transition cannot satisfy `controlled_outage` or
+    `bounded_recovery` once its newline arrives.
+  - [X] Add regression tests for each fix: a fake-guest failed start for each
+    invocation, a complete short extra stdout line in the end-of-input
+    regression, overlay and scenario-name canaries, a duplicate-role variant in
+    the raw-closure canary, and checker cases that move each witness's
+    acknowledgement before its transition.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
