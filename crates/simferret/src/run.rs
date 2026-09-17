@@ -625,10 +625,11 @@ fn replay_with_adapter_and_assets(
             read_bounded(&directory.join("scenario.toml"), MAX_SCENARIO_SOURCE_BYTES)?;
         let (scenario, scenario_bytes) = Scenario::parse(scenario_bytes)?;
         if scenario.name != manifest.scenario_name {
-            return Err(invalid_data(format!(
-                "scenario name differs from manifest: expected {:?}, found {:?}",
-                manifest.scenario_name, scenario.name
-            )));
+            // The scenario name is a user-authored string, so the diagnostic
+            // names the disagreement rather than either value.
+            return Err(invalid_data(
+                "the scenario name differs from the recorded manifest",
+            ));
         }
         let materialized_choices = scenario.choices(manifest.seed);
         let network = NetworkConfig::restricted_tftp_replay(
@@ -864,10 +865,11 @@ fn replay_workload_scenario(
         MAX_SCENARIO_SOURCE_BYTES,
     )?)?;
     if scenario.name != manifest.scenario_name {
-        return Err(invalid_data(format!(
-            "scenario name differs from manifest: expected {:?}, found {:?}",
-            manifest.scenario_name, scenario.name
-        )));
+        // The scenario name is a user-authored string, so the diagnostic names
+        // the disagreement rather than either value.
+        return Err(invalid_data(
+            "the scenario name differs from the recorded manifest",
+        ));
     }
     let materialized_choices = scenario.choices(manifest.seed);
     let network = NetworkConfig::restricted_tftp_replay(
@@ -5844,6 +5846,39 @@ mod tests {
     }
 
     #[test]
+    fn a_tampered_manifest_scenario_name_never_reaches_the_failure_bundle() {
+        // The recorded scenario name is a user-authored string, so a mismatch must
+        // not quote either side of the comparison.
+        let root = temporary_root("scenario-name-privacy");
+        let options = workload_options(&root, false);
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+        let manifest_path = recorded.directory.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["scenario_name"] = serde_json::Value::String("SECRET=CANARY".into());
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let error = replay_with_adapter(
+            &replay_options(&options, recorded.directory.clone()),
+            &adapter,
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("CANARY"), "{error}");
+        assert!(
+            error.to_string().contains("scenario name differs"),
+            "{error}"
+        );
+        let bundle = only_failure_bundle(&options.runs_directory);
+        let report = fs::read(bundle.join("failure.json")).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&report).contains("CANARY"),
+            "{report:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_tampered_raw_closure_names_objects_by_position_not_by_value() {
         // The raw closure is a private artifact, but its role and digest fields
         // are free-form strings and a replay that rejects it retains a shareable
@@ -5858,14 +5893,29 @@ mod tests {
             .join("raw/closure.json");
         let original = fs::read(&closure_path).unwrap();
 
-        for (tamper, expected) in [("role", "unknown role"), ("digest", "policy limit")] {
+        for (tamper, expected) in [
+            ("role", "unknown role"),
+            ("digest", "policy limit"),
+            ("duplicate", "repeats the role"),
+        ] {
             let mut closure: serde_json::Value = serde_json::from_slice(&original).unwrap();
-            if tamper == "role" {
-                closure["objects"][0]["role"] = serde_json::Value::String("SECRET=CANARY".into());
-            } else {
-                // An oversized object must not name its unvalidated digest.
-                closure["objects"][0]["bytes"] = serde_json::Value::from(u64::MAX);
-                closure["objects"][0]["digest"] = serde_json::Value::String("SECRET=CANARY".into());
+            match tamper {
+                "role" => {
+                    closure["objects"][0]["role"] =
+                        serde_json::Value::String("SECRET=CANARY".into());
+                }
+                "duplicate" => {
+                    // Both records keep a valid digest and byte count, so only the
+                    // repeated role identifies the object.
+                    let role = closure["objects"][0]["role"].clone();
+                    closure["objects"][1]["role"] = role;
+                }
+                _ => {
+                    // An oversized object must not name its unvalidated digest.
+                    closure["objects"][0]["bytes"] = serde_json::Value::from(u64::MAX);
+                    closure["objects"][0]["digest"] =
+                        serde_json::Value::String("SECRET=CANARY".into());
+                }
             }
             fs::write(&closure_path, serde_json::to_vec(&closure).unwrap()).unwrap();
 

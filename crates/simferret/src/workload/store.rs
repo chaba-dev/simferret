@@ -688,8 +688,7 @@ fn read_objects(root: &Root, closure: &Closure) -> io::Result<BTreeMap<String, V
         let hex = parse_digest(&record.digest)?;
         if objects.contains_key(&record.role) {
             return Err(invalid(format!(
-                "raw closure names role {:?} more than once",
-                record.role
+                "raw closure object {index} repeats the role of an earlier object"
             )));
         }
         let data = read_required(

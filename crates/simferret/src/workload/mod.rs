@@ -103,9 +103,15 @@ pub fn validate_overlay_compatibility(tree: &Tree, launch: &LaunchIdentity) -> i
     };
     for (path, entry) in tree.iter() {
         if below_or_at(path) && entry.kind != EntryKind::Directory {
+            // The entry's path is a workload-controlled string, so the diagnostic
+            // names the fixed overlay subtree it collides with instead.
+            let overlay = if path.starts_with(OVERLAY_TMP) {
+                "/tmp"
+            } else {
+                "/dev"
+            };
             return Err(invalid(format!(
-                "workload entry {:?} collides with the runtime overlay",
-                String::from_utf8_lossy(path)
+                "a workload entry below {overlay} collides with the runtime overlay"
             )));
         }
     }
@@ -348,12 +354,22 @@ mod tests {
         file_at_tmp.insert(b"tmp".to_vec(), Entry::file(b"x".to_vec(), 0o644, 0, 0, 0));
         assert!(validate_overlay_compatibility(&file_at_tmp, &launch("/bin/app", "/")).is_err());
 
-        let mut file_below_dev = tree.clone();
-        file_below_dev.insert(
-            b"dev/null".to_vec(),
-            Entry::file(b"x".to_vec(), 0o644, 0, 0, 0),
-        );
-        assert!(validate_overlay_compatibility(&file_below_dev, &launch("/bin/app", "/")).is_err());
+        // The colliding path is a workload-controlled string, so the diagnostic
+        // names the fixed subtree it collides with instead of the entry.
+        for (path, overlay) in [
+            (b"tmp/SECRET=overlay-marker".to_vec(), "/tmp"),
+            (b"dev/SECRET=overlay-marker".to_vec(), "/dev"),
+        ] {
+            let mut collided = tree.clone();
+            collided.insert(path, Entry::file(b"x".to_vec(), 0o644, 0, 0, 0));
+            let error =
+                validate_overlay_compatibility(&collided, &launch("/bin/app", "/")).unwrap_err();
+            assert!(!error.to_string().contains("overlay-marker"), "{error}");
+            assert!(
+                error.to_string().contains(&format!("below {overlay}")),
+                "{error}"
+            );
+        }
 
         let mut link_below_tmp = tree;
         link_below_tmp.insert(
