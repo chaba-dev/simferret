@@ -51,8 +51,10 @@ static int valid_request_id(const char *value) {
            valid_token(value) && value[sizeof(prefix) - 1] != '\0';
 }
 
-static int emit_state(void) {
+static int emit_state(const char *executable) {
     int stale = access(state_path, F_OK) == 0;
+    int stale_root = 0;
+    struct stat info;
     FILE *state;
 
     if (!stale && errno != ENOENT) {
@@ -69,7 +71,25 @@ static int emit_state(void) {
         perror("fixture: close state");
         return -1;
     }
-    printf("state value=%s\n", stale ? "stale" : "fresh");
+    /*
+     * The /tmp marker only proves that the writable overlay was recreated. The
+     * executable lives in the immutable workload root, so its canonical mode is
+     * a witness that survives no overlay at all: mutating it here makes a reused
+     * workload root observable on the next invocation.
+     */
+    if (stat(executable, &info) != 0) {
+        perror("fixture: inspect executable");
+        return -1;
+    }
+    if ((info.st_mode & 07777) != 0755) {
+        stale_root = 1;
+    }
+    if (chmod(executable, 0700) != 0) {
+        perror("fixture: mutate executable mode");
+        return -1;
+    }
+    printf("state value=%s root=%s\n", stale ? "stale" : "fresh",
+           stale_root ? "stale" : "fresh");
     return fflush(stdout);
 }
 
@@ -200,9 +220,10 @@ static int tftp_request(const char *request_id, const char *expected_payload) {
     return fflush(stdout);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     char command[COMMAND_BYTES];
     int descendant_spawned = 0;
+    const char *executable = (argc > 0 && argv[0] != NULL) ? argv[0] : state_path;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("ready version=1\n");
@@ -229,7 +250,7 @@ int main(void) {
             second_argument == NULL && valid_token(argument)) {
             printf("echo value=%s\n", argument);
         } else if (strcmp(command, "state") == 0 && argument == NULL) {
-            if (emit_state() != 0) {
+            if (emit_state(executable) != 0) {
                 return 1;
             }
         } else if (strcmp(command, "spawn-descendant") == 0 && argument == NULL) {

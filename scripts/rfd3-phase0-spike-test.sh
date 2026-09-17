@@ -64,7 +64,7 @@ fi
 emit_success() {
   printf 'ready version=1\r\n'
   printf 'echo value=asymmetric_42\r\n'
-  printf 'state value=fresh\r\n'
+  printf 'state value=fresh root=fresh\r\n'
   printf 'descendant state=escaped\r\n'
   printf 'stopped status=0\r\n'
   printf 'supervisor workload_status=0\r\n'
@@ -87,7 +87,7 @@ case "${FAKE_QEMU_BEHAVIOR:-success}" in
   missing-marker)
     printf 'ready version=1\r\n'
     printf 'echo value=asymmetric_42\r\n'
-    printf 'state value=fresh\r\n'
+    printf 'state value=fresh root=fresh\r\n'
     printf 'descendant state=escaped\r\n'
     printf 'stopped status=0\r\n'
     printf 'supervisor workload_status=0\r\n'
@@ -130,7 +130,7 @@ test "$(grep -c '^shift=auto,rr=replay,rrfile=' "$test_root/qemu.arguments")" -e
 test "$(grep -c '^user,id=' "$test_root/qemu.arguments" || true)" -eq 0
 awk '$0 == "-net" { getline; if ($0 != "none") found = 1 } END { exit found }' \
   "$test_root/qemu.arguments"
-for line in 'ready version=1' 'echo value=asymmetric_42' 'state value=fresh' \
+for line in 'ready version=1' 'echo value=asymmetric_42' 'state value=fresh root=fresh' \
   'descendant state=escaped' 'stopped status=0' 'supervisor workload_status=0' \
   'supervisor cleanup_reaped=1' 'SIMFERRET_PHASE0_SUPERVISOR_OK version=1'; do
   grep -Fxq "$line"$'\r' "$run_dir/images/binary-record.serial"

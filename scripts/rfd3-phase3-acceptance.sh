@@ -206,10 +206,52 @@ exercise() {
       .event.exit.kind == "signaled" and .event.exit.signal == 9) and
     any(.[]; .event.type == "workload_exited" and .event.invocation == 2 and
       .event.exit.kind == "exited" and .event.exit.code == 0 and .event.stdout_bytes > 0) and
-    any(.[]; .event.type == "cleanup_complete" and .event.reaped >= 1) and
+    any(.[]; .event.type == "cleanup_complete" and .event.reaped >= 2) and
     any(.[]; .event.type == "outage_activated") and
     any(.[]; .event.type == "network_restored")
   ' "$run_dir/events.jsonl" >/dev/null
+
+  # Each invocation must witness a fresh root twice over: the /tmp marker proves
+  # the writable overlay was recreated, and the executable mode proves the
+  # immutable workload root was re-materialized as well.
+  local fresh_witnesses
+  fresh_witnesses="$("$python" - "$run_dir/events.jsonl" <<'PY'
+import json, sys
+count = 0
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for line in handle:
+        event = json.loads(line)["event"]
+        if event["type"] == "workload_output" and event["stream"] == "stdout":
+            text = bytes.fromhex(event["bytes"]).decode("utf-8", "replace")
+            if text.strip() == "state value=fresh root=fresh":
+                count += 1
+print(count)
+PY
+)"
+  if [[ "$fresh_witnesses" != "2" ]]; then
+    echo "expected two fresh-root witnesses, observed $fresh_witnesses" >&2
+    exit 1
+  fi
+
+  # The run directory, the guest image cache, and the workload store carry the
+  # packaged workload, its launch identity, and the exact streams, so every one
+  # of them is owner-only.
+  local mode path
+  for path in "$run_dir" "$runs/.images" "$store"; do
+    mode="$(stat -c %a "$path")"
+    if [[ "$mode" != "700" ]]; then
+      echo "$path is not owner-only: $mode" >&2
+      exit 1
+    fi
+  done
+  for path in "$run_dir/events.jsonl" "$run_dir/assertions.json" \
+    "$run_dir/workload.lock" "$run_dir/manifest.json" "$runs/.images/"*.cpio.gz; do
+    mode="$(stat -c %a "$path")"
+    if [[ "$mode" != "600" ]]; then
+      echo "$path is not owner-only: $mode" >&2
+      exit 1
+    fi
+  done
 
   # The intentional corruption must fail safety with a nonzero result.
   local corrupt_runs="$output_dir/runs-corrupt-$name"
@@ -272,16 +314,28 @@ exercise() {
     "derived guest template does not match the raw closure"
   mv "$template.saved" "$template"
 
-  # Missing raw evidence fails even though the derived entry still exists.
+  # Missing raw evidence fails even though the derived entry still exists, and
+  # the diagnostic names the missing raw closure. The store is verified before
+  # QEMU starts, so this exact message is the intended rejection.
   mv "$store/raw/closure.json" "$store/raw/closure.json.saved"
   run_timed "missing-raw-$name" env \
     SIMFERRET_KERNEL="$kernel" QEMU_SYSTEM_X86_64="$qemu" \
     "$binary" replay "$run_dir"
-  if [[ "$RUN_STATUS" -eq 0 ]]; then
-    echo "replay accepted a store without its raw closure" >&2
-    exit 1
-  fi
+  expect_error "missing-raw-$name" "raw closure raw/closure.json is missing"
   mv "$store/raw/closure.json.saved" "$store/raw/closure.json"
+
+  # A raw object the closure still references must be present too, even though
+  # the closure itself is intact.
+  local object_digest object_path
+  object_digest="$(jq -r '.objects[0].digest' "$store/raw/closure.json")"
+  object_path="$store/raw/sha256/${object_digest#sha256:}"
+  test -f "$object_path"
+  mv "$object_path" "$object_path.saved"
+  run_timed "missing-object-$name" env \
+    SIMFERRET_KERNEL="$kernel" QEMU_SYSTEM_X86_64="$qemu" \
+    "$binary" replay "$run_dir"
+  expect_error "missing-object-$name" "raw object $object_digest is missing"
+  mv "$object_path.saved" "$object_path"
 
   # The untouched recording still replays after every tamper is restored.
   run_timed "restored-$name" env \
@@ -339,6 +393,12 @@ fi
     "$(tr '\n' ' ' <"$output_dir/tampered-lock-binary.stderr")"
   printf 'derived_template_tamper_error=%s\n' \
     "$(tr '\n' ' ' <"$output_dir/tampered-template-binary.stderr")"
+  printf 'missing_raw_closure_error=%s\n' \
+    "$(tr '\n' ' ' <"$output_dir/missing-raw-binary.stderr")"
+  printf 'missing_raw_object_error=%s\n' \
+    "$(tr '\n' ' ' <"$output_dir/missing-object-binary.stderr")"
+  printf 'private_artifacts=run directory, guest image cache, and workload store are owner-only\n'
+  printf 'fresh_root_witnesses=state value=fresh root=fresh observed once per invocation\n'
 } >"$output_dir/evidence.txt"
 
 cat "$output_dir/evidence.txt"
