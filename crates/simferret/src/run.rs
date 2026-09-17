@@ -1739,6 +1739,17 @@ impl<'a> WorkloadController<'a> {
         Ok(!(self.trace.exited(invocation) || self.trace.launch_failed(invocation)))
     }
 
+    /// Whether the invocation is live and has not already produced a response
+    /// that the checker must reject. The pinned fixture writes to stderr only
+    /// when it is failing and a line over the response bound can never be valid,
+    /// so neither state can be followed by an orderly completion.
+    fn healthy(&self, invocation: u64) -> bool {
+        !self.trace.exited(invocation)
+            && !self.trace.launch_failed(invocation)
+            && self.trace.stderr_bytes(invocation) == 0
+            && !self.trace.over_bound_line(invocation)
+    }
+
     /// Send one bounded input line to a live invocation. Returns `false` when
     /// the invocation has already exited or failed to start, so the driver stops
     /// issuing workload commands and lets the checker report the failure.
@@ -1750,7 +1761,7 @@ impl<'a> WorkloadController<'a> {
     /// acknowledgement and the run fails as an infrastructure error.
     fn write_stdin(&mut self, invocation: u64, offset: &mut u64, text: &str) -> io::Result<bool> {
         self.drain()?;
-        if self.trace.exited(invocation) || self.trace.launch_failed(invocation) {
+        if !self.healthy(invocation) {
             return Ok(false);
         }
         let expected = *offset;
@@ -1775,17 +1786,22 @@ impl<'a> WorkloadController<'a> {
     /// or answers with a different line.
     fn wait_for_line(&mut self, invocation: u64, expected: &str) -> io::Result<bool> {
         loop {
+            // An observed failure takes precedence over a matching line: a
+            // response that is already known to be failing must fail the run
+            // rather than be consumed and followed into the next wait.
+            if !self.healthy(invocation) {
+                return Ok(false);
+            }
             let consumed = self.consumed_lines.get(&invocation).copied().unwrap_or(0);
             if consumed < self.trace.stdout_line_count(invocation) {
                 let matched = self.trace.stdout_line(invocation, consumed) == Some(expected);
                 self.consumed_lines.insert(invocation, consumed + 1);
+                if !self.healthy(invocation) {
+                    return Ok(false);
+                }
                 return Ok(matched);
             }
-            if self.trace.exited(invocation)
-                || self.trace.launch_failed(invocation)
-                || self.trace.stderr_bytes(invocation) > 0
-                || self.trace.over_bound_line(invocation)
-            {
+            if self.trace.exited(invocation) || self.trace.launch_failed(invocation) {
                 return Ok(false);
             }
             self.receive_one()?;
@@ -1920,7 +1936,7 @@ fn drive_workload_scenario(
                 }
             }
             WorkloadStep::Terminate(invocation) => {
-                if !controller.live(invocation)? {
+                if !controller.live(invocation)? || !controller.healthy(invocation) {
                     stopped = true;
                     continue;
                 }
@@ -1936,7 +1952,7 @@ fn drive_workload_scenario(
                 })?;
             }
             WorkloadStep::StdinEof(invocation) => {
-                if !controller.live(invocation)? {
+                if !controller.live(invocation)? || !controller.healthy(invocation) {
                     stopped = true;
                     continue;
                 }
@@ -3090,6 +3106,9 @@ mod tests {
         /// Write a stdout line that already exceeds the response bound, without a
         /// newline and without exiting.
         over_bound_line_without_exit: bool,
+        /// Write the expected response and then an over-bound unfinished tail,
+        /// without exiting.
+        over_bound_tail_after_response: bool,
     }
 
     struct FakeAdapter {
@@ -3170,6 +3189,7 @@ mod tests {
                 pending_cleanup: None,
                 stderr_without_exit: false,
                 over_bound_line_without_exit: false,
+                over_bound_tail_after_response: false,
             })
         }
     }
@@ -3417,6 +3437,21 @@ mod tests {
                     // The barrier is serialized separately, so the host reads it
                     // only with the command that follows the exit record.
                     self.pending_cleanup = Some((invocation, 1));
+                } else if self.over_bound_tail_after_response && self.workload.fetched == 1 {
+                    // The expected response is valid, but the unfinished tail that
+                    // follows it can never be, and the invocation stays alive.
+                    self.emit_output(
+                        command_id,
+                        invocation,
+                        OutputStream::Stdout,
+                        &format!("network state=ok request={request_id}\n"),
+                    );
+                    self.emit_output(
+                        command_id,
+                        invocation,
+                        OutputStream::Stdout,
+                        &"x".repeat(MAX_RESPONSE_LINE_BYTES + 1),
+                    );
                 } else if self.over_bound_line_without_exit && self.workload.fetched == 1 {
                     // A response line that can never be valid, without a newline:
                     // only the response bound can end the wait.
@@ -3810,6 +3845,7 @@ mod tests {
             pending_cleanup: None,
             stderr_without_exit: false,
             over_bound_line_without_exit: false,
+            over_bound_tail_after_response: false,
         };
         let mut diagnostics = failure_diagnostics("record");
         let (events, report) =
@@ -5222,6 +5258,36 @@ mod tests {
     }
 
     #[test]
+    fn a_semantic_launch_failure_never_quotes_the_launch_value() {
+        // A correctly typed but invalid launch field is rejected by semantic
+        // validation, whose diagnostic must not quote the value either.
+        let root = temporary_root("launch-value-privacy");
+        let options = workload_options(&root, false);
+        let specification = options.workload.clone().unwrap();
+        let base = fs::read_to_string(&specification).unwrap();
+        let adapter = fake_adapter(None);
+        for (from, to) in [
+            ("user = \"65534:65534\"", "user = \"SECRET=launch-marker\""),
+            (
+                "working_directory = \"/\"",
+                "working_directory = \"SECRET=launch-marker\"",
+            ),
+        ] {
+            let text = base.replace(from, to);
+            assert_ne!(text, base, "the specification contains {from}");
+            fs::write(&specification, &text).unwrap();
+            let error = record_with_adapter(&options, &adapter).unwrap_err();
+            assert!(!error.to_string().contains("launch-marker"), "{error}");
+            for bundle in failure_bundles(&options.runs_directory) {
+                let retained = String::from_utf8_lossy(&bundle_bytes(&bundle)).into_owned();
+                assert!(!retained.contains("launch-marker"), "{retained}");
+            }
+        }
+        fs::write(&specification, &base).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_malformed_private_artifact_never_quotes_the_launch_environment() {
         let root = temporary_root("manifest-privacy");
         let options = workload_options(&root, false);
@@ -5585,6 +5651,51 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn an_over_bound_tail_after_a_matching_response_stops_the_run() {
+        // The expected response is valid, but the unfinished tail that follows it
+        // can never be, so the driver must stop rather than continue to the next
+        // command and wait for an exit.
+        let mut vm = fake_workload_vm();
+        vm.over_bound_tail_after_response = true;
+        let (events, report) = drive_fake_workload(&mut vm);
+        assert!(!report.passed);
+        assert!(!report.assertions[0].passed, "{:#?}", report.assertions);
+        assert!(
+            report.assertions[0]
+                .detail
+                .contains("exceeds the response bound"),
+            "{}",
+            report.assertions[0].detail
+        );
+        assert!(
+            events
+                .iter()
+                .any(|frame| matches!(frame.event, Event::AgentStopped {}))
+        );
+        // The driver stopped at the first failing response: echo, state, and the
+        // first request were acknowledged, and the end of input was never sent.
+        let acknowledged = events
+            .iter()
+            .filter(|frame| {
+                matches!(
+                    frame.event,
+                    Event::InputAccepted {
+                        invocation: 1,
+                        eof: false,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(acknowledged, 3);
+        assert!(
+            !events
+                .iter()
+                .any(|frame| matches!(frame.event, Event::InputAccepted { eof: true, .. }))
+        );
+    }
+
     /// A fake guest and scenario for driving the workload control loop directly,
     /// without a record or replay publication.
     fn workload_scenario_fixture() -> WorkloadScenario {
@@ -5638,6 +5749,7 @@ mod tests {
             pending_cleanup: None,
             stderr_without_exit: false,
             over_bound_line_without_exit: false,
+            over_bound_tail_after_response: false,
         }
     }
 
@@ -5792,6 +5904,7 @@ mod tests {
             pending_cleanup: None,
             stderr_without_exit: false,
             over_bound_line_without_exit: false,
+            over_bound_tail_after_response: false,
         }
     }
 
