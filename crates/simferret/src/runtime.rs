@@ -21,7 +21,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
@@ -53,6 +53,13 @@ const MAX_TEMPLATE_PATH_BYTES: usize = 1024;
 const MAX_DESCRIPTOR_SCAN: u64 = 1 << 16;
 /// The bounded wait for the child's setup result before exec.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// The bounded time the cleanup barrier may take to signal and reap every
+/// member and drain both pipes. Exhausting it is a fatal infrastructure error,
+/// never a reported completion.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// `PF_KTHREAD`. Kernel threads appear in the guest process table but cannot be
+/// signalled or reaped, so they are never invocation members.
+const KERNEL_THREAD_FLAG: u64 = 0x0020_0000;
 
 /// Child setup result codes. The child writes one byte to a close-on-exec error
 /// pipe before `execve`, so a successful exec is an unreadable pipe and a setup
@@ -155,9 +162,33 @@ impl StreamState {
     }
 }
 
+/// Owns one fresh writable root and removes it when the invocation is dropped,
+/// including on every failed-start path.
+struct RootGuard {
+    path: PathBuf,
+}
+
+impl RootGuard {
+    fn create(path: PathBuf) -> io::Result<Self> {
+        std::fs::create_dir(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RootGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 struct Invocation {
     id: u64,
-    root: PathBuf,
+    /// Held for its `Drop`: it removes the fresh root when the invocation ends.
+    _root: RootGuard,
     pid: libc::pid_t,
     stdin: Option<OwnedFd>,
     stdout: Option<OwnedFd>,
@@ -169,7 +200,6 @@ struct Invocation {
     sequence: u64,
     frames: u64,
     exit: Option<ProcessExit>,
-    primary_reaped: bool,
     reaped: u64,
     cleanup_complete: bool,
 }
@@ -178,6 +208,9 @@ struct Invocation {
 pub struct Runtime {
     config: RuntimeConfig,
     active: Option<Invocation>,
+    /// The greatest invocation identifier ever accepted. Identifiers must be
+    /// strictly increasing, so a completed invocation can never be reused.
+    last_invocation: Option<u64>,
 }
 
 impl Runtime {
@@ -198,6 +231,7 @@ impl Runtime {
         Ok(Self {
             config,
             active: None,
+            last_invocation: None,
         })
     }
 
@@ -248,63 +282,68 @@ impl Runtime {
                 "an invocation is already active".into(),
             ));
         }
-        validate_launch(launch).map_err(|error| (LaunchFailure::Executable, error.to_string()))?;
-        let root = self
-            .config
-            .runtime_root
-            .join(format!("invocation-{invocation}"));
-        if root.exists() {
+        // Identifiers must strictly increase, so a completed invocation can
+        // never be mistaken for a new one. The mark is consumed by every
+        // accepted start, including one that later fails.
+        if let Some(last) = self.last_invocation
+            && invocation <= last
+        {
             return Err((
                 LaunchFailure::InvocationRepeated,
-                format!("invocation root {} already exists", root.display()),
+                format!(
+                    "invocation {invocation} is not greater than the last accepted invocation {last}"
+                ),
             ));
         }
+        self.last_invocation = Some(invocation);
+        validate_launch(launch).map_err(|error| (LaunchFailure::Executable, error.to_string()))?;
         create_private_directory(&self.config.runtime_root).map_err(|error| {
             (
                 LaunchFailure::Materialization,
                 format!("cannot create the runtime root: {error}"),
             )
         })?;
-        materialize(&self.config.template_root, &root, &self.config.limits)
+        let path = self
+            .config
+            .runtime_root
+            .join(format!("invocation-{invocation}"));
+        if path.exists() {
+            return Err((
+                LaunchFailure::InvocationRepeated,
+                format!("invocation root {} already exists", path.display()),
+            ));
+        }
+        // The guard owns the root from the moment it exists, so every failure
+        // below leaves no partially materialized root behind.
+        let root = RootGuard::create(path)
             .map_err(|error| (LaunchFailure::Materialization, error.to_string()))?;
-        if let Err(error) = apply_overlay(&root) {
-            let _ = std::fs::remove_dir_all(&root);
-            return Err((LaunchFailure::Materialization, error.to_string()));
-        }
-        if let Err(error) = verify_launch_target(&root, launch) {
-            let _ = std::fs::remove_dir_all(&root);
-            return Err(error);
-        }
-        match spawn(&root, launch, self.config.scope) {
-            Ok(spawned) => {
-                self.active = Some(Invocation {
-                    id: invocation,
-                    root,
-                    pid: spawned.pid,
-                    stdin: Some(spawned.stdin),
-                    stdout: Some(spawned.stdout),
-                    stderr: Some(spawned.stderr),
-                    stdout_state: StreamState::new(),
-                    stderr_state: StreamState::new(),
-                    input_offset: 0,
-                    input_bytes: 0,
-                    sequence: 0,
-                    frames: 0,
-                    exit: None,
-                    primary_reaped: false,
-                    reaped: 0,
-                    cleanup_complete: false,
-                });
-                Ok(Event::WorkloadStarted {
-                    invocation,
-                    launch: launch.clone(),
-                })
-            }
-            Err((failure, detail)) => {
-                let _ = std::fs::remove_dir_all(&root);
-                Err((failure, detail))
-            }
-        }
+        materialize_into(&self.config.template_root, root.path(), &self.config.limits)
+            .map_err(|error| (LaunchFailure::Materialization, error.to_string()))?;
+        apply_overlay(root.path())
+            .map_err(|error| (LaunchFailure::Materialization, error.to_string()))?;
+        verify_launch_target(root.path(), launch)?;
+        let spawned = spawn(root.path(), launch, self.config.scope)?;
+        self.active = Some(Invocation {
+            id: invocation,
+            _root: root,
+            pid: spawned.pid,
+            stdin: Some(spawned.stdin),
+            stdout: Some(spawned.stdout),
+            stderr: Some(spawned.stderr),
+            stdout_state: StreamState::new(),
+            stderr_state: StreamState::new(),
+            input_offset: 0,
+            input_bytes: 0,
+            sequence: 0,
+            frames: 0,
+            exit: None,
+            reaped: 0,
+            cleanup_complete: false,
+        });
+        Ok(Event::WorkloadStarted {
+            invocation,
+            launch: launch.clone(),
+        })
     }
 
     /// Accept one bounded, strictly contiguous stdin frame.
@@ -386,7 +425,7 @@ impl Runtime {
                 "the invocation has already exited",
             ));
         }
-        signal_members(active.pid, self.config.scope, TERMINATION_SIGNAL);
+        signal_members(active.pid, self.config.scope, TERMINATION_SIGNAL)?;
         Ok(vec![Event::TerminationRequested {
             invocation,
             signal: TERMINATION_SIGNAL,
@@ -403,7 +442,7 @@ impl Runtime {
         let mut events = Vec::new();
         if active.exit.is_none() {
             drain_ready(active, &self.config.limits, timeout, &mut events)?;
-            reap_primary(active);
+            active.reaped += reap_children(active);
         }
         if active.exit.is_some() && !active.cleanup_complete {
             cleanup(active, self.config.scope, &self.config.limits, &mut events)?;
@@ -423,7 +462,7 @@ impl Runtime {
             return Ok(Vec::new());
         };
         if active.exit.is_none() {
-            signal_members(active.pid, self.config.scope, TERMINATION_SIGNAL);
+            signal_members(active.pid, self.config.scope, TERMINATION_SIGNAL)?;
         }
         let mut events = Vec::new();
         cleanup(active, self.config.scope, &self.config.limits, &mut events)?;
@@ -454,7 +493,7 @@ impl Runtime {
         if let Ok(active) = self.invocation_mut(invocation)
             && active.exit.is_none()
         {
-            signal_members(active.pid, self.config.scope, TERMINATION_SIGNAL);
+            let _ = signal_members(active.pid, self.config.scope, TERMINATION_SIGNAL);
         }
         error
     }
@@ -464,11 +503,11 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         if let Some(active) = self.active.as_mut() {
             if active.exit.is_none() {
-                signal_members(active.pid, self.config.scope, TERMINATION_SIGNAL);
+                let _ = signal_members(active.pid, self.config.scope, TERMINATION_SIGNAL);
             }
             let mut ignored = Vec::new();
             let _ = cleanup(active, self.config.scope, &self.config.limits, &mut ignored);
-            let _ = std::fs::remove_dir_all(&active.root);
+            // The invocation's root guard removes the fresh root on drop.
         }
     }
 }
@@ -573,12 +612,12 @@ pub fn validate_template(template: &Path, limits: &RuntimeLimits) -> io::Result<
     Ok(())
 }
 
-/// Reproduce the template bytes and canonical metadata below a fresh root.
-fn materialize(template: &Path, destination: &Path, limits: &RuntimeLimits) -> io::Result<()> {
+/// Reproduce the template bytes and canonical metadata below an existing fresh
+/// root. The caller owns creation and removal of that root, so a failure here
+/// never leaves a partial root behind.
+fn materialize_into(template: &Path, destination: &Path, limits: &RuntimeLimits) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(template)
         .map_err(|error| invalid(format!("cannot inspect the workload template: {error}")))?;
-    std::fs::create_dir(destination)
-        .map_err(|error| invalid(format!("cannot create the fresh workload root: {error}")))?;
     copy_directory(template, destination, &metadata, limits)
 }
 
@@ -799,6 +838,55 @@ struct Spawned {
     stderr: OwnedFd,
 }
 
+/// Owns the forked child until the invocation takes it over, so every failure
+/// after `fork` kills and reaps the child instead of leaking it.
+struct ChildGuard {
+    pid: libc::pid_t,
+    scope: MemberScope,
+    armed: bool,
+}
+
+impl ChildGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = signal_members(self.pid, self.scope, TERMINATION_SIGNAL);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut status = 0;
+            // SAFETY: `status` is writable and `pid` is the child created by
+            // this call.
+            let reaped = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+            if reaped == self.pid || reaped < 0 {
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// The result of waiting for the child's setup pipe.
+enum SetupOutcome {
+    /// The child closed the setup pipe by successfully exec'ing.
+    Ready,
+    /// The child reported a typed setup failure.
+    Failed(u8),
+    /// The child did not report within the setup bound.
+    Timeout,
+    /// The setup pipe could not be read.
+    Transport(io::Error),
+}
+
 fn spawn(
     root: &Path,
     launch: &LaunchIdentity,
@@ -838,6 +926,21 @@ fn spawn(
     let error_write = error_pipe.write.as_raw_fd();
     let uid = launch.uid;
     let gid = launch.gid;
+
+    // Configure the parent's read ends before forking, so no fallible
+    // parent-side operation remains once the child exists.
+    set_nonblocking(stdout.read.as_raw_fd()).map_err(|error| {
+        (
+            LaunchFailure::Pipe,
+            format!("cannot configure the workload output pipe: {error}"),
+        )
+    })?;
+    set_nonblocking(stderr.read.as_raw_fd()).map_err(|error| {
+        (
+            LaunchFailure::Pipe,
+            format!("cannot configure the workload output pipe: {error}"),
+        )
+    })?;
 
     // SAFETY: the child runs only async-signal-safe calls on pre-built
     // arguments and then either `_exit`s or replaces its image with `execve`.
@@ -879,20 +982,16 @@ fn spawn(
     drop(stderr.write);
     drop(error_pipe.write);
 
+    // The guard owns the child from here, so every failure below kills and
+    // reaps it instead of leaving a running process behind.
+    let mut guard = ChildGuard {
+        pid,
+        scope,
+        armed: true,
+    };
     match await_setup(error_pipe.read) {
-        Ok(()) => {
-            set_nonblocking(stdout.read.as_raw_fd()).map_err(|error| {
-                (
-                    LaunchFailure::Pipe,
-                    format!("cannot configure the workload output pipe: {error}"),
-                )
-            })?;
-            set_nonblocking(stderr.read.as_raw_fd()).map_err(|error| {
-                (
-                    LaunchFailure::Pipe,
-                    format!("cannot configure the workload output pipe: {error}"),
-                )
-            })?;
+        SetupOutcome::Ready => {
+            guard.disarm();
             Ok(Spawned {
                 pid,
                 stdin: stdin.write,
@@ -900,10 +999,7 @@ fn spawn(
                 stderr: stderr.read,
             })
         }
-        Err(code) => {
-            let mut status = 0;
-            // SAFETY: `pid` is the child created above and `status` is writable.
-            unsafe { libc::waitpid(pid, &mut status, 0) };
+        SetupOutcome::Failed(code) => {
             let (kind, detail) = child_status::failure(code);
             let failure = match kind {
                 "working_directory" => LaunchFailure::WorkingDirectory,
@@ -913,6 +1009,14 @@ fn spawn(
             };
             Err((failure, detail.to_string()))
         }
+        SetupOutcome::Timeout => Err((
+            LaunchFailure::Setup,
+            "the workload child did not complete setup within the bound".into(),
+        )),
+        SetupOutcome::Transport(error) => Err((
+            LaunchFailure::Pipe,
+            format!("cannot read the workload setup result: {error}"),
+        )),
     }
 }
 
@@ -991,7 +1095,7 @@ unsafe fn close_inherited_descriptors(preserve: RawFd) {
     }
 }
 
-fn await_setup(error_read: OwnedFd) -> Result<(), u8> {
+fn await_setup(error_read: OwnedFd) -> SetupOutcome {
     let fd = error_read.as_raw_fd();
     let mut descriptor = libc::pollfd {
         fd,
@@ -1002,22 +1106,28 @@ fn await_setup(error_read: OwnedFd) -> Result<(), u8> {
         // SAFETY: `descriptor` is a single initialized pollfd.
         let ready = unsafe { libc::poll(&mut descriptor, 1, SETUP_TIMEOUT.as_millis() as i32) };
         if ready < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(child_status::EXEC);
+            return SetupOutcome::Transport(error);
         }
         if ready == 0 {
-            return Err(child_status::EXEC);
+            return SetupOutcome::Timeout;
         }
         let mut byte = [0_u8; 1];
         // SAFETY: `byte` is a writable one-byte buffer on the setup pipe.
         let read = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
         return match read {
-            1 => Err(byte[0]),
-            0 => Ok(()),
-            _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
-            _ => Err(child_status::EXEC),
+            1 => SetupOutcome::Failed(byte[0]),
+            0 => SetupOutcome::Ready,
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                SetupOutcome::Transport(error)
+            }
         };
     }
 }
@@ -1040,32 +1150,6 @@ fn drain_ready(
     drain_stream(active, OutputStream::Stdout, limits, events)?;
     drain_stream(active, OutputStream::Stderr, limits, events)?;
     Ok(())
-}
-
-/// Drain both streams to end of file after the cleanup kill. The pipes close
-/// asynchronously once every member is dead, so this polls with a bounded
-/// retry instead of reading a single time.
-fn drain_to_eof(
-    active: &mut Invocation,
-    limits: &RuntimeLimits,
-    events: &mut Vec<Event>,
-) -> io::Result<()> {
-    for _ in 0..64 {
-        drain_stream(active, OutputStream::Stdout, limits, events)?;
-        drain_stream(active, OutputStream::Stderr, limits, events)?;
-        if active.stdout_state.eof && active.stderr_state.eof {
-            return Ok(());
-        }
-        let descriptors = poll_descriptors(active);
-        if descriptors.is_empty() {
-            return Ok(());
-        }
-        let _ = poll_once(&descriptors, Duration::from_millis(100))?;
-    }
-    Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        "workload output pipes did not reach end of file after cleanup",
-    ))
 }
 
 fn poll_descriptors(active: &Invocation) -> Vec<libc::pollfd> {
@@ -1181,18 +1265,12 @@ fn drain_stream(
     }
 }
 
-fn reap_primary(active: &mut Invocation) {
-    if active.exit.is_some() {
+/// Record one reaped child. The primary's real status is preserved, so a
+/// fabricated exit is never reported.
+fn record_reaped(active: &mut Invocation, pid: libc::pid_t, status: i32) {
+    if pid != active.pid || active.exit.is_some() {
         return;
     }
-    let mut status = 0;
-    // SAFETY: `status` is writable and the pid is the invocation's primary
-    // child.
-    let reaped = unsafe { libc::waitpid(active.pid, &mut status, libc::WNOHANG) };
-    if reaped != active.pid {
-        return;
-    }
-    active.primary_reaped = true;
     active.exit = if libc::WIFEXITED(status) {
         Some(ProcessExit::Exited {
             code: libc::WEXITSTATUS(status),
@@ -1206,8 +1284,29 @@ fn reap_primary(active: &mut Invocation) {
     };
 }
 
+/// Reap every child that has exited, recording the primary's status.
+fn reap_children(active: &mut Invocation) -> u64 {
+    let mut reaped = 0;
+    loop {
+        let mut status = 0;
+        // SAFETY: `status` is writable; only the agent's own children are
+        // reaped, which is exactly the invocation's direct members.
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid <= 0 {
+            break;
+        }
+        reaped += 1;
+        record_reaped(active, pid, status);
+    }
+    reaped
+}
+
 /// Kill every remaining member, reap until only the agent remains, and drain
-/// the workload pipes to end of file before reporting the barrier.
+/// both pipes to end of file before reporting the barrier.
+///
+/// The barrier is verified rather than assumed: the loop continues until the
+/// process table and both pipes are empty, and exhausting its deadline is a
+/// fatal infrastructure error instead of a reported completion.
 fn cleanup(
     active: &mut Invocation,
     scope: MemberScope,
@@ -1219,23 +1318,37 @@ fn cleanup(
     if active.cleanup_complete {
         return Ok(());
     }
-    let mut reaped = active.reaped + u64::from(active.primary_reaped);
-    signal_members(active.pid, scope, TERMINATION_SIGNAL);
     active.stdin = None;
-    for _ in 0..64 {
-        reaped += reap_children();
-        if !members_remain(scope, active.pid) {
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    loop {
+        signal_members(active.pid, scope, TERMINATION_SIGNAL)?;
+        active.reaped += reap_children(active);
+        drain_stream(active, OutputStream::Stdout, limits, events)?;
+        drain_stream(active, OutputStream::Stderr, limits, events)?;
+        let members = members_remain(scope, active.pid)?;
+        let drained = active.stdout_state.eof && active.stderr_state.eof;
+        if !members && drained {
             break;
         }
-        signal_members(active.pid, scope, TERMINATION_SIGNAL);
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the workload cleanup barrier did not complete within its bound",
+            ));
+        }
+        // Wait briefly so a killed member can be reaped and a pipe can reach
+        // end of file without spinning.
+        wait_for_output(active, Duration::from_millis(10));
     }
-    drain_to_eof(active, limits, events)?;
-    let exit = active.exit.unwrap_or(ProcessExit::Signaled {
-        signal: TERMINATION_SIGNAL,
-    });
+    // One final reap after end of file, so a member that exited while the pipes
+    // were draining is never left as an unreaped zombie.
+    active.reaped += reap_children(active);
+    let exit = active
+        .exit
+        .ok_or_else(|| io::Error::other("the workload primary process was not reaped"))?;
     let stdout_sha256 = finish_stream(&mut active.stdout_state);
     let stderr_sha256 = finish_stream(&mut active.stderr_state);
-    active.reaped = reaped;
+    let reaped = active.reaped;
     active.cleanup_complete = true;
     active.stdout = None;
     active.stderr = None;
@@ -1252,8 +1365,18 @@ fn cleanup(
         invocation: active.id,
         reaped,
     });
-    let _ = std::fs::remove_dir_all(&active.root);
     Ok(())
+}
+
+/// Wait for output readiness or a short timeout, so the cleanup barrier yields
+/// the CPU between kill attempts.
+fn wait_for_output(active: &Invocation, timeout: Duration) {
+    let descriptors = poll_descriptors(active);
+    if descriptors.is_empty() {
+        std::thread::sleep(timeout);
+        return;
+    }
+    let _ = poll_once(&descriptors, timeout);
 }
 
 fn finish_stream(state: &mut StreamState) -> String {
@@ -1265,66 +1388,117 @@ fn finish_stream(state: &mut StreamState) -> String {
     output
 }
 
-fn reap_children() -> u64 {
-    let mut reaped = 0;
-    loop {
-        let mut status = 0;
-        // SAFETY: `status` is writable; only the agent's own children are
-        // reaped, which is exactly the invocation's direct members.
-        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-        if pid <= 0 {
-            break;
-        }
-        reaped += 1;
-    }
-    reaped
-}
-
-fn signal_members(pid: libc::pid_t, scope: MemberScope, signal: i32) {
+fn signal_members(pid: libc::pid_t, scope: MemberScope, signal: i32) -> io::Result<()> {
     match scope {
         MemberScope::ProcessGroup => {
             // SAFETY: signalling a process group is harmless when it is empty.
-            unsafe { libc::kill(-pid, signal) };
+            if unsafe { libc::kill(-pid, signal) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("cannot signal the invocation process group: {error}"),
+                    ));
+                }
+            }
+            Ok(())
         }
         MemberScope::Guest => {
-            for member in guest_process_table() {
-                if member == std::process::id() {
-                    continue;
-                }
-                // SAFETY: signalling an arbitrary guest pid is safe in the
+            for member in guest_process_table()? {
+                // SAFETY: signalling a userspace guest pid is safe in the
                 // dedicated guest; ESRCH is expected for exited members.
-                unsafe { libc::kill(member as libc::pid_t, signal) };
+                if unsafe { libc::kill(member as libc::pid_t, signal) } != 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!("cannot signal guest member {member}: {error}"),
+                        ));
+                    }
+                }
             }
+            Ok(())
         }
     }
 }
 
-fn members_remain(scope: MemberScope, pid: libc::pid_t) -> bool {
+fn members_remain(scope: MemberScope, pid: libc::pid_t) -> io::Result<bool> {
     match scope {
         MemberScope::ProcessGroup => {
             // SAFETY: signal 0 only probes for existence.
-            unsafe { libc::kill(-pid, 0) == 0 }
+            Ok(unsafe { libc::kill(-pid, 0) } == 0)
         }
-        MemberScope::Guest => guest_process_table()
-            .into_iter()
-            .any(|member| member != std::process::id()),
+        MemberScope::Guest => Ok(!guest_process_table()?.is_empty()),
     }
 }
 
-fn guest_process_table() -> Vec<u32> {
+/// Every userspace process in the guest other than the agent. Kernel threads
+/// appear in `/proc` but cannot be signalled or reaped, so they are never
+/// invocation members.
+fn guest_process_table() -> io::Result<Vec<u32>> {
     let mut members = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return members;
-    };
-    for entry in entries.flatten() {
+    let entries = std::fs::read_dir("/proc").map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot enumerate the guest process table: {error}"),
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot read a guest process entry: {error}"),
+            )
+        })?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if let Ok(pid) = name.parse::<u32>() {
-            members.push(pid);
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
         }
+        // A pid that vanished between enumeration and inspection is simply not
+        // a member any more.
+        if is_kernel_thread(pid)? != Some(false) {
+            continue;
+        }
+        members.push(pid);
     }
     members.sort_unstable();
-    members
+    Ok(members)
+}
+
+/// Report whether a guest pid is a kernel thread. `None` means the process
+/// vanished while it was inspected.
+fn is_kernel_thread(pid: u32) -> io::Result<Option<bool>> {
+    match std::fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => Ok(Some(stat_flags(&stat)? & KERNEL_THREAD_FLAG != 0)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("cannot read the state of guest pid {pid}: {error}"),
+        )),
+    }
+}
+
+/// Extract the process flags field from `/proc/<pid>/stat`. The command name is
+/// parenthesized and may contain spaces and parentheses, so only the fields
+/// after the last `)` are counted positionally: state is 0 and flags is 6.
+fn stat_flags(stat: &[u8]) -> io::Result<u64> {
+    let text = std::str::from_utf8(stat)
+        .map_err(|_| invalid("a guest process state record is not UTF-8"))?;
+    let rest = text
+        .rsplit_once(')')
+        .map(|(_, rest)| rest)
+        .ok_or_else(|| invalid("a guest process state record has no command terminator"))?;
+    let flags = rest
+        .split_whitespace()
+        .nth(6)
+        .ok_or_else(|| invalid("a guest process state record has no flags field"))?;
+    flags
+        .parse()
+        .map_err(|_| invalid("a guest process state record has an invalid flags field"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1568,6 +1742,22 @@ mod tests {
         let root = template();
         std::fs::create_dir_all(root.0.join("tmp/nested")).unwrap();
         validate_template(&root.0, &RuntimeLimits::default()).unwrap();
+    }
+
+    #[test]
+    fn stat_flags_reads_the_field_after_the_last_command_terminator() {
+        // The command name may contain spaces and parentheses, so only the
+        // fields after the last `)` are positional. Index 6 is `flags`.
+        let kernel_thread = b"2 (kthreadd) S 0 2 0 0 -1 2097152 0 0 0 0 0 0 0";
+        assert_eq!(
+            stat_flags(kernel_thread).unwrap() & KERNEL_THREAD_FLAG,
+            KERNEL_THREAD_FLAG
+        );
+        let userspace = b"1 (weird ) name) S 0 1 1 0 -1 4194304 0 0 0";
+        assert_eq!(stat_flags(userspace).unwrap() & KERNEL_THREAD_FLAG, 0);
+        assert!(stat_flags(b"1 no-command-terminator").is_err());
+        assert!(stat_flags(b"1 (short) S 0").is_err());
+        assert!(stat_flags(b"1 (short) S 0 1 1 0 -1 not-a-number 0").is_err());
     }
 
     #[test]

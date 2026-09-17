@@ -433,6 +433,159 @@ fn an_overlay_collision_is_rejected_before_any_invocation() {
 }
 
 #[test]
+fn an_invocation_identifier_cannot_be_reused() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("identifier");
+    let mut runtime = runtime(&root);
+    let events = run_script(&mut runtime, 1, "printf 'first\\n'");
+    assert_eq!(stdout_bytes(&events), b"first\n");
+    let repeated = runtime.start(1, &launch("printf 'second\\n'"));
+    assert!(matches!(
+        repeated[0],
+        Event::LaunchFailed {
+            failure: LaunchFailure::InvocationRepeated,
+            ..
+        }
+    ));
+    assert!(!runtime.is_active());
+    let mut events = runtime.start(2, &launch("printf 'second\\n'"));
+    assert!(matches!(events[0], Event::WorkloadStarted { .. }));
+    poll_until_cleanup(&mut runtime, &mut events);
+    assert_eq!(stdout_bytes(&events), b"second\n");
+}
+
+#[test]
+fn a_failed_materialization_leaves_no_partial_root() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("partial");
+    // A file larger than the configured bound fails during materialization,
+    // after the root and some of its entries already exist.
+    fs::write(root.0.join("template/bin/large"), vec![0_u8; 8192]).unwrap();
+    let mut runtime = Runtime::new(RuntimeConfig {
+        template_root: root.0.join("template"),
+        runtime_root: root.0.join("runtime"),
+        limits: RuntimeLimits {
+            output_bytes: 4096,
+            ..RuntimeLimits::default()
+        },
+        scope: MemberScope::ProcessGroup,
+    })
+    .unwrap();
+    let events = runtime.start(1, &launch("printf 'unused\\n'"));
+    assert!(matches!(
+        events[0],
+        Event::LaunchFailed {
+            failure: LaunchFailure::Materialization,
+            ..
+        }
+    ));
+    let entries = fs::read_dir(root.0.join("runtime"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert!(entries.is_empty(), "a partial root survived: {entries:?}");
+}
+
+#[test]
+fn an_unexecutable_file_reports_a_typed_launch_failure() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("unexecutable");
+    // A regular file with an execute bit that is not a valid executable image:
+    // pre-fork validation passes, so this exercises the child setup pipe and
+    // the post-fork ownership path.
+    let path = root.0.join("template/bin/not-an-executable");
+    fs::write(&path, b"this is not an executable image\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut runtime = runtime(&root);
+    let mut launch = launch("unused");
+    launch.executable = "/bin/not-an-executable".into();
+    launch.arguments = vec!["/bin/not-an-executable".into()];
+    let events = runtime.start(1, &launch);
+    assert!(matches!(
+        events[0],
+        Event::LaunchFailed {
+            failure: LaunchFailure::Executable,
+            ..
+        }
+    ));
+    assert!(!runtime.is_active());
+    assert!(
+        fs::read_dir(root.0.join("runtime"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "a partial root survived"
+    );
+}
+
+#[test]
+fn shutdown_reports_the_real_primary_exit_status() {
+    if !require_root() {
+        return;
+    }
+    let (root, _) = template("exit-status");
+    let mut runtime = runtime(&root);
+    let events = runtime.start(1, &launch("exit 7"));
+    assert!(matches!(events[0], Event::WorkloadStarted { .. }));
+    // Let the primary exit without observing it, then shut down: the barrier
+    // must report the real status instead of a fabricated termination signal.
+    std::thread::sleep(Duration::from_millis(500));
+    let events = runtime.shutdown().unwrap();
+    let exit = events
+        .iter()
+        .find_map(|event| match event {
+            Event::WorkloadExited { exit, .. } => Some(*exit),
+            _ => None,
+        })
+        .expect("the barrier must report an exit record");
+    assert_eq!(exit, ProcessExit::Exited { code: 7 });
+}
+
+#[test]
+fn a_member_that_closes_its_output_descriptors_is_still_reaped() {
+    if !require_root() {
+        return;
+    }
+    if std::process::id() != 1 {
+        eprintln!(
+            "skipping: the guest-wide cleanup barrier requires a PID namespace (run scripts/rfd3-phase2-runtime.sh)"
+        );
+        return;
+    }
+    let (root, _) = template("closed-output");
+    let mut runtime = Runtime::new(RuntimeConfig {
+        template_root: root.0.join("template"),
+        runtime_root: root.0.join("runtime"),
+        limits: RuntimeLimits::default(),
+        scope: MemberScope::Guest,
+    })
+    .unwrap();
+    // The descendant escapes the process group, closes its output descriptors,
+    // and keeps running. The pipes reach end of file immediately, so the
+    // barrier must still kill and reap the descendant before completing.
+    let events = run_script(
+        &mut runtime,
+        1,
+        "(setsid sh -c 'exec 1>&- 2>&-; sleep 30' &) ; printf 'closed\\n'",
+    );
+    assert_eq!(stdout_bytes(&events), b"closed\n");
+    let reaped = events
+        .iter()
+        .find_map(|event| match event {
+            Event::CleanupComplete { reaped, .. } => Some(*reaped),
+            _ => None,
+        })
+        .expect("the barrier must complete");
+    assert!(reaped >= 2, "the descendant must be reaped too: {reaped}");
+}
+
+#[test]
 fn the_agent_drives_the_runtime_over_the_serial_control_channel() {
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
