@@ -196,6 +196,25 @@ content-addressed guest workload, and preserve exact passive replay.
     of exhausting the VM deadline.
   - [X] Reconstruct each invocation's stdout before counting fresh-root witnesses
     in the acceptance harness, so a line split across frames still counts.
+- [X] Harden the phase against the third adversarial review, which found the
+  confidentiality fix bypassable and three further defects:
+  - [X] Reduce every parser failure to a location only, including the generic
+    frame readers, the retained canonical specification, and the TOML
+    specification and scenario parsers, and add canaries whose secret is the
+    offending value itself, including one that embeds the parser's delimiter.
+  - [X] Validate the asynchronous lifecycle and network events the driver folds
+    without an expectation: unknown invocations, duplicate starts, exits,
+    cleanups, configurations, activations, and restorations, a cleanup before its
+    exit or without a reap, a configuration outside the fixed profile, and an
+    activation without its prohibition rule.
+  - [X] Bound every published artifact with the same reader the replay path uses,
+    so an oversized replay log or diagnostic log cannot be published and then
+    rejected on replay.
+  - [X] Stop the wait for a response line once its current stdout line exceeds the
+    response bound, so an over-long unfinished line fails its property instead of
+    exhausting the VM deadline.
+  - [X] Require the acceptance harness to observe one fresh-root witness in each
+    of the two invocations, counting only newline-completed lines.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
