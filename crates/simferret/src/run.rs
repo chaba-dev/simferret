@@ -375,7 +375,12 @@ fn record_with_adapter_and_assets(
             artifacts,
             workload,
         };
-        write_private_json(staging.path.join("manifest.json"), &manifest)?;
+        write_private_bounded_json(
+            staging.path.join("manifest.json"),
+            &manifest,
+            MAX_MANIFEST_BYTES,
+            "the run manifest",
+        )?;
         let directory = staging.publish()?;
         Ok(RunResult {
             run_id: run_id.clone(),
@@ -511,13 +516,15 @@ fn record_workload_scenario(
         .create(staging.path.join("logs"))?;
     write_private(staging.path.join("scenario.toml"), &scenario_source)?;
     write_private_json(staging.path.join("choices.json"), &choices)?;
-    write_private_json(
+    write_private_bounded_json(
         staging.path.join(WORKLOAD_LOCK_PATH),
         &WorkloadLock {
             version: WORKLOAD_LOCK_VERSION,
             store: WORKLOAD_STORE_NAME.into(),
             workload: workload.clone(),
         },
+        MAX_WORKLOAD_LOCK_BYTES,
+        "the workload lock",
     )?;
     let fixture_directory = staging.path.join("fixture");
     let fixture_entries = fixture_entries(&choices.requests, scenario.corrupt_responses);
@@ -629,8 +636,9 @@ fn replay_with_adapter_and_assets(
         diagnostics.set_network(&network.identity);
         let choice_bytes =
             read_bounded(&directory.join("choices.json"), MAX_SEMANTIC_ARTIFACT_BYTES)?;
-        let choices: ChoicePlan = serde_json::from_slice(&choice_bytes)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let choices: ChoicePlan = serde_json::from_slice(&choice_bytes).map_err(|error| {
+            crate::diagnostics::json_error("malformed recorded choices", &error)
+        })?;
         if choices != materialized_choices {
             return Err(invalid_data(
                 "recorded choice plan does not match the scenario and seed",
@@ -867,7 +875,7 @@ fn replay_workload_scenario(
     diagnostics.set_network(&network.identity);
     let choice_bytes = read_bounded(&directory.join("choices.json"), MAX_SEMANTIC_ARTIFACT_BYTES)?;
     let choices: WorkloadChoicePlan = serde_json::from_slice(&choice_bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        .map_err(|error| crate::diagnostics::json_error("malformed recorded choices", &error))?;
     if choices != materialized_choices {
         return Err(invalid_data(
             "recorded choice plan does not match the scenario and seed",
@@ -1028,7 +1036,7 @@ fn read_recorded_assertions(directory: &Path) -> io::Result<(AssertionReport, Ve
         MAX_SEMANTIC_ARTIFACT_BYTES,
     )?;
     let expected_assertions: AssertionReport = serde_json::from_slice(&expected_assertion_bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        .map_err(|error| crate::diagnostics::json_error("malformed recorded assertions", &error))?;
     Ok((expected_assertions, expected_assertion_bytes))
 }
 
@@ -1420,6 +1428,25 @@ fn validate_workload_control_frames(
             "the materialized launch identity needs a {start}-byte start command, which exceeds the {MAX_FRAME_LENGTH}-byte control frame limit"
         )));
     }
+    // The guest serializes the same identity in its start event, whose envelope
+    // is not the command's, so the response frame is preflighted too.
+    let started = serde_json::to_vec(&EventFrame {
+        protocol_version: PROTOCOL_VERSION,
+        event_id: u64::MAX,
+        command_id: u64::MAX,
+        event: Event::WorkloadStarted {
+            invocation: u64::MAX,
+            launch: launch.clone(),
+        },
+        diagnostics: Default::default(),
+    })
+    .map_err(io::Error::other)?;
+    if started.len() > MAX_FRAME_LENGTH {
+        return Err(invalid_data(format!(
+            "the materialized launch identity needs a {}-byte workload-started event, which exceeds the {MAX_FRAME_LENGTH}-byte control frame limit",
+            started.len()
+        )));
+    }
     let mut widest = 0;
     let mut widest_request = "";
     for request in &choices.requests {
@@ -1447,6 +1474,19 @@ fn validate_workload_control_frames(
         )));
     }
     Ok(())
+}
+
+/// Whether an event reports the end of a workload invocation. The runtime
+/// serializes an exit and its cleanup barrier as separate frames, so a network
+/// command that follows a stopped invocation can be acknowledged after them.
+fn is_terminal_workload_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::TerminationRequested { .. }
+            | Event::WorkloadExited { .. }
+            | Event::LaunchFailed { .. }
+            | Event::CleanupComplete { .. }
+    )
 }
 
 /// The workload control loop. Unlike the network controller, responses to a
@@ -1568,6 +1608,11 @@ impl<'a> WorkloadController<'a> {
     /// Fold every already-queued event that belongs to an issued command into the
     /// trace without waiting. A closed channel is still an error: the guest ended
     /// without its shutdown handshake.
+    ///
+    /// Only passive replay parks an event whose command has not been issued yet:
+    /// a replayed guest runs ahead of the host, which sends nothing. A live
+    /// recording cannot legitimately see an event for a command it has not sent,
+    /// so such an event is an envelope violation there.
     fn drain(&mut self) -> io::Result<()> {
         loop {
             let frame = match self.pending.pop_front() {
@@ -1577,7 +1622,7 @@ impl<'a> WorkloadController<'a> {
                     None => return Ok(()),
                 },
             };
-            if frame.command_id >= self.next_command_id {
+            if frame.command_id >= self.next_command_id && !self.send_commands {
                 self.pending.push_back(frame);
                 return Ok(());
             }
@@ -1589,10 +1634,17 @@ impl<'a> WorkloadController<'a> {
     /// folding live output frames into the trace. An output frame is
     /// asynchronous and may still be attributed to an earlier command, but every
     /// other event must name the command that is being awaited.
+    ///
+    /// `allow_terminal` additionally folds the lifecycle events of a workload
+    /// invocation: the runtime serializes an exit and its cleanup barrier as
+    /// separate frames, so a network command issued after an invocation stopped
+    /// can legitimately be acknowledged after those frames. The trace keeps them,
+    /// and the checker reports them.
     fn expect(
         &mut self,
         command_id: u64,
         description: &str,
+        allow_terminal: bool,
         predicate: impl Fn(&Event) -> bool,
     ) -> io::Result<EventFrame> {
         loop {
@@ -1613,7 +1665,9 @@ impl<'a> WorkloadController<'a> {
                     frame.command_id
                 )));
             }
-            if !matches!(frame.event, Event::WorkloadOutput { .. }) {
+            if !matches!(frame.event, Event::WorkloadOutput { .. })
+                && !(allow_terminal && is_terminal_workload_event(&frame.event))
+            {
                 return Err(invalid_data(format!(
                     "unexpected {} while waiting for {description}",
                     frame.event.describe()
@@ -1716,8 +1770,8 @@ impl<'a> WorkloadController<'a> {
     ///
     /// The line must be the *next* complete line of that invocation, so a wrong
     /// response fails the run through the checker instead of being skipped over
-    /// until the VM deadline. Returns `false` when the invocation exits first or
-    /// answers with a different line.
+    /// until the VM deadline. Returns `false` when the invocation exits first,
+    /// writes to stderr, or answers with a different line.
     fn wait_for_line(&mut self, invocation: u64, expected: &str) -> io::Result<bool> {
         loop {
             let consumed = self.consumed_lines.get(&invocation).copied().unwrap_or(0);
@@ -1726,7 +1780,10 @@ impl<'a> WorkloadController<'a> {
                 self.consumed_lines.insert(invocation, consumed + 1);
                 return Ok(matched);
             }
-            if self.trace.exited(invocation) || self.trace.launch_failed(invocation) {
+            if self.trace.exited(invocation)
+                || self.trace.launch_failed(invocation)
+                || self.trace.stderr_bytes(invocation) > 0
+            {
                 return Ok(false);
             }
             self.receive_one()?;
@@ -1744,13 +1801,24 @@ fn drive_workload_scenario(
     diagnostics: &mut FailureDiagnostics,
 ) -> io::Result<(Vec<NormalizedEvent>, AssertionReport)> {
     let mut controller = WorkloadController::new(vm, send_commands, expected_events, diagnostics);
+    let interface = "eth0".to_owned();
+    let guest_cidr = "10.0.2.15/24".to_owned();
     let configure = controller.issue(Command::ConfigureNetwork {
-        interface: "eth0".into(),
-        guest_cidr: "10.0.2.15/24".into(),
+        interface: interface.clone(),
+        guest_cidr: guest_cidr.clone(),
         gateway: scenario.fixture_peer.clone(),
     })?;
-    controller.expect(configure, "network-configured", |event| {
-        matches!(event, Event::NetworkConfigured { .. })
+    controller.expect(configure, "network-configured", true, |event| {
+        matches!(
+            event,
+            Event::NetworkConfigured {
+                interface: actual_interface,
+                guest_cidr: actual_cidr,
+                gateway: actual_gateway,
+            } if actual_interface == &interface
+                && actual_cidr == &guest_cidr
+                && actual_gateway == &scenario.fixture_peer
+        )
     })?;
     let peer_cidr = format!("{}/32", scenario.fixture_peer);
     let mut offsets = BTreeMap::<u64, u64>::new();
@@ -1810,8 +1878,12 @@ fn drive_workload_scenario(
                 let command = controller.issue(Command::ActivateOutage {
                     peer_cidr: peer_cidr.clone(),
                 })?;
-                controller.expect(command, "outage-activated", |event| {
-                    matches!(event, Event::OutageActivated { .. })
+                controller.expect(command, "outage-activated", true, |event| {
+                    matches!(
+                        event,
+                        Event::OutageActivated { peer_cidr: actual, rule }
+                            if actual == &peer_cidr && rule == &format!("prohibit {peer_cidr}")
+                    )
                 })?;
                 outage_active = true;
             }
@@ -1819,8 +1891,11 @@ fn drive_workload_scenario(
                 let command = controller.issue(Command::RestoreNetwork {
                     peer_cidr: peer_cidr.clone(),
                 })?;
-                controller.expect(command, "network-restored", |event| {
-                    matches!(event, Event::NetworkRestored { .. })
+                controller.expect(command, "network-restored", true, |event| {
+                    matches!(
+                        event,
+                        Event::NetworkRestored { peer_cidr: actual } if actual == &peer_cidr
+                    )
                 })?;
                 outage_active = false;
             }
@@ -1829,7 +1904,7 @@ fn drive_workload_scenario(
                     invocation,
                     launch: launch.clone(),
                 })?;
-                controller.expect(command, "workload-started", |event| {
+                controller.expect(command, "workload-started", false, |event| {
                     matches!(
                         event,
                         Event::WorkloadStarted { .. } | Event::LaunchFailed { .. }
@@ -1848,13 +1923,13 @@ fn drive_workload_scenario(
                     continue;
                 }
                 let command = controller.issue(Command::Terminate { invocation })?;
-                controller.expect(command, "termination-requested", |event| {
+                controller.expect(command, "termination-requested", false, |event| {
                     matches!(event, Event::TerminationRequested { .. })
                 })?;
-                controller.expect(command, "workload-exited", |event| {
+                controller.expect(command, "workload-exited", false, |event| {
                     matches!(event, Event::WorkloadExited { .. })
                 })?;
-                controller.expect(command, "cleanup-complete", |event| {
+                controller.expect(command, "cleanup-complete", false, |event| {
                     matches!(event, Event::CleanupComplete { .. })
                 })?;
             }
@@ -1865,17 +1940,17 @@ fn drive_workload_scenario(
                 }
                 let expected_end = offsets.get(&invocation).copied().unwrap_or(0);
                 let command = controller.issue(Command::StdinEof { invocation })?;
-                controller.expect(command, "input-accepted", move |event| {
+                controller.expect(command, "input-accepted", false, move |event| {
                     matches!(
                         event,
                         Event::InputAccepted { invocation: actual, offset, bytes: 0, eof: true }
                             if *actual == invocation && *offset == expected_end
                     )
                 })?;
-                controller.expect(command, "workload-exited", |event| {
+                controller.expect(command, "workload-exited", false, |event| {
                     matches!(event, Event::WorkloadExited { .. })
                 })?;
-                controller.expect(command, "cleanup-complete", |event| {
+                controller.expect(command, "cleanup-complete", false, |event| {
                     matches!(event, Event::CleanupComplete { .. })
                 })?;
             }
@@ -1894,8 +1969,11 @@ fn drive_workload_scenario(
         let command = controller.issue(Command::RestoreNetwork {
             peer_cidr: peer_cidr.clone(),
         })?;
-        controller.expect(command, "network-restored", |event| {
-            matches!(event, Event::NetworkRestored { .. })
+        controller.expect(command, "network-restored", true, |event| {
+            matches!(
+                event,
+                Event::NetworkRestored { peer_cidr: actual } if actual == &peer_cidr
+            )
         })?;
     }
     // The runtime may still be finishing a barrier when the agent stops, so
@@ -1910,17 +1988,19 @@ fn drive_workload_scenario(
             ));
         }
         if matches!(frame.event, Event::AgentStopped {}) {
+            if frame.command_id != shutdown {
+                return Err(invalid_data(format!(
+                    "the agent-stopped response carries command {} instead of {shutdown}",
+                    frame.command_id
+                )));
+            }
             break;
         }
         if !matches!(
             frame.event,
-            Event::WorkloadOutput { .. }
-                | Event::InputAccepted { .. }
-                | Event::TerminationRequested { .. }
-                | Event::WorkloadExited { .. }
-                | Event::LaunchFailed { .. }
-                | Event::CleanupComplete { .. }
-        ) {
+            Event::WorkloadOutput { .. } | Event::InputAccepted { .. }
+        ) && !is_terminal_workload_event(&frame.event)
+        {
             return Err(invalid_data(format!(
                 "unexpected {} while waiting for agent-stopped",
                 frame.event.describe()
@@ -2084,7 +2164,11 @@ fn build_guest_image_with_assets(
     require_private_cache(&cache, 0o700, true)?;
     let image = cache.join(format!("{digest}.cpio.gz"));
     if image.exists() {
-        if sha256_file(&image)? != digest {
+        // An entry published by an earlier build may be world-readable or of the
+        // wrong type, so a reused image is validated and repaired before it is
+        // opened: hashing a FIFO would block before any check could reject it.
+        require_private_cache(&image, 0o600, false)?;
+        if sha256_regular_file(&image, compressed.len())? != digest {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -2093,9 +2177,6 @@ fn build_guest_image_with_assets(
                 ),
             ));
         }
-        // An entry published by an earlier build may still be world-readable, so
-        // a reused image is repaired rather than trusted.
-        require_private_cache(&image, 0o600, false)?;
     } else {
         let temporary = cache.join(format!(
             ".{digest}.tmp-{}-{}",
@@ -2118,23 +2199,23 @@ fn build_guest_image_with_assets(
         drop(temporary_file);
         match fs::rename(&temporary, &image) {
             Ok(()) => {
-                if sha256_file(&image)? != digest {
+                require_private_cache(&image, 0o600, false)?;
+                if sha256_regular_file(&image, compressed.len())? != digest {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "published guest image has the wrong digest",
                     ));
                 }
-                require_private_cache(&image, 0o600, false)?;
             }
             Err(error) if image.exists() => {
                 let _ = fs::remove_file(temporary);
-                if sha256_file(&image)? != digest {
+                require_private_cache(&image, 0o600, false)?;
+                if sha256_regular_file(&image, compressed.len())? != digest {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "concurrent guest image cache entry has the wrong digest",
                     ));
                 }
-                require_private_cache(&image, 0o600, false)?;
                 drop(error);
             }
             Err(error) => return Err(error),
@@ -2493,7 +2574,7 @@ fn valid_sha256(value: &str) -> bool {
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, limit: usize) -> io::Result<T> {
     let bytes = read_bounded(path, limit)?;
     serde_json::from_slice(&bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .map_err(|error| crate::diagnostics::json_error("malformed recorded artifact", &error))
 }
 
 fn read_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
@@ -2591,10 +2672,10 @@ fn decode_events(bytes: &[u8]) -> io::Result<Vec<NormalizedEvent>> {
         .enumerate()
         .map(|(index, line)| {
             serde_json::from_str(line).map_err(|error| {
-                invalid_data(format!(
-                    "invalid normalized event at line {}: {error}",
-                    index + 1
-                ))
+                crate::diagnostics::json_error(
+                    &format!("invalid normalized event at line {}", index + 1),
+                    &error,
+                )
             })
         })
         .collect()
@@ -2656,6 +2737,24 @@ fn write_private(path: PathBuf, bytes: &[u8]) -> io::Result<()> {
 
 fn write_private_json(path: PathBuf, value: &impl Serialize) -> io::Result<()> {
     write_private(path, &json_bytes(value)?)
+}
+
+/// Write one private JSON artifact and require it to fit the limit its reader
+/// enforces, so a published run cannot be unreplayable.
+fn write_private_bounded_json(
+    path: PathBuf,
+    value: &impl Serialize,
+    limit: usize,
+    what: &str,
+) -> io::Result<()> {
+    let bytes = json_bytes(value)?;
+    if bytes.len() > limit {
+        return Err(invalid_data(format!(
+            "{what} is {} bytes, which exceeds the {limit}-byte replay limit",
+            bytes.len()
+        )));
+    }
+    write_private(path, &bytes)
 }
 
 fn json_bytes(value: &impl Serialize) -> io::Result<Vec<u8>> {
@@ -2965,6 +3064,18 @@ mod tests {
         exit_after_start: bool,
         /// Emit one duplicated input acknowledgement for the first input command.
         duplicate_input_accept: bool,
+        /// Report a different gateway than the one the host configured.
+        mismatched_network: bool,
+        /// Report the agent-stopped acknowledgement with an older command.
+        late_agent_stopped: bool,
+        /// Emit one event that belongs to a command the host has not issued.
+        future_command_event: bool,
+        /// A cleanup barrier the runtime has not delivered yet, because it
+        /// finishes the barrier after the host has already read the exit record.
+        pending_cleanup: Option<(u64, u64)>,
+        /// Write to stderr without exiting, so only the driver's stderr check can
+        /// end the wait for a response line.
+        stderr_without_exit: bool,
     }
 
     struct FakeAdapter {
@@ -3039,6 +3150,11 @@ mod tests {
                 stale_root: false,
                 exit_after_start: false,
                 duplicate_input_accept: false,
+                mismatched_network: false,
+                late_agent_stopped: false,
+                future_command_event: false,
+                pending_cleanup: None,
+                stderr_without_exit: false,
             })
         }
     }
@@ -3200,13 +3316,12 @@ mod tests {
             );
         }
 
-        /// Emit the independently computed exit record and the cleanup barrier.
-        fn emit_workload_exit(
+        /// Emit the independently computed exit record.
+        fn emit_workload_exit_record(
             &mut self,
             command_id: u64,
             invocation: u64,
             exit: ProcessExit,
-            reaped: u64,
         ) {
             let stdout = self.workload.stdout.remove(&invocation).unwrap_or_default();
             let stderr = self.workload.stderr.remove(&invocation).unwrap_or_default();
@@ -3225,6 +3340,17 @@ mod tests {
                     frames,
                 },
             );
+        }
+
+        /// Emit the exit record and its cleanup barrier.
+        fn emit_workload_exit(
+            &mut self,
+            command_id: u64,
+            invocation: u64,
+            exit: ProcessExit,
+            reaped: u64,
+        ) {
+            self.emit_workload_exit_record(command_id, invocation, exit);
             self.event(command_id, Event::CleanupComplete { invocation, reaped });
         }
 
@@ -3268,11 +3394,22 @@ mod tests {
                         OutputStream::Stderr,
                         "fixture: injected application failure\n",
                     );
-                    self.emit_workload_exit(
+                    self.emit_workload_exit_record(
                         command_id,
                         invocation,
                         ProcessExit::Exited { code: 1 },
-                        1,
+                    );
+                    // The barrier is serialized separately, so the host reads it
+                    // only with the command that follows the exit record.
+                    self.pending_cleanup = Some((invocation, 1));
+                } else if self.stderr_without_exit && self.workload.fetched == 1 {
+                    // A failing application that stays alive: only the driver's
+                    // stderr check can end the wait for its response line.
+                    self.emit_output(
+                        command_id,
+                        invocation,
+                        OutputStream::Stderr,
+                        "fixture: injected application failure\n",
                     );
                 } else if self.corrupt && self.workload.fetched == 1 {
                     self.emit_output(
@@ -3334,6 +3471,12 @@ mod tests {
             if self.playback {
                 return Err(io::Error::other("replay wrote a live command"));
             }
+            if let Some((invocation, reaped)) = self.pending_cleanup.take() {
+                self.event(
+                    frame.command_id,
+                    Event::CleanupComplete { invocation, reaped },
+                );
+            }
             match &frame.command {
                 Command::ConfigureNetwork {
                     interface,
@@ -3342,12 +3485,17 @@ mod tests {
                 } => {
                     self.running = true;
                     self.workload.network_up = true;
+                    let gateway = if self.mismatched_network {
+                        "10.0.2.3".to_owned()
+                    } else {
+                        gateway.clone()
+                    };
                     self.event(
                         frame.command_id,
                         Event::NetworkConfigured {
                             interface: interface.clone(),
                             guest_cidr: guest_cidr.clone(),
-                            gateway: gateway.clone(),
+                            gateway,
                         },
                     );
                 }
@@ -3436,9 +3584,14 @@ mod tests {
                             "fake guest refuses to stop while the outage is active",
                         ));
                     }
-                    self.event(frame.command_id, Event::AgentStopped {});
+                    let acknowledged = if self.late_agent_stopped {
+                        frame.command_id - 1
+                    } else {
+                        frame.command_id
+                    };
+                    self.event(acknowledged, Event::AgentStopped {});
                     if self.extra_after_shutdown {
-                        self.event(frame.command_id, Event::AgentStopped {});
+                        self.event(acknowledged, Event::AgentStopped {});
                     }
                 }
                 Command::Start { invocation, launch } => {
@@ -3458,6 +3611,11 @@ mod tests {
                         OutputStream::Stdout,
                         &format!("{READY_LINE}\n"),
                     );
+                    if self.future_command_event {
+                        // An event that belongs to a command the host has not
+                        // issued: only a replayed guest can run ahead.
+                        self.event(frame.command_id + 1, Event::AgentReady {});
+                    }
                     if self.exit_after_start {
                         self.emit_workload_exit(
                             frame.command_id,
@@ -3622,6 +3780,11 @@ mod tests {
             stale_root: false,
             exit_after_start: false,
             duplicate_input_accept: false,
+            mismatched_network: false,
+            late_agent_stopped: false,
+            future_command_event: false,
+            pending_cleanup: None,
+            stderr_without_exit: false,
         };
         let mut diagnostics = failure_diagnostics("record");
         let (events, report) =
@@ -5034,6 +5197,43 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_private_artifact_never_quotes_the_launch_environment() {
+        let root = temporary_root("manifest-privacy");
+        let options = workload_options(&root, false);
+        let specification = options.workload.clone().unwrap();
+        let text = fs::read_to_string(&specification)
+            .unwrap()
+            .replace("MODE=acceptance", "SECRET=manifest-marker");
+        fs::write(&specification, text).unwrap();
+        let adapter = fake_adapter(None);
+        let recorded = record_with_adapter(&options, &adapter).unwrap();
+
+        // A manifest whose launch field has the wrong type quotes its value in a
+        // plain serde error, so the diagnostic must be value-free.
+        let manifest_path = recorded.directory.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["workload"]["launch"]["uid"] =
+            serde_json::Value::String("SECRET=manifest-marker".into());
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = replay_with_adapter(
+            &replay_options(&options, recorded.directory.clone()),
+            &adapter,
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("manifest-marker"), "{error}");
+        assert!(
+            error.to_string().contains("malformed recorded artifact"),
+            "{error}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_workload_replay_divergence_never_leaks_the_launch_environment() {
         let root = temporary_root("workload-divergence-privacy");
         let options = workload_options(&root, false);
@@ -5102,6 +5302,173 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn a_late_cleanup_barrier_does_not_turn_an_outage_failure_into_an_error() {
+        // The runtime can finish the cleanup barrier after the host has read the
+        // exit record, so a network command issued during the early stop can be
+        // acknowledged after that barrier.
+        let mut vm = fake_workload_vm();
+        vm.exit_on_outage = true;
+        let (events, report) = drive_fake_workload(&mut vm);
+        assert!(!report.passed);
+        let cleanup = events
+            .iter()
+            .position(|frame| matches!(frame.event, Event::CleanupComplete { .. }))
+            .expect("the delayed barrier was folded in");
+        let restoration = events
+            .iter()
+            .position(|frame| matches!(frame.event, Event::NetworkRestored { .. }))
+            .expect("the driver restored the network");
+        assert!(cleanup < restoration);
+    }
+
+    #[test]
+    fn a_wrong_network_acknowledgement_is_rejected() {
+        // The acknowledgement must name the values the host configured, not just
+        // its variant.
+        let scenario = workload_scenario_fixture();
+        let choices = scenario.choices(42);
+        let mut vm = fake_workload_vm();
+        vm.mismatched_network = true;
+        let mut diagnostics = failure_diagnostics("record");
+        let error = drive_workload_scenario(
+            &scenario,
+            &choices,
+            &workload_launch(),
+            &mut vm,
+            true,
+            None,
+            &mut diagnostics,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("network_configured"), "{error}");
+    }
+
+    #[test]
+    fn a_late_agent_stopped_acknowledgement_is_rejected() {
+        let scenario = workload_scenario_fixture();
+        let choices = scenario.choices(42);
+        let mut vm = fake_workload_vm();
+        vm.late_agent_stopped = true;
+        let mut diagnostics = failure_diagnostics("record");
+        let error = drive_workload_scenario(
+            &scenario,
+            &choices,
+            &workload_launch(),
+            &mut vm,
+            true,
+            None,
+            &mut diagnostics,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("agent-stopped"), "{error}");
+    }
+
+    #[test]
+    fn a_record_rejects_a_future_command_event() {
+        // Only a replayed guest can run ahead of the host, so a live recording
+        // treats a future-command event as an envelope violation instead of
+        // parking it.
+        let scenario = workload_scenario_fixture();
+        let choices = scenario.choices(42);
+        let mut vm = fake_workload_vm();
+        vm.future_command_event = true;
+        let mut diagnostics = failure_diagnostics("record");
+        let error = drive_workload_scenario(
+            &scenario,
+            &choices,
+            &workload_launch(),
+            &mut vm,
+            true,
+            None,
+            &mut diagnostics,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unexpected event envelope"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_stderr_failure_stops_the_wait_instead_of_timing_out() {
+        // The fixture writes to stderr only when it is failing, so a live
+        // application error must end the wait for a response line and publish a
+        // failing run rather than exhausting the VM deadline.
+        let mut vm = fake_workload_vm();
+        vm.stderr_without_exit = true;
+        let (events, report) = drive_fake_workload(&mut vm);
+        assert!(!report.passed);
+        assert!(!report.assertions[1].passed, "{:#?}", report.assertions);
+        assert!(
+            events
+                .iter()
+                .any(|frame| matches!(frame.event, Event::AgentStopped {}))
+        );
+    }
+
+    #[test]
+    fn the_workload_preflight_covers_the_launch_response_frame() {
+        let scenario = workload_scenario_fixture();
+        let choices = scenario.choices(42);
+        // Grow the environment until the start *command* exactly fits one control
+        // frame, then require the preflight to reject the identity because the
+        // start *event* envelope is larger.
+        let frame_bytes = |launch: &LaunchIdentity| -> usize {
+            serde_json::to_vec(&CommandFrame {
+                protocol_version: PROTOCOL_VERSION,
+                command_id: u64::MAX,
+                command: Command::Start {
+                    invocation: 1,
+                    launch: launch.clone(),
+                },
+            })
+            .unwrap()
+            .len()
+        };
+        let mut low = 0;
+        let mut high = MAX_FRAME_LENGTH;
+        while low < high {
+            let middle = (low + high).div_ceil(2);
+            let mut probe = workload_launch();
+            probe.environment = vec![format!("BIG={}", "x".repeat(middle))];
+            if frame_bytes(&probe) <= MAX_FRAME_LENGTH {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        let mut launch = workload_launch();
+        launch.environment = vec![format!("BIG={}", "x".repeat(low))];
+        assert!(frame_bytes(&launch) <= MAX_FRAME_LENGTH);
+        let error = validate_workload_control_frames(&launch, &choices).unwrap_err();
+        assert!(
+            error.to_string().contains("workload-started event"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_guest_image_cache_rejects_a_non_regular_entry_without_blocking() {
+        let root = temporary_root("image-cache-fifo");
+        let runs = root.join("runs");
+        let executable = root.join("simferret");
+        let mut elf = vec![0_u8; 64];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        fs::write(&executable, elf).unwrap();
+
+        let image = build_guest_image(&executable, &runs).unwrap();
+        fs::remove_file(&image.path).unwrap();
+        let path = std::ffi::CString::new(image.path.as_os_str().as_bytes()).unwrap();
+        // A writer-less FIFO would block a hash, so the type check must run first.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let error = build_guest_image(&executable, &runs).unwrap_err();
+        assert!(error.to_string().contains("file type"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// A fake guest and scenario for driving the workload control loop directly,
     /// without a record or replay publication.
     fn workload_scenario_fixture() -> WorkloadScenario {
@@ -5149,6 +5516,11 @@ mod tests {
             stale_root: false,
             exit_after_start: false,
             duplicate_input_accept: false,
+            mismatched_network: false,
+            late_agent_stopped: false,
+            future_command_event: false,
+            pending_cleanup: None,
+            stderr_without_exit: false,
         }
     }
 
@@ -5297,6 +5669,11 @@ mod tests {
             stale_root: false,
             exit_after_start: false,
             duplicate_input_accept: false,
+            mismatched_network: false,
+            late_agent_stopped: false,
+            future_command_event: false,
+            pending_cleanup: None,
+            stderr_without_exit: false,
         }
     }
 
