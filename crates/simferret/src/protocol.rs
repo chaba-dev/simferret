@@ -190,17 +190,28 @@ impl OutputStream {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum ProcessExit {
     Exited { code: i32 },
     Signaled { signal: i32 },
 }
 
 impl ProcessExit {
+    /// The shell-style status code. A signal value outside the Linux range is
+    /// saturated instead of overflowing, so a hostile event frame cannot panic
+    /// or wrap the host.
     pub fn status_code(self) -> i32 {
         match self {
             Self::Exited { code } => code,
-            Self::Signaled { signal } => 128 + signal,
+            Self::Signaled { signal } => 128_i32.saturating_add(signal),
+        }
+    }
+
+    /// Report whether this record describes a real Linux exit or signal.
+    pub fn is_valid(self) -> bool {
+        match self {
+            Self::Exited { code } => (0..=255).contains(&code),
+            Self::Signaled { signal } => (1..=64).contains(&signal),
         }
     }
 }
@@ -578,6 +589,22 @@ mod tests {
             write_line_frame(&mut bytes, &event).unwrap();
             assert_eq!(read_line_frame(&mut bytes.as_slice()).unwrap(), Some(event));
         }
+    }
+
+    #[test]
+    fn process_exit_records_reject_foreign_fields_and_bound_status_codes() {
+        // A record carrying a field from the other variant is not a valid exit.
+        let foreign = json!({"kind": "exited", "code": 0, "signal": 9});
+        assert!(serde_json::from_value::<ProcessExit>(foreign).is_err());
+        let unknown = json!({"kind": "exited", "code": 0, "unexpected": true});
+        assert!(serde_json::from_value::<ProcessExit>(unknown).is_err());
+        // A hostile signal value saturates instead of overflowing.
+        let extreme = ProcessExit::Signaled { signal: i32::MAX };
+        assert_eq!(extreme.status_code(), i32::MAX);
+        assert!(!extreme.is_valid());
+        assert!(ProcessExit::Signaled { signal: 9 }.is_valid());
+        assert!(ProcessExit::Exited { code: 0 }.is_valid());
+        assert!(!ProcessExit::Exited { code: 256 }.is_valid());
     }
 
     #[test]
