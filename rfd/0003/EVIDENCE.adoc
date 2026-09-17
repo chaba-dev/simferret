@@ -1392,16 +1392,23 @@ one of them was addressed in the same phase rather than deferred:
   `failure.json` or the CLI error text. `Event::kind`/`Event::describe` and
   `Command::kind`/`Command::describe` are the single source of those
   descriptions, and a protocol unit test pins the tag names against the wire form
-  and asserts that no marker value survives.
+  and asserts that no marker value survives. Parser failures are reduced by
+  `crates/simferret/src/diagnostics.rs`: a private artifact reports only a
+  category and a location, and a user-authored specification or scenario reports
+  a message whose quoted spans are replaced, because a TOML or serde message can
+  quote the value it rejected.
 * *Owner-only image cache.* The `.images` cache is created `0700` with `0600`
-  entries, a reused entry has its mode repaired instead of trusted, and a
-  non-regular or foreign-owned entry is refused.
+  entries, and a reused entry is validated before it is opened: its type,
+  ownership, and mode are checked first and repaired where possible, then it is
+  hashed through the same `O_NOFOLLOW | O_NONBLOCK` reader the replay inputs use,
+  so a writer-less FIFO or a device node is rejected instead of blocking the run.
 * *Complete stream evaluation.* Per-invocation offset, sequence, and input-stream
   violations are now evaluated alongside the trace-level ones; sequences must
   start at one and stay contiguous; each accepted input must advance the accepted
-  offset by exactly its byte count and name a distinct later command; every
-  invocation must end on a complete stdout line; and no invocation may write a
-  single stderr byte.
+  offset by exactly its byte count and name a distinct later command; an
+  end-of-input must be unique and last; every response line but the startup line
+  must have its own accepted command; every invocation must end on a complete
+  stdout line; and no invocation may write a single stderr byte.
 * *Process evidence.* The first cleanup barrier must reap at least two processes
   (the terminated primary and the escaped descendant) and the escaped-descendant
   line must precede the termination request, with termination, exit, and cleanup
@@ -1410,13 +1417,18 @@ one of them was addressed in the same phase rather than deferred:
   invocation to answer its first command within the scenario's liveness bound, so
   the first invocation's responses can no longer satisfy the property.
 * *Strict response matching.* The driver requires each invocation's *next*
-  complete line to equal the expected line. A wrong response therefore fails the
-  property through the checker instead of blocking until the VM deadline.
+  complete line to equal the expected line, and it stops the wait as soon as the
+  invocation writes to stderr, because the pinned fixture writes there only when
+  it is failing. A wrong response or a reported application error therefore fails
+  the property through the checker instead of blocking until the VM deadline.
 * *Outage bookkeeping.* The driver tracks the administrative outage and restores
   the network before an early shutdown, because the agent refuses to stop while
-  an outage is active. The fake guest enforces the same refusal, so forgetting
-  the restore is a test failure rather than a production-only infrastructure
-  error.
+  an outage is active. A network acknowledgement also folds the lifecycle events
+  of a stopped invocation, because the runtime serializes an exit and its cleanup
+  barrier as separate frames that can arrive after the host has already read the
+  exit record. The fake guest enforces both the refusal and a separately
+  delivered barrier, so forgetting either is a test failure rather than a
+  production-only infrastructure error.
 * *Process-command safety.* The driver waits for an invocation's startup line
   before its first command, folds every already-queued event before each process
   command, and treats a terminal event observed while awaiting a response as an
@@ -1424,17 +1436,25 @@ one of them was addressed in the same phase rather than deferred:
   them, so a drain parks those events and preserves the exact read order.
 * *Envelope and acknowledgement correlation.* Every event's command identifier is
   bounded by the last issued command, synchronous acknowledgements must name the
-  awaited command, `input-accepted` contents are validated against the sent
-  bytes, and the shutdown drain accepts only workload events.
+  awaited command, every network acknowledgement must carry the values the host
+  configured rather than only its variant, `input-accepted` contents are
+  validated against the sent bytes, the shutdown drain accepts only workload
+  events and requires the agent-stopped acknowledgement to name its command, and
+  only passive replay may park an event whose command has not been issued yet.
 * *Preparation-time bounds.* `payload_bytes` is constrained to the fixture's
-  hex-encoded token limit (63 bytes) and the serialized start and widest input
-  frames are preflighted in both record and replay, so an undeliverable launch
-  identity or input fails before QEMU starts. The recorded event stream is
-  required to fit the replay artifact budget before anything is published.
+  hex-encoded token limit (63 bytes) and the serialized start command, start
+  event, and widest input frames are preflighted in both record and replay, so an
+  undeliverable launch identity or input fails before QEMU starts. The recorded
+  event stream, assertion report, workload lock, and run manifest are each
+  required to fit the replay budget their reader enforces before anything is
+  published.
 * *Acceptance harness.* The missing-raw case asserts the intended diagnostic
   instead of any nonzero exit, and a removed closure-referenced raw object is
-  covered too. Only the acceptance report, process status, and shareable failure
-  bundles are uploaded from the Phase 3 diagnostics artifact.
+  covered too. The fresh-root witness check concatenates each invocation's stdout
+  frames before it splits them into lines, exactly as the host checker
+  reconstructs the streams, so a line split across frames still counts. Only the
+  acceptance report, process status, and shareable failure bundles are uploaded
+  from the Phase 3 diagnostics artifact.
 * *Stronger fresh-root witness.* The fixture mutates its own executable's mode in
   the immutable workload root, outside the writable overlay, and each invocation
   must report `state value=fresh root=fresh`. A reused workload root is therefore
@@ -1447,8 +1467,8 @@ each individual failure: a reused root reported as `stale` (including a stale
 root witness while the `/tmp` marker is fresh), a mismatched response line, a
 cleanup barrier that reaped fewer than two processes, a sequence that does not
 start at one, a sequence gap, a non-contiguous output offset, a non-contiguous
-input offset, a replayed input command identifier, an unterminated stdout line, a
-stderr byte, a missing restoration, an outage response that arrives only after
+input offset, a replayed input command identifier, a missing input
+acknowledgement, an unterminated stdout line, a stderr byte, a missing restoration, an outage response that arrives only after
 restoration, a restart that answers outside the liveness bound, exit totals that
 disagree with the recorded frames, and a typed launch failure that cannot satisfy
 a workload property.
@@ -1483,7 +1503,18 @@ manifest, and replay preflight are exercised without QEMU. The tests cover:
 * the owner-only guest image cache, including repair of a world-readable entry
   and refusal of a non-regular one; and
 * a replayed launch-identity divergence, whose error text and shareable failure
-  bundle must carry no environment value and no workload stream byte.
+  bundle must carry no environment value and no workload stream byte;
+* a malformed private artifact and a malformed workload specification, whose
+  diagnostics must not quote the launch environment;
+* a late cleanup barrier, a wrong network acknowledgement, a late agent-stopped
+  acknowledgement, and an event for an unissued command, each of which must be
+  folded or rejected exactly as the protocol requires;
+* a failing application that writes to stderr and stays alive, which must fail
+  the property instead of exhausting the VM deadline;
+* a launch identity at the start-command boundary, which the response-frame
+  preflight must still reject; and
+* a writer-less FIFO in the guest image cache, which must be rejected without
+  blocking.
 
 `crates/simferret/tests/rfd3_phase3.rs` pins the public contract: the strict
 versioned workload scenario, the seeded choice plan and its bounds, the request

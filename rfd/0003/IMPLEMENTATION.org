@@ -175,6 +175,27 @@ content-addressed guest workload, and preserve exact passive replay.
     `state value=fresh root=fresh`.
   - [X] Upload only the acceptance report, process status, and shareable failure
     bundles from the Phase 3 diagnostics artifact.
+- [X] Harden the phase against the second adversarial review, which rechecked the
+  first round and found four fixes incomplete and three new defects:
+  - [X] Reduce every parser failure that can reach a diagnostic to a value-free
+    form, including TOML type errors and surplus guest frames, and cover both a
+    malformed specification and a malformed private artifact with canaries.
+  - [X] Fold the lifecycle events of a stopped invocation while awaiting a network
+    acknowledgement, because the runtime serializes an exit and its cleanup
+    barrier as separate frames.
+  - [X] Correlate network acknowledgements with the values the host configured,
+    require the agent-stopped acknowledgement to name its command, park
+    future-command events only in passive replay, and require the checker to
+    account for every accepted input command and the end-of-input state.
+  - [X] Preflight the launch-bearing response frame as well as the command, and
+    enforce the replay budget on the workload lock and run manifest.
+  - [X] Validate a reused cache entry before opening it, so a non-regular entry is
+    rejected instead of blocking the hash.
+  - [X] End the wait for a response line as soon as the invocation writes to
+    stderr, so a failing application that stays alive fails its property instead
+    of exhausting the VM deadline.
+  - [X] Reconstruct each invocation's stdout before counting fresh-root witnesses
+    in the acceptance harness, so a line split across frames still counts.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
