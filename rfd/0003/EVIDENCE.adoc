@@ -1407,6 +1407,15 @@ one of them was addressed in the same phase rather than deferred:
   one, and the recorded OCI manifest digest is validated before it can be named.
   Record-path canaries assert that neither the CLI text nor the shareable failure
   bundle carries a marker placed in those fields, including a traversal path.
+  Guest-reported free-form strings are not descriptions either: a diverging
+  `network-configured`, `outage-activated`, `network-restored`, or request event
+  can carry any bytes in its gateway, peer, rule, or request-identifier field, so
+  `Event::describe` names the tag, the request phase, the typed error, and the
+  numeric coordinates only, and the fault-transition diagnostics in
+  `failure.json` take their peer and rule from the validated network profile the
+  run configured instead of from the event. The protocol canary places a marker
+  in each of those fields, and an end-to-end record canary asserts that a rejected
+  activation's strings appear in neither the CLI text nor the bundle.
 * *Owner-only image cache.* The `.images` cache is created `0700` with `0600`
   entries, and a reused entry is validated before it is opened: its type,
   ownership, and mode are checked first and repaired where possible, then it is
@@ -1429,7 +1438,11 @@ one of them was addressed in the same phase rather than deferred:
   offset by exactly its byte count and name a distinct later command; an
   end-of-input must be unique and last; every response line but the startup line
   must have its own accepted command; every invocation must end on a complete
-  stdout line; and no invocation may write a single stderr byte.
+  stdout line; and no invocation may write a single stderr byte. The
+  end-of-input acknowledgement is required rather than merely permitted: the
+  acceptance contract ends the surviving invocation's input, so its accounting
+  must show exactly one end of input for the restarted invocation and none for
+  the terminated one, and a recording that omits it cannot pass.
 * *Process evidence.* The first cleanup barrier must reap at least two processes
   (the terminated primary and the escaped descendant) and the escaped-descendant
   line must precede the termination request, with termination, exit, and cleanup
@@ -1444,8 +1457,9 @@ one of them was addressed in the same phase rather than deferred:
   pinned fixture writes to stderr only when it is failing and a line over the
   bound can never be valid. The same health test gates every process command and
   the end-of-input step, so a failure observed by the pre-command drain stops the
-  drive as well, and the wait for an exit is interruptible by an output frame
-  that fails the same test instead of running to the VM deadline. A wrong
+  drive as well, and the wait for an exit consults the same test before its first
+  blocking receive, so a failing tail folded by the acknowledgement it awaited
+  ends the wait instead of becoming a receive error. A wrong
   response, a reported application error, or an over-long unfinished line
   therefore fails the property through the checker instead of blocking until the
   VM deadline.
@@ -1505,7 +1519,8 @@ root witness while the `/tmp` marker is fresh), a mismatched response line, a
 cleanup barrier that reaped fewer than two processes, a sequence that does not
 start at one, a sequence gap, a non-contiguous output offset, a non-contiguous
 input offset, a replayed input command identifier, a missing input
-acknowledgement, an unterminated stdout line, a stderr byte, a missing restoration, an outage response that arrives only after
+acknowledgement, a missing end of input for the restarted invocation, an
+unterminated stdout line, a stderr byte, a missing restoration, an outage response that arrives only after
 restoration, a restart that answers outside the liveness bound, exit totals that
 disagree with the recorded frames, and a typed launch failure that cannot satisfy
 a workload property.
@@ -1571,7 +1586,15 @@ manifest, and replay preflight are exercised without QEMU. The tests cover:
 * an over-bound tail that becomes visible only after the end-of-input
   acknowledgement, which must still stop the run; and
 * a recording whose failing response became visible one command later than a
-  faster replay would observe it, which must still replay to the same report.
+  faster replay would observe it, which must still replay to the same report;
+* a failing tail folded by the end-of-input acknowledgement, on stderr and as an
+  over-bound unfinished stdout line, which must stop the run and publish a
+  failing report instead of becoming a receive error;
+* a workload that exits cleanly after its last response and before its input can
+  be ended, whose recording must fail `response_integrity`; and
+* a rejected outage activation whose peer and rule carry a marker, which must
+  leave the error text and the whole failure bundle free of it while the report
+  still names the validated profile's peer and rule.
 
 `crates/simferret/tests/rfd3_phase3.rs` pins the public contract: the strict
 versioned workload scenario, the seeded choice plan and its bounds, the request

@@ -242,6 +242,27 @@ content-addressed guest workload, and preserve exact passive replay.
     consumes and compares the recorded event stream in order and lets the checker
     recompute the report, so a recording that observed a failing response one
     command later than a faster replay still replays to the same report.
+- [X] Harden the phase against the sixth adversarial review, which confirmed the
+  first, second, and fourth fifth-round fixes and found the third incomplete plus
+  three new defects:
+  - [X] Consult the invocation's health before the wait for an exit performs its
+    first blocking receive, so a failing tail folded by the acknowledgement it
+    awaited ends the wait instead of becoming a receive error.
+  - [X] Require the recorded end of input instead of merely permitting it: the
+    terminated invocation must acknowledge none and the restarted invocation
+    exactly one, so a recording whose workload stopped on its own after its last
+    response cannot pass every property.
+  - [X] Keep guest-reported free-form strings out of shareable output: event
+    descriptions name the tag, the request phase, the typed error, and the
+    numeric coordinates only, and the fault-transition diagnostics take their
+    peer and rule from the validated network profile rather than from the event
+    the driver observed before validating it.
+  - [X] Add regression tests for each fix: a stderr and an over-bound tail folded
+    by the end-of-input acknowledgement, a deletion-based checker case and a
+    fake-guest run for the missing end of input, an extended protocol canary for
+    the four guest-reported string fields, and an end-to-end record canary that
+    scans both the CLI text and the failure bundle for a rejected activation's
+    marker.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
