@@ -1726,13 +1726,13 @@ impl<'a> WorkloadController<'a> {
     /// Read until the invocation exits, or until an already-observed response
     /// failure means the run must stop instead of waiting for an exit that may
     /// never come. Output frames are folded as they arrive, so a stderr byte, an
-    /// over-bound unfinished line, or a response line the driver never asked for
-    /// ends the wait as soon as it is observed.
+    /// over-bound unfinished line, a response line the driver never asked for, or
+    /// a pending byte ends the wait as soon as it is observed.
     fn await_exit(&mut self, command_id: u64, invocation: u64) -> io::Result<bool> {
         // The acknowledgement that was awaited before this call can fold a
         // failing output frame, so an already-observed failure must end the wait
         // before the first blocking receive rather than after the next one.
-        if !self.healthy(invocation) || self.unconsumed_line(invocation) {
+        if self.exit_wait_failed(invocation) {
             return Ok(false);
         }
         loop {
@@ -1750,7 +1750,7 @@ impl<'a> WorkloadController<'a> {
                     return Ok(true);
                 }
                 Event::WorkloadOutput { .. } => {
-                    if !self.healthy(invocation) || self.unconsumed_line(invocation) {
+                    if self.exit_wait_failed(invocation) {
                         return Ok(false);
                     }
                 }
@@ -1773,10 +1773,19 @@ impl<'a> WorkloadController<'a> {
         Ok(!(self.trace.exited(invocation) || self.trace.launch_failed(invocation)))
     }
 
+    /// Whether the exit wait must stop before it receives anything. Every
+    /// expected response line has been consumed by the time the driver waits for
+    /// an exit, so a further complete line, or even a pending byte, can only be a
+    /// response the checker must reject; and an already-observed failure takes
+    /// precedence over any later frame.
+    fn exit_wait_failed(&self, invocation: u64) -> bool {
+        !self.healthy(invocation)
+            || self.unconsumed_line(invocation)
+            || self.trace.stdout_pending(invocation)
+    }
+
     /// Whether the invocation has produced a complete stdout line the driver did
-    /// not consume as an expected response. Every expected line has been consumed
-    /// by the time the driver waits for an exit, so a further complete line can
-    /// only be a response the checker must reject.
+    /// not consume as an expected response.
     fn unconsumed_line(&self, invocation: u64) -> bool {
         let consumed = self.consumed_lines.get(&invocation).copied().unwrap_or(0);
         self.trace.stdout_line_count(invocation) > consumed
@@ -2543,8 +2552,7 @@ fn validate_manifest(directory: &Path, manifest: &Manifest) -> io::Result<()> {
     }
     if manifest.simferret_version != env!("CARGO_PKG_VERSION") {
         return Err(invalid_data(format!(
-            "SimFerret version differs from recording: expected {}, found {}",
-            manifest.simferret_version,
+            "the SimFerret version differs from the recording; expected {}",
             env!("CARGO_PKG_VERSION")
         )));
     }
@@ -3113,6 +3121,11 @@ mod tests {
         OverBoundSplit,
         /// A short, complete stdout line the driver never asked for.
         ExtraLine,
+        /// A single stdout byte that completes no line.
+        ShortPartial,
+        /// The same pending byte, reported after the end-of-input
+        /// acknowledgement.
+        ShortPartialAfterAck,
     }
 
     struct FakeVm {
@@ -3620,6 +3633,48 @@ mod tests {
             }
         }
 
+        /// Write one failing tail on the invocation's output stream.
+        fn emit_failing_tail(&mut self, tail: FailingTail, command_id: u64, invocation: u64) {
+            match tail {
+                FailingTail::Stderr => self.emit_output(
+                    command_id,
+                    invocation,
+                    OutputStream::Stderr,
+                    "fixture: injected application failure\n",
+                ),
+                FailingTail::OverBound => self.emit_output(
+                    command_id,
+                    invocation,
+                    OutputStream::Stdout,
+                    &"x".repeat(MAX_RESPONSE_LINE_BYTES + 1),
+                ),
+                FailingTail::OverBoundLine => self.emit_output(
+                    command_id,
+                    invocation,
+                    OutputStream::Stdout,
+                    &format!("{}\n", "x".repeat(MAX_RESPONSE_LINE_BYTES + 1)),
+                ),
+                FailingTail::OverBoundSplit => {
+                    self.emit_output(
+                        command_id,
+                        invocation,
+                        OutputStream::Stdout,
+                        &"x".repeat(MAX_RESPONSE_LINE_BYTES + 1),
+                    );
+                    self.emit_output(command_id, invocation, OutputStream::Stdout, "\n");
+                }
+                FailingTail::ExtraLine => self.emit_output(
+                    command_id,
+                    invocation,
+                    OutputStream::Stdout,
+                    "unexpected response\n",
+                ),
+                FailingTail::ShortPartial | FailingTail::ShortPartialAfterAck => {
+                    self.emit_output(command_id, invocation, OutputStream::Stdout, "x");
+                }
+            }
+        }
+
         fn event(&mut self, command_id: u64, event: Event) {
             let frame = EventFrame {
                 protocol_version: PROTOCOL_VERSION,
@@ -3870,50 +3925,13 @@ mod tests {
                         .get(invocation)
                         .copied()
                         .unwrap_or(0);
-                    if let Some(tail) = self.failing_tail_before_eof {
+                    if let Some(tail) = self.failing_tail_before_eof
+                        && tail != FailingTail::ShortPartialAfterAck
+                    {
                         // A failing invocation can still acknowledge the end of
                         // input, so the host observes the failure before it waits
                         // for an exit that never comes.
-                        match tail {
-                            FailingTail::Stderr => self.emit_output(
-                                frame.command_id,
-                                *invocation,
-                                OutputStream::Stderr,
-                                "fixture: injected application failure\n",
-                            ),
-                            FailingTail::OverBound => self.emit_output(
-                                frame.command_id,
-                                *invocation,
-                                OutputStream::Stdout,
-                                &"x".repeat(MAX_RESPONSE_LINE_BYTES + 1),
-                            ),
-                            FailingTail::OverBoundLine => self.emit_output(
-                                frame.command_id,
-                                *invocation,
-                                OutputStream::Stdout,
-                                &format!("{}\n", "x".repeat(MAX_RESPONSE_LINE_BYTES + 1)),
-                            ),
-                            FailingTail::OverBoundSplit => {
-                                self.emit_output(
-                                    frame.command_id,
-                                    *invocation,
-                                    OutputStream::Stdout,
-                                    &"x".repeat(MAX_RESPONSE_LINE_BYTES + 1),
-                                );
-                                self.emit_output(
-                                    frame.command_id,
-                                    *invocation,
-                                    OutputStream::Stdout,
-                                    "\n",
-                                );
-                            }
-                            FailingTail::ExtraLine => self.emit_output(
-                                frame.command_id,
-                                *invocation,
-                                OutputStream::Stdout,
-                                "unexpected response\n",
-                            ),
-                        }
+                        self.emit_failing_tail(tail, frame.command_id, *invocation);
                     }
                     self.event(
                         frame.command_id,
@@ -3924,6 +3942,13 @@ mod tests {
                             eof: true,
                         },
                     );
+                    if self.failing_tail_before_eof == Some(FailingTail::ShortPartialAfterAck) {
+                        self.emit_failing_tail(
+                            FailingTail::ShortPartial,
+                            frame.command_id,
+                            *invocation,
+                        );
+                    }
                     if self.failing_tail_before_eof.is_none() {
                         self.emit_workload_exit(
                             frame.command_id,
@@ -6046,6 +6071,8 @@ mod tests {
             FailingTail::OverBoundLine,
             FailingTail::OverBoundSplit,
             FailingTail::ExtraLine,
+            FailingTail::ShortPartial,
+            FailingTail::ShortPartialAfterAck,
         ] {
             let mut vm = fake_workload_vm();
             vm.failing_tail_before_eof = Some(tail);

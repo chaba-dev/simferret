@@ -686,6 +686,15 @@ impl WorkloadTrace {
             .is_some_and(|streams| streams.stdout_over_bound || streams.stdout_over_bound_seen)
     }
 
+    /// Whether one invocation's stdout has bytes that have not yet completed a
+    /// line. The driver stops waiting for an exit on a pending byte as well,
+    /// because every expected response is already complete and consumed by then.
+    pub fn stdout_pending(&self, invocation: u64) -> bool {
+        self.invocations
+            .get(&invocation)
+            .is_some_and(|streams| !streams.stdout_pending.is_empty())
+    }
+
     fn stdout_lines(&self, invocation: u64) -> &[CompletedLine] {
         self.invocations
             .get(&invocation)
