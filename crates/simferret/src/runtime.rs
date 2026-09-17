@@ -29,7 +29,9 @@ use crate::protocol::{
     Event, LaunchFailure, MAX_INVOCATION_INPUT_BYTES, MAX_INVOCATION_OUTPUT_BYTES,
     MAX_OUTPUT_FRAME_BYTES, MAX_STDIN_FRAME_BYTES, OutputStream, ProcessExit, TERMINATION_SIGNAL,
 };
-use crate::workload::LaunchIdentity;
+use crate::workload::{
+    LaunchIdentity, MAX_FILE_BYTES, MAX_PATH_BYTES, MAX_VIEW_ENTRIES, validate_launch_identity,
+};
 
 /// The reserved guest path holding the immutable workload template. The PID-1
 /// agent and its tools stay outside it.
@@ -47,9 +49,7 @@ const OVERLAY_DIRECTORY_MODE: u32 = 0o755;
 const OVERLAY_TMP_MODE: u32 = 0o1777;
 const OVERLAY_DEVICE_MODE: u32 = 0o666;
 
-/// Bounds the template walk so a hostile template cannot force unbounded work.
-const MAX_TEMPLATE_ENTRIES: usize = 1 << 14;
-const MAX_TEMPLATE_PATH_BYTES: usize = 1024;
+/// Bounds the descriptor scan during the cleanup barrier.
 const MAX_DESCRIPTOR_SCAN: u64 = 1 << 16;
 /// The bounded wait for the child's setup result before exec.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -112,8 +112,13 @@ pub struct RuntimeLimits {
     pub output_bytes: usize,
     pub input_frame_bytes: usize,
     pub output_frame_bytes: usize,
+    /// Bounds the template walk. Defaults to the canonical view bound the
+    /// assembler enforces, so the runtime never rejects a template the
+    /// assembler accepted.
     pub template_entries: usize,
     pub template_path_bytes: usize,
+    /// Bounds one copied template file, independent of the output byte budget.
+    pub file_bytes: usize,
 }
 
 impl Default for RuntimeLimits {
@@ -123,8 +128,9 @@ impl Default for RuntimeLimits {
             output_bytes: MAX_INVOCATION_OUTPUT_BYTES,
             input_frame_bytes: MAX_STDIN_FRAME_BYTES,
             output_frame_bytes: MAX_OUTPUT_FRAME_BYTES,
-            template_entries: MAX_TEMPLATE_ENTRIES,
-            template_path_bytes: MAX_TEMPLATE_PATH_BYTES,
+            template_entries: MAX_VIEW_ENTRIES,
+            template_path_bytes: MAX_PATH_BYTES,
+            file_bytes: MAX_FILE_BYTES,
         }
     }
 }
@@ -379,8 +385,6 @@ impl Runtime {
         let root = RootGuard::create(path)
             .map_err(|error| (LaunchFailure::Materialization, error.to_string()))?;
         materialize_into(&self.config.template_root, root.path(), &self.config.limits)
-            .map_err(|error| (LaunchFailure::Materialization, error.to_string()))?;
-        apply_overlay(root.path())
             .map_err(|error| (LaunchFailure::Materialization, error.to_string()))?;
         verify_launch_target(root.path(), launch)?;
         let spawned = spawn(root.path(), launch, self.config.scope)?;
@@ -644,8 +648,16 @@ fn validate_limits(limits: &RuntimeLimits) -> io::Result<()> {
             "runtime byte limits must cover at least one whole frame",
         ));
     }
-    if limits.template_entries == 0 || limits.template_path_bytes == 0 {
-        return Err(invalid("runtime template limits must be positive"));
+    if limits.template_entries == 0
+        || limits.template_entries > MAX_VIEW_ENTRIES
+        || limits.template_path_bytes == 0
+        || limits.template_path_bytes > MAX_PATH_BYTES
+        || limits.file_bytes == 0
+        || limits.file_bytes > MAX_FILE_BYTES
+    {
+        return Err(invalid(
+            "runtime template limits must be positive and within the canonical filesystem bounds",
+        ));
     }
     Ok(())
 }
@@ -662,7 +674,9 @@ pub fn validate_template(template: &Path, limits: &RuntimeLimits) -> io::Result<
         return Err(invalid("the workload template root is not a directory"));
     }
     let mut stack = vec![(template.to_path_buf(), Vec::<u8>::new())];
-    let mut entries = 0usize;
+    // The template root itself is a view entry, exactly as the assembler counts
+    // it, so the runtime accepts every template the assembler accepted.
+    let mut entries = 1usize;
     while let Some((directory, prefix)) = stack.pop() {
         for entry in std::fs::read_dir(&directory)
             .map_err(|error| invalid(format!("cannot read the workload template: {error}")))?
@@ -719,12 +733,22 @@ pub fn validate_template(template: &Path, limits: &RuntimeLimits) -> io::Result<
 }
 
 /// Reproduce the template bytes and canonical metadata below an existing fresh
-/// root. The caller owns creation and removal of that root, so a failure here
-/// never leaves a partial root behind.
+/// root, then apply the versioned runtime overlay.
+///
+/// The canonical root metadata is applied after the overlay, so creating the
+/// overlay entries cannot change the recorded directory timestamps.
 fn materialize_into(template: &Path, destination: &Path, limits: &RuntimeLimits) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(template)
         .map_err(|error| invalid(format!("cannot inspect the workload template: {error}")))?;
-    copy_directory(template, destination, &metadata, limits)
+    copy_entries(template, destination, true, limits)?;
+    apply_overlay(destination)?;
+    set_metadata(
+        destination,
+        unix_mode(&metadata),
+        unix_owner(&metadata),
+        unix_mtime(&metadata),
+        false,
+    )
 }
 
 fn copy_directory(
@@ -733,18 +757,40 @@ fn copy_directory(
     metadata: &std::fs::Metadata,
     limits: &RuntimeLimits,
 ) -> io::Result<()> {
-    let mode = unix_mode(metadata);
-    let (uid, gid) = unix_owner(metadata);
-    let mtime = unix_mtime(metadata);
+    copy_entries(source, destination, false, limits)?;
+    set_metadata(
+        destination,
+        unix_mode(metadata),
+        unix_owner(metadata),
+        unix_mtime(metadata),
+        false,
+    )
+}
+
+/// Copy one directory level.
+///
+/// At the template root the `tmp` and `dev` subtrees are skipped: the overlay
+/// synthesizes them fresh, so a package-provided entry below them can never
+/// collide with the overlay or force a failing removal.
+fn copy_entries(
+    source: &Path,
+    destination: &Path,
+    skip_overlay: bool,
+    limits: &RuntimeLimits,
+) -> io::Result<()> {
     for entry in std::fs::read_dir(source)
         .map_err(|error| invalid(format!("cannot read the workload template: {error}")))?
     {
         let entry =
             entry.map_err(|error| invalid(format!("cannot read a template entry: {error}")))?;
+        let name = entry.file_name();
+        if skip_overlay && (name.as_bytes() == OVERLAY_TMP || name.as_bytes() == OVERLAY_DEV) {
+            continue;
+        }
         let file_type = entry
             .file_type()
             .map_err(|error| invalid(format!("cannot inspect a template entry: {error}")))?;
-        let target = destination.join(entry.file_name());
+        let target = destination.join(&name);
         let source_path = entry.path();
         let child = std::fs::symlink_metadata(&source_path)
             .map_err(|error| invalid(format!("cannot inspect a template entry: {error}")))?;
@@ -760,8 +806,11 @@ fn copy_directory(
                 invalid(format!("cannot create a workload symbolic link: {error}"))
             })?;
         } else if file_type.is_file() {
-            if child.len() > limits.output_bytes as u64 {
-                return Err(invalid("a workload file exceeds the runtime bound"));
+            if child.len() > limits.file_bytes as u64 {
+                return Err(invalid(format!(
+                    "a workload file exceeds the {} byte canonical file bound",
+                    limits.file_bytes
+                )));
             }
             std::fs::copy(&source_path, &target)
                 .map_err(|error| invalid(format!("cannot copy a workload file: {error}")))?;
@@ -778,32 +827,27 @@ fn copy_directory(
             file_type.is_symlink(),
         )?;
     }
-    set_metadata(destination, mode, (uid, gid), mtime, false)
+    Ok(())
 }
 
 /// Apply the versioned runtime overlay to a freshly materialized root.
+///
+/// Both overlay directories are synthesized from the canonical profile, so any
+/// package-provided content below them is replaced rather than merged. The
+/// `/dev` metadata is applied after its device nodes exist, so creating them
+/// cannot change the recorded directory timestamp.
 fn apply_overlay(root: &Path) -> io::Result<()> {
     let tmp = root.join("tmp");
     ensure_directory(&tmp)?;
     set_metadata(&tmp, OVERLAY_TMP_MODE, (0, 0), 0, false)?;
     let dev = root.join("dev");
     ensure_directory(&dev)?;
-    set_metadata(&dev, OVERLAY_DIRECTORY_MODE, (0, 0), 0, false)?;
     for (name, (major, minor)) in [("null", DEV_NULL), ("zero", DEV_ZERO)] {
         let path = dev.join(name);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(invalid(format!(
-                    "cannot replace workload overlay device {name}: {error}"
-                )));
-            }
-        }
         mknod_device(&path, major, minor)?;
         set_metadata(&path, OVERLAY_DEVICE_MODE, (0, 0), 0, false)?;
     }
-    Ok(())
+    set_metadata(&dev, OVERLAY_DIRECTORY_MODE, (0, 0), 0, false)
 }
 
 fn ensure_directory(path: &Path) -> io::Result<()> {
@@ -832,12 +876,8 @@ fn verify_launch_target(
     root: &Path,
     launch: &LaunchIdentity,
 ) -> Result<(), (LaunchFailure, String)> {
-    let executable = resolve_in_root(root, &launch.executable).map_err(|error| {
-        (
-            LaunchFailure::Executable,
-            format!("workload executable is not usable: {error}"),
-        )
-    })?;
+    let executable = resolve_in_root(root, "the workload executable", &launch.executable)
+        .map_err(|error| (LaunchFailure::Executable, error.to_string()))?;
     let metadata = std::fs::symlink_metadata(&executable).map_err(|error| {
         (
             LaunchFailure::Executable,
@@ -857,12 +897,12 @@ fn verify_launch_target(
             "the workload executable has no execute permission".into(),
         ));
     }
-    let working = resolve_in_root(root, &launch.working_directory).map_err(|error| {
-        (
-            LaunchFailure::WorkingDirectory,
-            format!("workload working directory is not usable: {error}"),
-        )
-    })?;
+    let working = resolve_in_root(
+        root,
+        "the workload working directory",
+        &launch.working_directory,
+    )
+    .map_err(|error| (LaunchFailure::WorkingDirectory, error.to_string()))?;
     if !std::fs::symlink_metadata(&working)
         .map(|metadata| metadata.is_dir())
         .unwrap_or(false)
@@ -877,60 +917,36 @@ fn verify_launch_target(
 
 /// Resolve an absolute in-root path component by component, refusing any
 /// symbolic link in the path so a link cannot redirect the launch.
-fn resolve_in_root(root: &Path, value: &str) -> io::Result<PathBuf> {
-    validate_in_root(value)?;
+///
+/// Diagnostics name `field` and never echo the caller-provided path value.
+fn resolve_in_root(root: &Path, field: &str, value: &str) -> io::Result<PathBuf> {
+    if value.is_empty() || !value.starts_with('/') || value.contains('\0') {
+        return Err(invalid(format!("{field} is not an absolute in-root path")));
+    }
+    if value.split('/').any(|component| component == "..") {
+        return Err(invalid(format!("{field} escapes the workload root")));
+    }
     let mut current = root.to_path_buf();
     for component in value.split('/').filter(|part| !part.is_empty()) {
         current.push(component);
         let metadata = std::fs::symlink_metadata(&current)
-            .map_err(|error| invalid(format!("cannot access {value:?}: {error}")))?;
+            .map_err(|error| invalid(format!("cannot access {field}: {error}")))?;
         if metadata.is_symlink() {
-            return Err(invalid(format!("path {value:?} traverses a symbolic link")));
+            return Err(invalid(format!("{field} traverses a symbolic link")));
         }
     }
     Ok(current)
 }
 
-fn validate_in_root(value: &str) -> io::Result<()> {
-    if value.is_empty() || !value.starts_with('/') || value.contains('\0') {
-        return Err(invalid(format!(
-            "{value:?} is not an absolute in-root path"
-        )));
-    }
-    if value.split('/').any(|component| component == "..") {
-        return Err(invalid(format!("{value:?} escapes the workload root")));
-    }
-    Ok(())
-}
-
+/// Validate the launch identity against the shared, versioned launch contract.
+///
+/// The runtime deliberately does not re-implement the bounds or require
+/// `arguments[0]` to equal `executable`: OCI normalization canonicalizes the
+/// executable path while preserving the caller's argument vector, so the two
+/// may legitimately differ. Symlink-free resolution of the executed paths is a
+/// separate runtime concern handled by [`resolve_in_root`].
 fn validate_launch(launch: &LaunchIdentity) -> io::Result<()> {
-    validate_in_root(&launch.executable)?;
-    if launch.arguments.is_empty() {
-        return Err(invalid("the workload argument vector is empty"));
-    }
-    if launch.arguments[0] != launch.executable {
-        return Err(invalid(
-            "the workload argument vector does not begin with the executable",
-        ));
-    }
-    for argument in &launch.arguments {
-        if argument.contains('\0') {
-            return Err(invalid("a workload argument contains a NUL byte"));
-        }
-    }
-    for entry in &launch.environment {
-        if !entry.contains('=') || entry.contains('\0') {
-            return Err(invalid("a workload environment entry is not NAME=VALUE"));
-        }
-    }
-    validate_in_root(&launch.working_directory)?;
-    if launch.uid == 0 || launch.gid == 0 {
-        return Err(invalid("root credentials are not supported"));
-    }
-    if launch.uid == u32::MAX || launch.gid == u32::MAX {
-        return Err(invalid("the reserved owner identifier is not a credential"));
-    }
-    Ok(())
+    validate_launch_identity(launch)
 }
 
 // ---------------------------------------------------------------------------
@@ -1878,6 +1894,114 @@ mod tests {
         validate_template(&root.0, &RuntimeLimits::default()).unwrap();
     }
 
+    /// The runtime bound must be the canonical view bound the assembler
+    /// enforces, and it must count the template root like the assembler does,
+    /// so the runtime never rejects a template the assembler accepted.
+    #[test]
+    fn template_entry_bounds_match_the_canonical_view_bounds() {
+        assert_eq!(
+            RuntimeLimits::default().template_entries,
+            crate::workload::MAX_VIEW_ENTRIES
+        );
+        assert_eq!(
+            RuntimeLimits::default().template_path_bytes,
+            crate::workload::MAX_PATH_BYTES
+        );
+        assert_eq!(
+            RuntimeLimits::default().file_bytes,
+            crate::workload::MAX_FILE_BYTES
+        );
+
+        let root = template();
+        // `template()` has six entries below the root, so the root-inclusive
+        // count is seven.
+        let exact = RuntimeLimits {
+            template_entries: 7,
+            ..RuntimeLimits::default()
+        };
+        validate_template(&root.0, &exact).unwrap();
+        let one_short = RuntimeLimits {
+            template_entries: 6,
+            ..RuntimeLimits::default()
+        };
+        assert!(validate_template(&root.0, &one_short).is_err());
+    }
+
+    /// A template file is bounded by the canonical file bound, not by the
+    /// invocation's output budget: the two describe different things.
+    #[test]
+    fn the_copied_file_bound_is_independent_of_the_output_budget() {
+        let root = template();
+        let large = vec![0u8; 2 << 20];
+        std::fs::write(root.0.join("bin/large"), &large).unwrap();
+
+        let destination = TempDir::new();
+        let limits = RuntimeLimits {
+            output_bytes: 1 << 20,
+            ..RuntimeLimits::default()
+        };
+        copy_entries(&root.0, &destination.0, true, &limits)
+            .expect("a file within the canonical file bound must be copied");
+        assert_eq!(
+            std::fs::metadata(destination.0.join("bin/large"))
+                .unwrap()
+                .len(),
+            large.len() as u64
+        );
+
+        let destination = TempDir::new();
+        let limits = RuntimeLimits {
+            file_bytes: 1024,
+            ..RuntimeLimits::default()
+        };
+        let error = copy_entries(&root.0, &destination.0, true, &limits).unwrap_err();
+        assert!(error.to_string().contains("file bound"), "{error}");
+    }
+
+    /// Materialization must replace the overlay subtrees instead of copying
+    /// them, and it must leave the canonical directory timestamps intact.
+    #[test]
+    fn materialization_replaces_the_overlay_and_preserves_directory_timestamps() {
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: materializing the overlay needs root to create device nodes");
+            return;
+        }
+        let root = template();
+        // A directory below an overlay path is legal, but it must not survive
+        // into the invocation root, and it must not make the overlay fail.
+        std::fs::create_dir_all(root.0.join("tmp/nested")).unwrap();
+        std::fs::create_dir_all(root.0.join("dev/null")).unwrap();
+        set_metadata(&root.0, 0o755, (0, 0), 1_700_000_000, false).unwrap();
+        set_metadata(&root.0.join("dev"), 0o755, (0, 0), 1_600_000_000, false).unwrap();
+
+        let destination = TempDir::new();
+        materialize_into(&root.0, &destination.0, &RuntimeLimits::default()).unwrap();
+
+        use std::os::unix::fs::FileTypeExt;
+        let dev = destination.0.join("dev");
+        assert!(
+            std::fs::symlink_metadata(dev.join("null"))
+                .unwrap()
+                .file_type()
+                .is_char_device()
+        );
+        assert!(!destination.0.join("tmp/nested").exists());
+        // The overlay replaces `/dev` metadata, and creating its device nodes
+        // must not change it again.
+        assert_eq!(
+            unix_mtime(&std::fs::symlink_metadata(&dev).unwrap()),
+            0,
+            "the overlay must own the /dev timestamp"
+        );
+        // The canonical root timestamp is applied after the overlay.
+        assert_eq!(
+            unix_mtime(&std::fs::symlink_metadata(&destination.0).unwrap()),
+            1_700_000_000,
+            "creating the overlay must not change the canonical root timestamp"
+        );
+    }
+
     #[test]
     fn stat_flags_reads_the_field_after_the_last_command_terminator() {
         // The command name may contain spaces and parentheses, so only the
@@ -1920,6 +2044,14 @@ mod tests {
             },
             RuntimeLimits {
                 template_path_bytes: 0,
+                ..RuntimeLimits::default()
+            },
+            RuntimeLimits {
+                file_bytes: 0,
+                ..RuntimeLimits::default()
+            },
+            RuntimeLimits {
+                file_bytes: MAX_FILE_BYTES + 1,
                 ..RuntimeLimits::default()
             },
         ];
@@ -2004,20 +2136,93 @@ mod tests {
         root.uid = 0;
         assert!(validate_launch(&root).is_err());
 
+        let mut reserved = base.clone();
+        reserved.gid = u32::MAX;
+        assert!(validate_launch(&reserved).is_err());
+
         let mut empty = base.clone();
         empty.arguments.clear();
         assert!(validate_launch(&empty).is_err());
-
-        let mut mismatched = base.clone();
-        mismatched.arguments = vec!["/bin/other".into()];
-        assert!(validate_launch(&mismatched).is_err());
 
         let mut environment = base.clone();
         environment.environment = vec!["MODE".into()];
         assert!(validate_launch(&environment).is_err());
 
-        let mut relative_working = base;
+        let mut duplicate = base.clone();
+        duplicate.environment = vec!["MODE=a".into(), "MODE=b".into()];
+        assert!(validate_launch(&duplicate).is_err());
+
+        let mut relative_working = base.clone();
         relative_working.working_directory = "tmp".into();
         assert!(validate_launch(&relative_working).is_err());
+
+        let mut too_many_arguments = base.clone();
+        too_many_arguments.arguments = vec!["/bin/app".into(); crate::workload::MAX_ARGUMENTS + 1];
+        assert!(validate_launch(&too_many_arguments).is_err());
+
+        let mut oversized_argument = base.clone();
+        oversized_argument.arguments = vec![
+            "/bin/app".into(),
+            "x".repeat(crate::workload::MAX_ARGUMENT_BYTES + 1),
+        ];
+        assert!(validate_launch(&oversized_argument).is_err());
+
+        let mut too_many_environment = base.clone();
+        too_many_environment.environment =
+            vec!["A=1".into(); crate::workload::MAX_ENVIRONMENT_ENTRIES + 1];
+        assert!(validate_launch(&too_many_environment).is_err());
+
+        let mut oversized_environment = base.clone();
+        oversized_environment.environment = vec![format!(
+            "A={}",
+            "x".repeat(crate::workload::MAX_ENVIRONMENT_ENTRY_BYTES)
+        )];
+        assert!(validate_launch(&oversized_environment).is_err());
+
+        let mut non_absolute_first_argument = base.clone();
+        non_absolute_first_argument.arguments = vec!["app".into()];
+        assert!(validate_launch(&non_absolute_first_argument).is_err());
+    }
+
+    /// OCI normalization canonicalizes the executable while preserving the
+    /// caller's argument vector, so a first argument that differs from the
+    /// executable is a valid identity and must launch.
+    #[test]
+    fn launch_validation_accepts_a_normalized_executable_with_an_original_first_argument() {
+        let launch = LaunchIdentity {
+            executable: "/bin/app".into(),
+            arguments: vec!["/bin/./app".into(), "--serve".into()],
+            environment: vec!["MODE=test".into()],
+            working_directory: "/".into(),
+            uid: 65534,
+            gid: 65534,
+        };
+        validate_launch(&launch).unwrap();
+    }
+
+    /// The diagnostics travel to the host, so they must name the field instead
+    /// of echoing a caller-provided argument or environment value.
+    #[test]
+    fn launch_diagnostics_do_not_echo_caller_values() {
+        let secret = "hunter2-should-not-appear";
+        let launch = LaunchIdentity {
+            executable: "/bin/app".into(),
+            arguments: vec!["/bin/app".into()],
+            environment: vec![format!("MODE={secret}")],
+            working_directory: "/".into(),
+            uid: 65534,
+            gid: 65534,
+        };
+        validate_launch(&launch).unwrap();
+
+        let mut duplicate = launch.clone();
+        duplicate.environment = vec![format!("MODE={secret}"), format!("MODE={secret}")];
+        let error = validate_launch(&duplicate).unwrap_err().to_string();
+        assert!(!error.contains(secret), "{error}");
+
+        let mut bad = launch;
+        bad.environment = vec![format!("MODE{secret}")];
+        let error = validate_launch(&bad).unwrap_err().to_string();
+        assert!(!error.contains(secret), "{error}");
     }
 }
