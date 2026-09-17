@@ -487,7 +487,10 @@ fn record_workload_scenario(
 ) -> io::Result<RecordOutcome> {
     let (scenario, scenario_source) = WorkloadScenario::read(&options.scenario)?;
     let choices = scenario.choices(options.seed);
-    let store = options.runs_directory.join(WORKLOAD_STORE_NAME);
+    // The runs directory is an operational path the retained report replaces, so
+    // every path derived from it uses the same canonical form.
+    let runs_directory = fs::canonicalize(&options.runs_directory)?;
+    let store = runs_directory.join(WORKLOAD_STORE_NAME);
     let assembled = crate::workload::assemble(specification, &store)?;
     // Re-derive the workload from the raw closure that was just published, so
     // the identity the run records is the verified one rather than an assembly
@@ -514,7 +517,7 @@ fn record_workload_scenario(
     validate_workload_control_frames(&loaded.launch, &choices)?;
     let image = build_guest_image_with_assets(
         &options.executable,
-        &options.runs_directory,
+        &runs_directory,
         assets,
         Some(&loaded.template),
     )?;
@@ -2302,19 +2305,13 @@ fn require_private_cache(path: &Path, mode: u32, directory: bool) -> io::Result<
     if !expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "cached guest image entry has an unexpected file type: {}",
-                path.display()
-            ),
+            "a cached guest image entry has an unexpected file type",
         ));
     }
     if metadata.uid() != unsafe { libc::geteuid() } {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "cached guest image entry is not owned by the current user: {}",
-                path.display()
-            ),
+            "a cached guest image entry is not owned by the current user",
         ));
     }
     if metadata.permissions().mode() & 0o777 != mode {
@@ -2323,10 +2320,7 @@ fn require_private_cache(path: &Path, mode: u32, directory: bool) -> io::Result<
         if repaired.permissions().mode() & 0o777 != mode {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "cached guest image entry could not be made owner-only: {}",
-                    path.display()
-                ),
+                "a cached guest image entry could not be made owner-only",
             ));
         }
     }
@@ -3011,8 +3005,16 @@ fn sanitize_diagnostic_log(bytes: &[u8], private_paths: &[&Path]) -> Vec<u8> {
         if let Some(path) = path.to_str()
             && !path.is_empty()
         {
-            log = log.replace(&qemu_escape_path(path), "<private-path>");
-            log = log.replace(path, "<private-path>");
+            // A diagnostic can name the path plainly, with QEMU's comma
+            // escaping, or with Rust's debug escaping, so every representation is
+            // replaced.
+            for representation in [
+                qemu_escape_path(path),
+                path.to_owned(),
+                path.escape_debug().to_string(),
+            ] {
+                log = replace_private_path(&log, &representation);
+            }
         }
     }
     if log.len() <= MAX_FAILURE_TEXT_BYTES {
@@ -3023,6 +3025,32 @@ fn sanitize_diagnostic_log(bytes: &[u8], private_paths: &[&Path]) -> Vec<u8> {
         start += 1;
     }
     log.as_bytes()[start..].to_vec()
+}
+
+/// Replace one representation of a private path wherever it appears as a whole
+/// path. A longer unrelated name that merely starts with the private path is left
+/// alone, so the replacement cannot corrupt diagnostic text.
+fn replace_private_path(log: &str, representation: &str) -> String {
+    let mut result = String::with_capacity(log.len());
+    let mut rest = log;
+    while let Some(index) = rest.find(representation) {
+        let following = rest[index + representation.len()..].chars().next();
+        let complete = !following.is_some_and(|character| {
+            character.is_ascii_alphanumeric()
+                || character == '-'
+                || character == '_'
+                || character == '.'
+        });
+        result.push_str(&rest[..index]);
+        if complete {
+            result.push_str("<private-path>");
+        } else {
+            result.push_str(&rest[index..index + representation.len()]);
+        }
+        rest = &rest[index + representation.len()..];
+    }
+    result.push_str(rest);
+    result
 }
 
 fn qemu_escape_path(path: &str) -> String {
@@ -5894,8 +5922,32 @@ mod tests {
         let report = fs::read(bundle.join("failure.json")).unwrap();
         let text = String::from_utf8_lossy(&report);
         assert!(!text.contains("CANARY"), "{text}");
-        assert!(text.contains("<private-path>"), "{text}");
+        // The store rejection names a fixed label instead of the path.
+        assert!(text.contains("the workload store"), "{text}");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_path_replacement_covers_every_representation() {
+        // A diagnostic can name a private path plainly, with QEMU's comma
+        // escaping, or with Rust's debug escaping. A relative path is replaced
+        // just like an absolute one, and a longer unrelated name that merely
+        // starts with a private path must survive.
+        let escaped = "/tmp/esc\\aped";
+        let log = format!("runs-MARKER/.workload-store\n{escaped:?}/child\n/tmp/runner\n");
+        let sanitized = sanitize_diagnostic_log(
+            log.as_bytes(),
+            &[
+                Path::new("runs-MARKER"),
+                Path::new(escaped),
+                Path::new("/tmp/run"),
+            ],
+        );
+        let text = String::from_utf8_lossy(&sanitized);
+        assert!(!text.contains("MARKER"), "{text}");
+        assert!(text.contains("<private-path>/.workload-store"), "{text}");
+        assert!(text.contains("\"<private-path>\"/child"), "{text}");
+        assert!(text.contains("/tmp/runner"), "{text}");
     }
 
     #[test]

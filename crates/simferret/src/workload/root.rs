@@ -42,7 +42,9 @@ impl Root {
     /// is exactly what the owner-only requirement forbids.
     pub fn open_private(path: &Path) -> io::Result<Self> {
         let root = Self::open(path)?;
-        root.require_private(&rustix::fs::fstat(&root.fd)?, &path.display().to_string())?;
+        // The path is an operational host path, and this diagnostic reaches the
+        // shareable failure report, so the object is named by a fixed label.
+        root.require_private(&rustix::fs::fstat(&root.fd)?, "the workload store")?;
         Ok(root)
     }
 
