@@ -70,8 +70,22 @@ jobs:
           nix develop --command sudo --preserve-env=PATH,SIMFERRET_BUSYBOX \
             env SIMFERRET_PHASE2_TEST_BINARY="$binary" \
             ./scripts/rfd3-phase2-runtime.sh
+      - name: RFD 3 phase 4 guest-visible conformance
+        # The conformance check changes root, drops credentials, and creates
+        # device nodes, and its guest-wide cleanup barrier needs a private PID
+        # namespace, so the test binary is built unprivileged and then run as
+        # PID 1 under sudo.
+        run: |
+          binary="$(nix develop --command bash -c 'cargo test --locked --test rfd3_phase4 --no-run --message-format=json 2>/dev/null | jq -r "select(.reason == \"compiler-artifact\" and .target.name == \"rfd3_phase4\" and .executable != null) | .executable" | tail -1')"
+          test -x "$binary"
+          nix develop --command sudo --preserve-env=PATH,SIMFERRET_BUSYBOX \
+            env SIMFERRET_PHASE4_TEST_BINARY="$binary" \
+            ./scripts/rfd3-phase4-runtime.sh
       - run: nix develop --command ./scripts/phase4-acceptance-test.sh
-      - run: nix develop --command ./scripts/rfd3-phase3-acceptance.sh
+      # The Phase 4 acceptance runs the Phase 3 record-and-two-replay
+      # demonstration for both source forms and adds the assembly-cost,
+      # ambient-input, classification, and volume evidence.
+      - run: nix develop --command ./scripts/rfd3-phase4-acceptance.sh
       - run: nix develop --command ./scripts/qemu-replay-smoke.sh
       - run: nix develop --command ./scripts/qemu-network-replay-smoke.sh
       - run: nix develop --command ./scripts/phase4-acceptance.sh
@@ -79,7 +93,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-replay-diagnostics
-          # The Phase 3 run directories and the workload store carry the private
+          # The Phase 4 run directories and the workload store carry the private
           # replay closure, the exact workload streams, and the recorded launch
           # environment, so only the acceptance report, the process status, and
           # the shareable failure bundles are uploaded.
@@ -88,10 +102,14 @@ jobs:
             .poc/qemu-network-replay-smoke/
             .poc/phase4-acceptance/
             .poc/rfd3-phase1-evidence/
-            .poc/rfd3-phase3-acceptance/*/evidence.txt
-            .poc/rfd3-phase3-acceptance/*/*.status
-            .poc/rfd3-phase3-acceptance/*/*.duration-ns
-            .poc/rfd3-phase3-acceptance/*/*.stdout
-            .poc/rfd3-phase3-acceptance/*/*.stderr
-            .poc/rfd3-phase3-acceptance/*/*/failures/**
+            .poc/rfd3-phase4-acceptance/*/evidence.txt
+            .poc/rfd3-phase4-acceptance/*/*.status
+            .poc/rfd3-phase4-acceptance/*/*.duration-ns
+            .poc/rfd3-phase4-acceptance/*/*.stdout
+            .poc/rfd3-phase4-acceptance/*/*.stderr
+            .poc/rfd3-phase4-acceptance/*/phase3/run.*/*.status
+            .poc/rfd3-phase4-acceptance/*/phase3/run.*/*.duration-ns
+            .poc/rfd3-phase4-acceptance/*/phase3/run.*/*.stdout
+            .poc/rfd3-phase4-acceptance/*/phase3/run.*/*.stderr
+            .poc/rfd3-phase4-acceptance/*/phase3/run.*/*/failures/**
           if-no-files-found: ignore
