@@ -73,6 +73,45 @@ pub enum Command {
     Shutdown {},
 }
 
+impl Command {
+    /// The command's protocol tag, exactly as it is serialized, and never the
+    /// launch identity or input bytes a command may carry.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ConfigureNetwork { .. } => "configure_network",
+            Self::ActivateOutage { .. } => "activate_outage",
+            Self::RestoreNetwork { .. } => "restore_network",
+            Self::Request { .. } => "request",
+            Self::Check { .. } => "check",
+            Self::Start { .. } => "start",
+            Self::StdinWrite { .. } => "stdin_write",
+            Self::StdinEof { .. } => "stdin_eof",
+            Self::Terminate { .. } => "terminate",
+            Self::Shutdown { .. } => "shutdown",
+        }
+    }
+
+    /// The value-free coordinates of one command, for shareable failure
+    /// diagnostics.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Start { invocation, .. } => format!("start(invocation {invocation})"),
+            Self::StdinWrite {
+                invocation,
+                offset,
+                bytes,
+            } => format!(
+                "stdin_write(invocation {invocation}, offset {offset}, hex_bytes {})",
+                bytes.len()
+            ),
+            Self::StdinEof { invocation } => format!("stdin_eof(invocation {invocation})"),
+            Self::Terminate { invocation } => format!("terminate(invocation {invocation})"),
+            Self::Request { request_id, .. } => format!("request(request_id {request_id})"),
+            command => command.kind().to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestPhase {
@@ -171,6 +210,106 @@ pub enum Event {
         reaped: u64,
     },
     AgentStopped {},
+}
+
+impl Event {
+    /// The event's protocol tag, exactly as it is serialized.
+    ///
+    /// Failure diagnostics use this instead of the derived `Debug` output so a
+    /// shareable failure report names what diverged without carrying the launch
+    /// environment or exact stream bytes an event may hold.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::AgentReady { .. } => "agent_ready",
+            Self::NetworkConfigured { .. } => "network_configured",
+            Self::OutageActivated { .. } => "outage_activated",
+            Self::NetworkRestored { .. } => "network_restored",
+            Self::RequestAttempted { .. } => "request_attempted",
+            Self::RequestSucceeded { .. } => "request_succeeded",
+            Self::RequestUnavailable { .. } => "request_unavailable",
+            Self::AssertionsEvaluated { .. } => "assertions_evaluated",
+            Self::WorkloadStarted { .. } => "workload_started",
+            Self::InputAccepted { .. } => "input_accepted",
+            Self::TerminationRequested { .. } => "termination_requested",
+            Self::WorkloadOutput { .. } => "workload_output",
+            Self::WorkloadExited { .. } => "workload_exited",
+            Self::LaunchFailed { .. } => "launch_failed",
+            Self::CleanupComplete { .. } => "cleanup_complete",
+            Self::AgentStopped { .. } => "agent_stopped",
+        }
+    }
+
+    /// The value-free coordinates of one event: the fields a shareable failure
+    /// report may name, never a launch environment value, a stream byte, or a
+    /// free-form string a guest reported. A diverging frame can carry any bytes
+    /// in its string fields, so only tags, enums, and numeric coordinates are
+    /// named.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::WorkloadStarted { invocation, .. } => {
+                format!("workload_started(invocation {invocation})")
+            }
+            Self::InputAccepted {
+                invocation,
+                offset,
+                bytes,
+                eof,
+            } => format!(
+                "input_accepted(invocation {invocation}, offset {offset}, bytes {bytes}, eof {eof})"
+            ),
+            Self::TerminationRequested { invocation, signal } => {
+                format!("termination_requested(invocation {invocation}, signal {signal})")
+            }
+            Self::WorkloadOutput {
+                invocation,
+                stream,
+                offset,
+                sequence,
+                bytes,
+            } => format!(
+                "workload_output(invocation {invocation}, stream {}, offset {offset}, sequence {sequence}, hex_bytes {})",
+                stream.name(),
+                bytes.len()
+            ),
+            Self::WorkloadExited {
+                invocation,
+                stdout_bytes,
+                stderr_bytes,
+                frames,
+                ..
+            } => format!(
+                "workload_exited(invocation {invocation}, stdout_bytes {stdout_bytes}, stderr_bytes {stderr_bytes}, frames {frames})"
+            ),
+            Self::LaunchFailed {
+                invocation,
+                failure,
+                ..
+            } => format!("launch_failed(invocation {invocation}, failure {failure:?})"),
+            Self::CleanupComplete { invocation, reaped } => {
+                format!("cleanup_complete(invocation {invocation}, reaped {reaped})")
+            }
+            Self::NetworkConfigured { .. } => "network_configured".to_owned(),
+            Self::OutageActivated { .. } => "outage_activated".to_owned(),
+            Self::NetworkRestored { .. } => "network_restored".to_owned(),
+            Self::RequestAttempted { phase, .. } => {
+                format!("request_attempted(phase {phase:?})")
+            }
+            Self::RequestSucceeded { phase, .. } => {
+                format!("request_succeeded(phase {phase:?})")
+            }
+            Self::RequestUnavailable {
+                phase,
+                error,
+                errno,
+                ..
+            } => format!("request_unavailable(phase {phase:?}, error {error:?}, errno {errno:?})"),
+            Self::AssertionsEvaluated { report } => {
+                format!("assertions_evaluated(passed {})", report.passed)
+            }
+            Self::AgentReady {} => "agent_ready".to_owned(),
+            Self::AgentStopped {} => "agent_stopped".to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -361,7 +500,7 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<Opt
     reader.read_exact(&mut body)?;
     serde_json::from_slice(&body)
         .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .map_err(|error| crate::diagnostics::json_error("malformed frame", &error))
 }
 
 pub fn read_line_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<Option<T>> {
@@ -393,7 +532,7 @@ pub fn read_line_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Resul
     }
     serde_json::from_slice(&body)
         .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .map_err(|error| crate::diagnostics::json_error("malformed frame", &error))
 }
 
 pub fn read_acknowledged_line_frame<T: DeserializeOwned>(
@@ -432,7 +571,7 @@ pub fn read_acknowledged_line_frame<T: DeserializeOwned>(
     }
     serde_json::from_slice(&body)
         .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .map_err(|error| crate::diagnostics::json_error("malformed frame", &error))
 }
 
 pub fn require_version(version: u16) -> io::Result<()> {
@@ -619,6 +758,176 @@ mod tests {
             write_line_frame(&mut bytes, &event).unwrap();
             assert_eq!(read_line_frame(&mut bytes.as_slice()).unwrap(), Some(event));
         }
+    }
+
+    #[test]
+    fn event_and_command_tags_match_the_wire_and_descriptions_are_value_free() {
+        // Every launch-visible value, every byte payload, and every free-form
+        // string a guest reports carries a marker that must never appear in a
+        // shareable description.
+        const SECRETS: [&str; 10] = [
+            "SECRET-ARGUMENT",
+            "SECRET-ENVIRONMENT",
+            "SECRET-PAYLOAD",
+            "SECRET-RESPONSE",
+            "SECRET-OUTPUT",
+            "SECRET-DETAIL",
+            "SECRET-GATEWAY",
+            "SECRET-PEER",
+            "SECRET-REQUEST",
+            "SECRET-RULE",
+        ];
+        let launch = crate::workload::LaunchIdentity {
+            executable: "/bin/app".into(),
+            arguments: vec!["/bin/app".into(), "SECRET-ARGUMENT".into()],
+            environment: vec!["MODE=SECRET-ENVIRONMENT".into()],
+            working_directory: "/".into(),
+            uid: 65534,
+            gid: 65534,
+        };
+        let events = vec![
+            Event::AgentReady {},
+            Event::NetworkConfigured {
+                interface: "eth0".into(),
+                guest_cidr: "10.0.2.15/24".into(),
+                gateway: "SECRET-GATEWAY".into(),
+            },
+            Event::OutageActivated {
+                peer_cidr: "SECRET-PEER".into(),
+                rule: "SECRET-RULE".into(),
+            },
+            Event::NetworkRestored {
+                peer_cidr: "SECRET-PEER".into(),
+            },
+            Event::RequestAttempted {
+                request_id: "SECRET-REQUEST".into(),
+                payload: "SECRET-PAYLOAD".into(),
+                phase: RequestPhase::PreOutage,
+            },
+            Event::RequestSucceeded {
+                request_id: "SECRET-REQUEST".into(),
+                request_payload: "SECRET-PAYLOAD".into(),
+                response_id: "SECRET-REQUEST".into(),
+                response_payload: "SECRET-RESPONSE".into(),
+                phase: RequestPhase::PreOutage,
+            },
+            Event::RequestUnavailable {
+                request_id: "SECRET-REQUEST".into(),
+                phase: RequestPhase::Outage,
+                error: RequestError::AdministrativeProhibited,
+                errno: Some(libc::EACCES),
+            },
+            Event::AssertionsEvaluated {
+                report: crate::assertions::evaluate(&[], 1, 2),
+            },
+            Event::WorkloadStarted {
+                invocation: 1,
+                launch: launch.clone(),
+            },
+            Event::InputAccepted {
+                invocation: 1,
+                offset: 0,
+                bytes: 12,
+                eof: false,
+            },
+            Event::TerminationRequested {
+                invocation: 1,
+                signal: TERMINATION_SIGNAL,
+            },
+            Event::WorkloadOutput {
+                invocation: 1,
+                stream: OutputStream::Stdout,
+                offset: 0,
+                sequence: 1,
+                bytes: encode_bytes(b"SECRET-OUTPUT"),
+            },
+            Event::WorkloadExited {
+                invocation: 1,
+                exit: ProcessExit::Exited { code: 0 },
+                stdout_bytes: 13,
+                stdout_sha256: "0".repeat(64),
+                stderr_bytes: 0,
+                stderr_sha256: "0".repeat(64),
+                frames: 1,
+            },
+            Event::LaunchFailed {
+                invocation: 1,
+                failure: LaunchFailure::Executable,
+                detail: "SECRET-DETAIL".into(),
+            },
+            Event::CleanupComplete {
+                invocation: 1,
+                reaped: 2,
+            },
+            Event::AgentStopped {},
+        ];
+        for event in &events {
+            let value = serde_json::to_value(event).unwrap();
+            assert_eq!(value["type"].as_str().unwrap(), event.kind(), "{event:?}");
+            let described = event.describe();
+            for secret in SECRETS {
+                assert!(!described.contains(secret), "{described}");
+            }
+        }
+        let commands = vec![
+            Command::ConfigureNetwork {
+                interface: "eth0".into(),
+                guest_cidr: "10.0.2.15/24".into(),
+                gateway: "10.0.2.2".into(),
+            },
+            Command::ActivateOutage {
+                peer_cidr: "10.0.2.2/32".into(),
+            },
+            Command::RestoreNetwork {
+                peer_cidr: "10.0.2.2/32".into(),
+            },
+            Command::Request {
+                request_id: "request-0000".into(),
+                payload: "SECRET-PAYLOAD".into(),
+                phase: RequestPhase::PreOutage,
+            },
+            Command::Check {
+                outage_event_bound: 1,
+                liveness_event_bound: 2,
+            },
+            Command::Start {
+                invocation: 1,
+                launch,
+            },
+            Command::StdinWrite {
+                invocation: 1,
+                offset: 0,
+                bytes: encode_bytes(b"SECRET-OUTPUT"),
+            },
+            Command::StdinEof { invocation: 1 },
+            Command::Terminate { invocation: 1 },
+            Command::Shutdown {},
+        ];
+        for command in &commands {
+            let value = serde_json::to_value(command).unwrap();
+            assert_eq!(
+                value["type"].as_str().unwrap(),
+                command.kind(),
+                "{command:?}"
+            );
+            let described = command.describe();
+            for secret in SECRETS {
+                assert!(!described.contains(secret), "{described}");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_frames_never_quote_the_launch_identity() {
+        // The guest-agent command reads its command frames with `read_frame`, so a
+        // malformed launch field must not reach the CLI with its value intact.
+        let body = br#"{"protocol_version":1,"command_id":1,"command":{"type":"start","invocation":1,"launch":{"executable":"/bin/app","arguments":[],"environment":["MODE=ok"],"working_directory":"/","uid":"SECRET=frame-marker","gid":1}}}"#;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(body);
+        let error = read_frame::<CommandFrame>(&mut frame.as_slice()).unwrap_err();
+        assert!(!error.to_string().contains("frame-marker"), "{error}");
+        assert!(error.to_string().contains("malformed frame"), "{error}");
     }
 
     #[test]

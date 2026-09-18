@@ -271,7 +271,9 @@ root-owned mode-`01777` directory, `/dev` is root-owned mode `0755`, and
 `/dev/null` and `/dev/zero` are mode-`0666` character devices with fixed device
 numbers. A package entry at `/tmp` or `/dev` must be a directory and has its
 metadata replaced; a non-directory entry below either path collides and is
-rejected before any root is created.
+rejected during assembly, before any template is published, and again by the
+runtime before any root is created. A launch executable or working directory the
+overlay replacement would invalidate is refused at the same assembly boundary.
 
 The agent never changes its own root. It forks a child that receives only fresh
 standard pipes, closes every other inherited descriptor, changes root and then
@@ -306,7 +308,41 @@ sudo env "PATH=$PATH" SIMFERRET_BUSYBOX="$SIMFERRET_BUSYBOX" \
 
 Selecting the workload in `simferret run`, recording its identity in the run
 manifest, driving the live protocol from the scenario checker, and the recorded
-passive replay remain Phase 3 work.
+passive replay are implemented by the RFD 3 Phase 3 integration below.
+
+## RFD 3 workload scenario and passive replay
+
+`simferret run` accepts an optional `--workload SPECIFICATION`. When it is
+present the scenario is parsed as the versioned workload-driven acceptance
+scenario and the packaged workload, rather than the agent, originates every
+recorded request:
+
+```shell
+simferret run \
+  --workload workloads/example-binary.toml \
+  --scenario scenarios/rfd3-workload-acceptance.toml \
+  --seed 42
+```
+
+The workload specification and its raw source are normalized and published to a
+content-addressed store (`<runs-dir>/.workload-store`) before QEMU starts. The
+run manifest and a private owner-only `workload.lock` record the normalized
+workload identity, and replay re-derives that identity from the verified raw
+closure, so a derived cache entry alone is never enough.
+
+The host checker in `crates/simferret/src/checker.rs` owns application meaning.
+It reconstructs each invocation's streams from the recorded output frames, checks
+them against the exit record's independently reported totals and digests, matches
+the ordered response lines to the recorded input commands, and reports
+`process_safety`, `response_integrity`, `controlled_outage`, `restoration`, and
+`bounded_recovery`. The acceptance script builds the checked-in fixture once and
+packages it as a standalone binary, a converging local OCI layout, and a
+dynamically linked OCI layout, then records and passively replays each twice
+after deleting the live source:
+
+```shell
+./scripts/rfd3-phase3-acceptance.sh
+```
 
 ## Development
 

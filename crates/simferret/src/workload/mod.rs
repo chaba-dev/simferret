@@ -79,6 +79,57 @@ pub const MAX_TEMPLATE_BYTES: usize =
 
 pub use store::{assemble, load};
 
+/// The runtime overlay directories the guest runtime replaces with fresh
+/// metadata and content.
+const OVERLAY_TMP: &[u8] = b"tmp";
+const OVERLAY_DEV: &[u8] = b"dev";
+
+/// Reject a canonical tree whose package entries collide with the runtime
+/// overlay, or whose launch paths the overlay replacement would invalidate.
+///
+/// The guest runtime copies a template into a fresh root while skipping the
+/// `/tmp` and `/dev` subtrees, then synthesizes both directories itself. An entry
+/// at either path must therefore be a directory, nothing below them survives, and
+/// no launch path may depend on it. Enforcing this during assembly means a
+/// template the runtime would refuse is never published, and replay re-derives
+/// the same decision from the raw closure instead of reaching the runtime
+/// boundary with a template it will reject.
+pub fn validate_overlay_compatibility(tree: &Tree, launch: &LaunchIdentity) -> io::Result<()> {
+    let below_or_at = |path: &[u8]| {
+        path == OVERLAY_TMP
+            || path == OVERLAY_DEV
+            || path.starts_with(b"tmp/")
+            || path.starts_with(b"dev/")
+    };
+    for (path, entry) in tree.iter() {
+        if below_or_at(path) && entry.kind != EntryKind::Directory {
+            // The entry's path is a workload-controlled string, so the diagnostic
+            // names the fixed overlay subtree it collides with instead.
+            let overlay = if path.starts_with(OVERLAY_TMP) {
+                "/tmp"
+            } else {
+                "/dev"
+            };
+            return Err(invalid(format!(
+                "a workload entry below {overlay} collides with the runtime overlay"
+            )));
+        }
+    }
+    let executable = launch.executable.trim_start_matches('/');
+    if below_or_at(executable.as_bytes()) {
+        return Err(invalid(
+            "the workload executable is replaced by the runtime overlay",
+        ));
+    }
+    let working_directory = launch.working_directory.trim_start_matches('/');
+    if working_directory.starts_with("tmp/") || working_directory.starts_with("dev/") {
+        return Err(invalid(
+            "the workload working directory does not survive the runtime overlay",
+        ));
+    }
+    Ok(())
+}
+
 /// The native little-endian x86-64 program-header size the guest loader requires.
 const NATIVE_PROGRAM_HEADER_BYTES: usize = 56;
 /// The largest program table the guest loader accepts.
@@ -257,4 +308,87 @@ fn read_u64(bytes: &[u8], offset: usize) -> io::Result<u64> {
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn launch(executable: &str, working_directory: &str) -> LaunchIdentity {
+        LaunchIdentity {
+            executable: executable.into(),
+            arguments: vec![executable.into()],
+            environment: Vec::new(),
+            working_directory: working_directory.into(),
+            uid: 65534,
+            gid: 65534,
+        }
+    }
+
+    #[test]
+    fn a_malformed_specification_never_quotes_the_environment() {
+        // A TOML type error can quote the offending value, and an environment
+        // value is a secret, so the diagnostic must not carry it.
+        let source = b"version = 1\nkind = \"binary\"\npath = \"app\"\nargs = []\nenv = [\"SECRET=classification-marker\", 17]\nworking_directory = \"/\"\nuser = \"65534:65534\"\n";
+        let error = WorkloadSpec::parse(source).unwrap_err();
+        assert!(
+            !error.to_string().contains("classification-marker"),
+            "{error}"
+        );
+
+        // A syntax error must still name its location without the document text.
+        let syntax = b"version = 1\nkind = \"binary\n";
+        let error = WorkloadSpec::parse(syntax).unwrap_err();
+        assert!(error.to_string().contains("byte offset"), "{error}");
+    }
+
+    #[test]
+    fn overlay_collisions_are_refused_during_assembly() {
+        let mut tree = Tree::new();
+        tree.insert_default_directory(b".");
+        tree.insert_default_directory(b"tmp");
+        tree.insert_default_directory(b"dev");
+        assert!(validate_overlay_compatibility(&tree, &launch("/bin/app", "/")).is_ok());
+
+        let mut file_at_tmp = tree.clone();
+        file_at_tmp.insert(b"tmp".to_vec(), Entry::file(b"x".to_vec(), 0o644, 0, 0, 0));
+        assert!(validate_overlay_compatibility(&file_at_tmp, &launch("/bin/app", "/")).is_err());
+
+        // The colliding path is a workload-controlled string, so the diagnostic
+        // names the fixed subtree it collides with instead of the entry.
+        for (path, overlay) in [
+            (b"tmp/SECRET=overlay-marker".to_vec(), "/tmp"),
+            (b"dev/SECRET=overlay-marker".to_vec(), "/dev"),
+        ] {
+            let mut collided = tree.clone();
+            collided.insert(path, Entry::file(b"x".to_vec(), 0o644, 0, 0, 0));
+            let error =
+                validate_overlay_compatibility(&collided, &launch("/bin/app", "/")).unwrap_err();
+            assert!(!error.to_string().contains("overlay-marker"), "{error}");
+            assert!(
+                error.to_string().contains(&format!("below {overlay}")),
+                "{error}"
+            );
+        }
+
+        let mut link_below_tmp = tree;
+        link_below_tmp.insert(
+            b"tmp/link".to_vec(),
+            Entry::symlink(b"/etc/passwd".to_vec(), 0, 0, 0),
+        );
+        assert!(validate_overlay_compatibility(&link_below_tmp, &launch("/bin/app", "/")).is_err());
+    }
+
+    #[test]
+    fn launch_paths_the_overlay_invalidates_are_refused_during_assembly() {
+        let mut tree = Tree::new();
+        tree.insert_default_directory(b".");
+        tree.insert_default_directory(b"tmp");
+        // A working directory of `/tmp` is recreated by the overlay.
+        assert!(validate_overlay_compatibility(&tree, &launch("/bin/app", "/tmp")).is_ok());
+        // Nothing below it survives.
+        assert!(validate_overlay_compatibility(&tree, &launch("/bin/app", "/tmp/work")).is_err());
+        assert!(validate_overlay_compatibility(&tree, &launch("/tmp/app", "/")).is_err());
+        assert!(validate_overlay_compatibility(&tree, &launch("/dev/app", "/")).is_err());
+    }
 }

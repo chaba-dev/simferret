@@ -36,6 +36,7 @@ fn run() -> io::Result<u8> {
         Some(command) if command == "run" => {
             let mut scenario = None;
             let mut seed = None;
+            let mut workload = None;
             let mut runs_directory = PathBuf::from("runs");
             while let Some(option) = arguments.next() {
                 let value = arguments.next().ok_or_else(usage)?;
@@ -52,6 +53,9 @@ fn run() -> io::Result<u8> {
                                 .map_err(|_| usage())?,
                         );
                     }
+                    Some("--workload") if workload.is_none() => {
+                        workload = Some(PathBuf::from(value));
+                    }
                     Some("--runs-dir") => runs_directory = PathBuf::from(value),
                     _ => return Err(usage()),
                 }
@@ -67,6 +71,7 @@ fn run() -> io::Result<u8> {
                 runs_directory,
                 kernel,
                 executable: env::current_exe()?,
+                workload,
             })?;
             println!("run: {}", result.run_id);
             println!(
@@ -180,7 +185,7 @@ fn shell_quote(path: &std::path::Path) -> io::Result<String> {
 fn usage() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: simferret run --scenario PATH --seed N [--runs-dir PATH] | simferret replay RUN_DIRECTORY | simferret workload assemble --specification PATH --store PATH | simferret workload verify STORE | simferret guest-agent",
+        "usage: simferret run --scenario PATH --seed N [--workload SPECIFICATION] [--runs-dir PATH] | simferret replay RUN_DIRECTORY | simferret workload assemble --specification PATH --store PATH | simferret workload verify STORE | simferret guest-agent",
     )
 }
 

@@ -2905,7 +2905,10 @@ fn an_opaque_marker_may_not_traverse_a_lower_symlink() {
     write_spec(&temp.join("workload.toml"), &oci_spec("layout", &digest));
     let error = assemble(&temp.join("workload.toml"), &temp.join("store"))
         .expect_err("an opaque marker traversed a lower symlink");
-    assert!(error.to_string().contains("traverses symlink"), "{error}");
+    assert!(
+        error.to_string().contains("traverses a symbolic link"),
+        "{error}"
+    );
 }
 
 #[test]

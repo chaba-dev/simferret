@@ -6,7 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, ExitStatus, Output, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,9 @@ const CPU: &str = "qemu64";
 const MEMORY_MIB: u32 = 128;
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// The largest number of command bytes written before the writer waits for the
+/// corresponding acknowledgements.
+const COMMAND_WRITE_CHUNK_BYTES: usize = 16;
 const EVENT_TIMEOUT: Duration = Duration::from_secs(180);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(180);
 const QMP_MESSAGE_LIMIT: usize = 64 * 1024;
@@ -644,13 +647,13 @@ fn validate_identity_compatibility(expected: &VmIdentity, actual: &VmIdentity) -
     }
     let expected = serde_json::to_value(expected).map_err(io::Error::other)?;
     let actual = serde_json::to_value(actual).map_err(io::Error::other)?;
-    let (field, expected, actual) = first_identity_difference("vm", &expected, &actual)
+    let field = first_identity_difference("vm", &expected, &actual)
         .expect("unequal identities have a differing field");
+    // The differing value is artifact data and may be a private host path or an
+    // arbitrary recorded string, so the diagnostic names the field only.
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        format!(
-            "replay environment identity differs at {field}: expected {expected}, actual {actual}"
-        ),
+        format!("replay environment identity differs at {field}"),
     ))
 }
 
@@ -663,13 +666,11 @@ pub(crate) fn validate_replay_network_identity(
     }
     let expected = serde_json::to_value(&expected.network).map_err(io::Error::other)?;
     let actual = serde_json::to_value(actual).map_err(io::Error::other)?;
-    let (field, expected, actual) = first_identity_difference("vm.network", &expected, &actual)
+    let field = first_identity_difference("vm.network", &expected, &actual)
         .expect("unequal network identities have a differing field");
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        format!(
-            "replay environment identity differs at {field}: expected {expected}, actual {actual}"
-        ),
+        format!("replay environment identity differs at {field}"),
     ))
 }
 
@@ -677,13 +678,13 @@ fn first_identity_difference(
     path: &str,
     expected: &serde_json::Value,
     actual: &serde_json::Value,
-) -> Option<(String, String, String)> {
+) -> Option<String> {
     match (expected, actual) {
         (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => {
             for (name, expected_value) in expected {
                 let child = format!("{path}.{name}");
                 let Some(actual_value) = actual.get(name) else {
-                    return Some((child, expected_value.to_string(), "<missing>".into()));
+                    return Some(child);
                 };
                 if let Some(difference) =
                     first_identity_difference(&child, expected_value, actual_value)
@@ -694,19 +695,13 @@ fn first_identity_difference(
             actual
                 .iter()
                 .find(|(name, _)| !expected.contains_key(*name))
-                .map(|(name, value)| {
-                    (
-                        format!("{path}.{name}"),
-                        "<missing>".into(),
-                        value.to_string(),
-                    )
-                })
+                .map(|(name, _)| format!("{path}.{name}"))
         }
         (serde_json::Value::Array(expected), serde_json::Value::Array(actual)) => {
             for (index, expected_value) in expected.iter().enumerate() {
                 let child = format!("{path}[{index}]");
                 let Some(actual_value) = actual.get(index) else {
-                    return Some((child, expected_value.to_string(), "<missing>".into()));
+                    return Some(child);
                 };
                 if let Some(difference) =
                     first_identity_difference(&child, expected_value, actual_value)
@@ -714,16 +709,12 @@ fn first_identity_difference(
                     return Some(difference);
                 }
             }
-            actual.get(expected.len()).map(|value| {
-                (
-                    format!("{path}[{}]", expected.len()),
-                    "<missing>".into(),
-                    value.to_string(),
-                )
-            })
+            actual
+                .get(expected.len())
+                .map(|_| format!("{path}[{}]", expected.len()))
         }
         _ if expected == actual => None,
-        _ => Some((path.into(), expected.to_string(), actual.to_string())),
+        _ => Some(path.into()),
     }
 }
 
@@ -746,6 +737,13 @@ pub trait RunningVm {
     fn identity(&self) -> &VmIdentity;
     fn send(&mut self, command: &CommandFrame) -> io::Result<()>;
     fn receive(&mut self) -> io::Result<EventFrame>;
+    /// Return the next already-queued event without waiting for one.
+    ///
+    /// The workload driver drains queued events before issuing a command, so an
+    /// invocation that has already exited stops the drive instead of racing the
+    /// command against a released invocation. A closed channel is still an
+    /// error, because it means the guest ended without its shutdown handshake.
+    fn try_receive(&mut self) -> io::Result<Option<EventFrame>>;
     fn finish_events(&mut self) -> io::Result<()>;
     fn wait(&mut self) -> io::Result<ExitStatus>;
 }
@@ -1092,23 +1090,30 @@ fn write_serial_command(
     }
     bytes.push(b'\n');
     let deadline = Instant::now() + timeout;
-    for byte in bytes {
-        output.write_all(&[byte])?;
+    // The frame is written in bounded chunks rather than one byte per
+    // acknowledgement. The guest still acknowledges every byte it consumes, so
+    // the flow-control contract is unchanged, but the round trip that used to be
+    // paid for every byte is paid once per chunk. That matters once a workload is
+    // live, where a control round trip can take tens of milliseconds.
+    for chunk in bytes.chunks(COMMAND_WRITE_CHUNK_BYTES) {
+        output.write_all(chunk)?;
         output.flush()?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match acknowledgements.recv_timeout(remaining) {
-            Ok(()) => {}
-            Err(RecvTimeoutError::Timeout) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out waiting for guest serial acknowledgement",
-                ));
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "guest serial acknowledgement channel disconnected",
-                ));
+        for _ in 0..chunk.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match acknowledgements.recv_timeout(remaining) {
+                Ok(()) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for guest serial acknowledgement",
+                    ));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "guest serial acknowledgement channel disconnected",
+                    ));
+                }
             }
         }
     }
@@ -1150,7 +1155,7 @@ fn read_serial_event(
     }
     serde_json::from_slice(&body)
         .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .map_err(|error| crate::diagnostics::json_error("malformed event frame", &error))
 }
 
 struct CommandWriter {
@@ -1256,12 +1261,28 @@ impl RunningVm for QemuVm {
         }
     }
 
+    fn try_receive(&mut self) -> io::Result<Option<EventFrame>> {
+        match self.events.try_recv() {
+            Ok(Ok(Some(event))) => Ok(Some(event)),
+            Ok(Ok(None)) => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "guest event channel closed",
+            )),
+            Ok(Err(error)) => Err(error),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "guest event reader disconnected",
+            )),
+        }
+    }
+
     fn finish_events(&mut self) -> io::Result<()> {
         match self.events.recv_timeout(EVENT_TIMEOUT) {
             Ok(Ok(None)) => Ok(()),
             Ok(Ok(Some(event))) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unexpected event after shutdown: {event:?}"),
+                format!("unexpected {} after shutdown", event.event.describe()),
             )),
             Ok(Err(error)) => Err(error),
             Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
@@ -2144,7 +2165,7 @@ time.sleep(30)
     }
 
     #[test]
-    fn actual_replay_network_mismatch_has_field_and_values() {
+    fn actual_replay_network_mismatch_names_the_field_only() {
         let root = network_test_root("actual-mismatch");
         fs::create_dir_all(&root).unwrap();
         let mut actual = network_config(&root);
@@ -2158,8 +2179,9 @@ time.sleep(30)
         };
         let message = error.to_string();
         assert!(message.contains("vm.network.nic.mac_address"), "{message}");
-        assert!(message.contains("52:54:00:12:34:56"), "{message}");
-        assert!(message.contains("52:54:00:12:34:57"), "{message}");
+        // The differing value is artifact data, so it is never quoted.
+        assert!(!message.contains("52:54:00:12:34:56"), "{message}");
+        assert!(!message.contains("52:54:00:12:34:57"), "{message}");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2216,7 +2238,7 @@ time.sleep(30)
     }
 
     #[test]
-    fn identity_mismatch_reports_the_first_field_with_both_values() {
+    fn identity_mismatch_reports_the_first_field_only() {
         let root = network_test_root("identity");
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::create_dir_all(root.join("share/qemu")).unwrap();
@@ -2247,8 +2269,10 @@ time.sleep(30)
         let error = validate_identity_compatibility(&expected, &actual).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("vm.network.nic.mac_address"), "{message}");
-        assert!(message.contains("52:54:00:12:34:57"), "{message}");
-        assert!(message.contains("52:54:00:12:34:56"), "{message}");
+        // Neither side of the comparison is quoted, because a recorded identity
+        // can carry an arbitrary string or a private host path.
+        assert!(!message.contains("52:54:00:12:34:57"), "{message}");
+        assert!(!message.contains("52:54:00:12:34:56"), "{message}");
         fs::remove_dir_all(root).unwrap();
     }
 

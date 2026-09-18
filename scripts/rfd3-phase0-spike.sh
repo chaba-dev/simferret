@@ -261,7 +261,7 @@ verify_serial() {
   for line in \
     'ready version=1' \
     'echo value=asymmetric_42' \
-    'state value=fresh' \
+    'state value=fresh root=fresh' \
     'descendant state=escaped' \
     'stopped status=0' \
     'supervisor workload_status=0' \

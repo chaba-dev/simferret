@@ -47,8 +47,8 @@ no interpreter program header. A host-side protocol smoke produced:
 ----
 ready version=1
 echo value=asymmetric_42
-state value=fresh
-state value=stale
+state value=fresh root=fresh
+state value=stale root=stale
 stopped status=0
 ----
 
@@ -74,24 +74,24 @@ The captured measurements and identities are:
 | Object | Bytes | SHA-256
 
 | Fixture source
-| 8,049
-| `c7958b06f3ddbd292f8abd9b0466afa04e3afef13e5e5f7f219d1da37d1c2305`
+| 8,888
+| `34161feb2f7c3f8c28deef21dcf51a92e6f02df23cfe9e6bb3a62f730faf5a83`
 
 | Standalone executable
-| 70,760
-| `d54d4b2a92ace28707ce282a9734fbcdfec0cf30cf1bf0c4c7102bf7d95b6e5c`
+| 70,912
+| `582a51e4c5ed835752fa84809a8b5a2f5ecdf49736be7d93d72a6c23d069243f`
 
 | OCI config
 | 276
-| `63234a974712b148203f72a3336392013f55ab3505d032eaba829567ca229692`
+| `c7a8a586a744a35527d1e37cb3ebc9233d488b567ef5d58c115b59dd40bd7650`
 
 | OCI manifest
 | 399
-| `a143552c9fc2c01504eeb7c531d5661c4ab139fc488ca2175746e024787ee429`
+| `399efbdb79b760c5babc749882b385b36d6a8db1c5f68ecb411f76030aeb4e6d`
 
 | OCI layer and DiffID
 | 81,920
-| `f18056523d5c0125fffaf16b26766c7160fa01ef38a047a9cda41ae5a92dcbab`
+| `e80ac2d42a82e47fb34715c714da972d1aa4bf5e08bea87ffb3921d7ad230550`
 |===
 
 The complete five-file OCI layout is 82,932 bytes. These observations establish
@@ -161,14 +161,14 @@ path. Both are little-endian x86-64 Linux ELF executables.
 | Source object | Bytes | Interpreter | SHA-256
 
 | Static executable
-| 70,760
+| 70,912
 | none
-| `d54d4b2a92ace28707ce282a9734fbcdfec0cf30cf1bf0c4c7102bf7d95b6e5c`
+| `582a51e4c5ed835752fa84809a8b5a2f5ecdf49736be7d93d72a6c23d069243f`
 
 | Dynamic executable
-| 17,464
+| 21,648
 | `/lib64/ld-linux-x86-64.so.2`
-| `564436ee235a187b6cd77c30331a66a4d65b243d5ab8aa23a3cabc0e27f9c227`
+| `37cb51e280ffddd038442c878db111b407261f414ecbbdda3fcc6d025e18f1db`
 
 | In-image loader
 | 263,056
@@ -191,23 +191,23 @@ dynamic workload executed from its in-image loader and library closure.
 
 | Static, one uncompressed layer
 | 82,862
-| `sha256:a143552c9fc2c01504eeb7c531d5661c4ab139fc488ca2175746e024787ee429`
+| `sha256:399efbdb79b760c5babc749882b385b36d6a8db1c5f68ecb411f76030aeb4e6d`
 
 | Dynamic, gzip base layer plus uncompressed upper layer
-| 1,161,232
-| `sha256:a4247157fc885f8240537a0438859f66bf87035c299ba3c68ed688fc4d533440`
+| 1,171,472
+| `sha256:846176de46401217327ea8e25c3268f5ce46a3835b8308ddb91fe2a83cb18ad8`
 
 | Layer-semantics, two uncompressed layers
 | 113,807
-| `sha256:2b5049c261612fe971e11d4fcde29ebea2290fa84006d6045e634c8cd56602a0`
+| `sha256:0125b5e9911fcf46bb1af087942366823e37431e82bf63fbae9fca5ca9c932bc`
 
 | Root-opacity, two uncompressed layers
 | ---
-| `sha256:52ca65520ee15a147a6f837765114fcf3b4829d9e4dbe679f1b6141a874333ff`
+| `sha256:144d0c9fb7bd1486b2b922c04634d8173f80ac173c59c0969ceeecd54ccf6215`
 |===
 
 The static layout reproduces the entry gate's config and manifest digests
-exactly (`63234a97...` and `a143552c...`), which confirms the canonical JSON and
+exactly (`c7a8a586...` and `399efbdb...`), which confirms the canonical JSON and
 layer encoding are reproducible across independent generators. The entry gate's
 index annotation changes only `index.json` and therefore neither digest.
 
@@ -299,22 +299,22 @@ same limitation RFD 3 records for content digests generally.
 | Source | Raw bytes | Expanded bytes | Canonical digest | Assembly
 
 | Binary
-| 70,932
-| 70,760
-| `a94f6f18...fe8da3c1`
-| 68.1 ms
+| 71,084
+| 70,912
+| `9190efc1...2ee9e4af`
+| 69.6 ms
 
 | Static OCI
 | 82,862
-| 70,760
-| `a94f6f18...fe8da3c1`
-| 69.0 ms
+| 70,912
+| `9190efc1...2ee9e4af`
+| 71.7 ms
 
 | Dynamic OCI
-| 1,161,232
-| 2,685,424
-| `37967c0d...5ff32a273`
-| 92.6 ms
+| 1,171,472
+| 2,689,608
+| `773718c1...cd4b10ca6`
+| 97.1 ms
 |===
 
 The standalone static executable and the static OCI layout converged on the
@@ -343,36 +343,35 @@ empty initramfs.
 | Source | Initramfs bytes | Growth over baseline | Workload tree bytes | Record | Replay 1 | Replay 2
 
 | Binary
-| 52,336
-| 31,397
-| 70,760
-| 6.66 s
-| 12.79 s
-| 12.75 s
+| 53,079
+| 32,078
+| 70,912
+| 6.20 s
+| 10.71 s
+| 10.80 s
 
 | Static OCI
-| 52,337
-| 31,398
-| 70,760
-| 6.27 s
-| 10.26 s
-| 10.24 s
+| 53,080
+| 32,079
+| 70,912
+| 6.28 s
+| 10.96 s
+| 10.86 s
 
 | Dynamic OCI
-| 1,172,605
-| 1,151,666
-| 2,685,424
-| 6.63 s
-| 11.82 s
-| 11.84 s
+| 1,172,482
+| 1,151,481
+| 2,689,608
+| 6.01 s
+| 9.27 s
+| 9.35 s
 |===
 
-The workload-free baseline is 20,939 bytes. Replay logs were 10,488,297,
-7,578,583, and 10,066,941 bytes. Record serial streams had SHA-256 digests
-`a5bce29a...a3cc6c565`, `e3ad35b9...432f06702`, and `e9ab5d7e...20b150cb`; both
-replays of each source matched their record byte for byte, and those digests are
-unchanged from the pre-fix runs, so the supervisor's concurrent draining
-preserved the guest-visible output exactly. The initramfs is smaller than the
+The workload-free baseline is 21,001 bytes. Replay logs were 8,523,815,
+8,134,856, and 5,835,881 bytes. Record serial streams had SHA-256 digests
+`cc564e42...5ccc0bddafa`, `da3b4c38...cc73b0141b6`, and `328bb993...6af86a4aaf4c31`; both
+replays of each source matched their record byte for byte, so the supervisor's
+concurrent draining preserved the guest-visible output exactly. The initramfs is smaller than the
 workload tree for the static sources because the archive is gzip-compressed.
 Repeated independent runs reproduced every canonical digest and serial digest
 exactly; only durations and replay-log sizes moved with host scheduling, so no
@@ -427,7 +426,7 @@ materialized, and each left no partial directory:
 | `layer 0 descriptor digest does not match stored bytes`
 
 | Missing stored blob
-| `cannot open file 'blobs/sha256/f1805652...a92dcbab'`
+| `cannot open file 'blobs/sha256/e80ac2d4...d7ad230550'`
 
 | Nonempty whiteout marker
 | `whiteout marker at '.wh.victim' is not an empty regular file`
@@ -441,6 +440,17 @@ materialized, and each left no partial directory:
 | Whiteout marker that is not a basename
 | `whiteout marker '.wh.a' is not a basename`
 |===
+
+The rejections above are the Phase 0 prototype's observed output, kept verbatim
+as spike evidence. The shipped assembler refuses the same constructs with
+value-free diagnostics: every layer rejection names the layer and member position
+plus a fixed category (`absolute layer paths are unsupported`, `layer paths must
+not contain '..' components`, `a layer contains duplicate normalized paths`,
+`a layer marker traverses a symbolic link`, `layer 0 member 3 has an unsupported
+mode`, `layer 0 member 3 is a hard link, which is unsupported`, and so on), never
+the path, media type, link target, or raw header field that caused it. The tar
+parser's own errors, which quote the pathname and the invalid numeric field, are
+reduced to fixed context for the same reason.
 
 The prototype also rejects FIFOs, sockets, sparse files, empty or malformed
 digests, empty manifests, numeric metadata outside its serializable range, an
@@ -636,34 +646,34 @@ A representative run produced:
 | Measurement | Value
 
 | Fixture source SHA-256
-| `c7958b06...37d1c2305`
+| `34161feb...30faf5a83`
 
 | Static executable
-| 70,760 bytes, `d54d4b2a...f7d95b6e5c`
+| 70,912 bytes, `582a51e4...d069243f`
 
 | OCI layout
-| 82,854 bytes, selected manifest `sha256:69aa8d92...4773d34186f`
+| 82,854 bytes, selected manifest `sha256:3fa49528...c0798493`
 
 | Binary canonical / tree / template
-| `2fce0cfb...0a3c8faead` / `8b2c67a9...7c47d07f` / `10885d3e...da153c83`
+| `bfb6c8c9...87f8c91` / `0f30f1ef...0c7ccfe66` / `cc1946f3...4eac1db6`
 
 | OCI canonical / tree / template
 | identical to the binary source
 
 | Binary closure
-| `5c9368fe...00a4336635` (2 raw objects)
+| `2ad827ac...3f6e93e62` (2 raw objects)
 
 | OCI closure
-| `52bf3413...6d98b8bc` (5 raw objects)
+| `671b85dc...c312751ca` (5 raw objects)
 
 | Canonical entries / expanded bytes
-| 3 / 70,760 for both sources
+| 3 / 70,912 for both sources
 
 | Assembly duration (both sources)
-| 30.2 ms warm, 979 ms cold; durations move with host scheduling
+| 23.6 ms warm; durations move with host scheduling
 
 | Store bytes (binary / OCI)
-| 144,106 / 156,685
+| 144,410 / 156,837
 
 | Re-assembly
 | byte-identical summary and closure
@@ -1229,3 +1239,477 @@ assertions, and the run manifest's workload identity remain Phase 3 work, and so
 does a recorded QEMU acceptance of this runtime: the checked-in phase 2 evidence
 is the host PID-namespace script above. The runtime reports no throughput or
 security claim beyond the accepted profile.
+
+== Phase 3 scenario and passive replay integration
+
+Phase 3 wires the assembled workload into the run pipeline. `simferret run` gains
+an optional `--workload SPECIFICATION`; when it is present the scenario is parsed
+as the versioned workload-driven acceptance scenario and the packaged workload,
+not the agent, originates every recorded request. The normalized workload
+identity is recorded in the run manifest and in a private `workload.lock`
+artifact, and replay re-derives it from the raw closure before QEMU starts.
+
+The host checker (`crates/simferret/src/checker.rs`) owns all application
+meaning. It folds the recorded events into a process and stream trace, checks
+each invocation's reconstructed stdout and stderr against the exit record's
+independently reported totals and digests, matches the ordered response lines to
+the recorded input commands, and evaluates five properties: `process_safety`,
+`response_integrity`, `controlled_outage`, `restoration`, and
+`bounded_recovery`. The guest agent still reports process and byte facts only.
+
+The acceptance fixture is the checked-in `poc/rfd3-workload/main.c`. It answers
+`echo`, reports whether its root already carried a previous invocation's marker,
+spawns an escaped `setsid` descendant that retains the output descriptor, fetches
+a named fixture file over TFTP from `10.0.2.2`, and exits on end of input. The
+same source is compiled once and packaged three ways:
+
+* a standalone fixed-address static binary workload;
+* a local `linux/amd64` OCI image layout carrying the same executable at the
+  binary profile's canonical install path, so both forms converge on one
+  canonical tree; and
+* a focused dynamically linked OCI layout whose executable, interpreter
+  (`/lib64/ld-linux-x86-64.so.2`), and `libc.so.6` closure exist only in the
+  image.
+
+The seeded workload choice plan adds a process-fault request index alongside the
+outage and restoration indices, and requires at least four requests so the fault
+is always strictly inside the sequence and distinct from both transitions.
+
+=== Checked-in evidence command
+
+[source,shell]
+----
+./scripts/rfd3-phase3-acceptance.sh
+----
+
+For each source form the script records the acceptance scenario, records the
+same scenario with a corrupted fixture response, removes the entire live source
+directory, passively replays the recording twice, and checks that a
+self-consistently changed workload lock, a changed derived cache entry, a missing
+raw closure, and a removed closure-referenced raw object are each refused before
+QEMU starts. It also requires two fresh-root witnesses per form, and requires the
+run directory, the guest image cache, and the workload store to be owner-only. A
+representative unprivileged run produced:
+
+[source,text]
+----
+qemu_version=QEMU emulator version 11.1.0
+kernel=/nix/store/s40h0m3746r0l287laa9sxa9345bkykf-linux-6.18.49/bzImage
+static_fixture_sha256=582a51e4c5ed835752fa84809a8b5a2f5ecdf49736be7d93d72a6c23d069243f
+dynamic_fixture_sha256=37cb51e280ffddd038442c878db111b407261f414ecbbdda3fcc6d025e18f1db
+dynamic_interpreter=/lib64/ld-linux-x86-64.so.2
+static_manifest_digest=sha256:3fa49528561cec23ff1f30d929a6362f2240add059f6a197b53073c0c0798493
+dynamic_manifest_digest=sha256:846176de46401217327ea8e25c3268f5ce46a3835b8308ddb91fe2a83cb18ad8
+binary_canonical=bfb6c8c9fe7ee7f612dca4b0dc76695c826ec2970bca968b3a401c21087f8c91
+binary_closure=2ad827acc0e604d1f806ba18a4e0930fddfaf7cb67916b4694d74873f6e93e62
+binary_record_duration_ns=9120231509
+binary_replay_1_duration_ns=15285330573
+binary_replay_2_duration_ns=15489995932
+binary_store_bytes=144410
+binary_initramfs_bytes=2187979
+binary_semantic_outcome=40431f4144c9aca39048191fff665b896b796cd68f3646d76ef6fdceb1be08bb
+binary_events=36
+binary_replay_log_bytes=6612322
+oci-static_canonical=bfb6c8c9fe7ee7f612dca4b0dc76695c826ec2970bca968b3a401c21087f8c91
+oci-static_closure=671b85dca94869d0f8e7b8a820bcd3892ea7334883ab5d95b3d4c1fc312751ca
+oci-static_record_duration_ns=20045197096
+oci-static_replay_1_duration_ns=27262514510
+oci-static_replay_2_duration_ns=27370961242
+oci-static_store_bytes=156837
+oci-static_initramfs_bytes=2187979
+oci-static_semantic_outcome=40431f4144c9aca39048191fff665b896b796cd68f3646d76ef6fdceb1be08bb
+oci-static_events=36
+oci-static_replay_log_bytes=8711357
+oci-dynamic_canonical=445d1445fe4532202a9860803cd6aaeb45e223125a9970a44a6b70cf7e9daf89
+oci-dynamic_closure=65fce5916519c4c9ec6cef0f0abcbe130823d4cbffd7598c11f2d1eee717868d
+oci-dynamic_record_duration_ns=16260407970
+oci-dynamic_replay_1_duration_ns=23074207592
+oci-dynamic_replay_2_duration_ns=23194709343
+oci-dynamic_store_bytes=3865319
+oci-dynamic_initramfs_bytes=3308963
+oci-dynamic_semantic_outcome=226712a5057bc1b95e9273b463c44e1ca58b05ff5c383bd63cf908034e4b6f04
+oci-dynamic_events=36
+oci-dynamic_replay_log_bytes=7682064
+intentional_divergence=process_safety and response_integrity failed with CLI status 1
+workload_lock_tamper_error=simferret: the workload lock identity differs from the manifest
+derived_template_tamper_error=simferret: derived guest template does not match the raw closure
+missing_raw_closure_error=simferret: raw closure raw/closure.json is missing
+missing_raw_object_error=simferret: raw object sha256:582a51e4c5ed835752fa84809a8b5a2f5ecdf49736be7d93d72a6c23d069243f is missing
+private_artifacts=run directory, guest image cache, and workload store are owner-only
+fresh_root_witnesses=state value=fresh root=fresh observed once per invocation
+----
+
+The standalone binary and static OCI sources converge on one canonical digest
+(`bfb6c8c9...`) and one semantic outcome digest (`40431f41...`), and both replay
+twice with byte-identical normalized events and assertions. The dynamically
+linked OCI source has its own canonical tree (`445d1445...`), executes from the
+in-image interpreter and library closure, and replays twice with its own stable
+semantic outcome digest. Every replay begins after the form's whole source
+directory has been removed, so no live source, registry, daemon, host mount, or
+fixture interaction participates. Intentional response corruption makes
+`process_safety` and `response_integrity` fail and returns CLI status 1 for both
+source forms. Each form also reports the strengthened fresh-root witness twice,
+proves its run directory, guest image cache, and store are owner-only, and names
+the missing raw evidence in both tamper cases.
+
+=== Two integration fixes
+
+Two pre-existing behaviours only became observable once a workload was live, and
+both were fixed in this phase:
+
+* `Runtime::terminate` closed the child's standard input before signalling. A
+  workload that treats end of input as a clean exit left the process before the
+  fixed `SIGKILL` landed, so the exit record reported `exited` instead of the
+  requested termination. The signal is now delivered first and the queued input
+  is dropped in the same critical section, so the command is unconditional as
+  documented and no later poll can write to a pipe whose readers are gone.
+* The host command writer wrote one byte and waited for one acknowledgement per
+  byte. That round trip costs roughly 30ms once a workload is live under the
+  pinned TCG/icount profile, so a 250-byte workload command could not complete
+  inside the command deadline. The writer now writes bounded 16-byte chunks (the
+  guest UART FIFO depth) and waits for the same number of acknowledgements, so
+  the guest still acknowledges every byte it consumes while the round trip is
+  paid once per chunk. Record duration dropped from a timeout to about 14s and
+  replay to about 22s. A larger chunk overran the guest serial FIFO and
+  corrupted the control stream, which is why the chunk is pinned to the FIFO
+  depth.
+
+=== Assembly-time overlay compatibility and artifact classification
+
+The runtime overlay rules moved into assembly: `validate_overlay_compatibility`
+refuses a canonical tree with a non-directory entry at or below `/tmp` or
+`/dev`, and refuses a launch executable or working directory the overlay
+replacement would invalidate. Assembly and replay both apply it, so a template
+the runtime would refuse is never published and replay re-derives the same
+decision from the raw closure instead of failing at the runtime boundary.
+
+The run directory and the host-written run artifacts are owner-only (`0700` and
+`0600`): they carry the recorded launch environment, the exact workload stream
+bytes, and the private replay closure. The shareable failure bundle is a separate
+directory and carries bounded protocol metadata, counts, digests, and typed
+errors only; a regression test asserts that neither the recorded environment
+value nor a recorded workload output line appears anywhere in it. The sanitizer
+replaces every private path it knows — the staging directory, the runtime
+directory, and the whole runs directory, which holds the workload store, the
+guest image cache, and the run artifacts — with a fixed `<private-path>` label,
+so a diagnostic that names one of them cannot carry the operator's own path into
+the shareable report. Every representation is covered, because the path can be
+relative, QEMU comma-escaped, or Rust debug-escaped, and the replacement only
+applies at a path boundary so an unrelated longer name that shares a prefix
+survives. The store and cache rejections do not render the path at all: they name
+the object with a fixed label, and the record path derives the store and cache
+from the canonicalized runs directory.
+
+=== Adversarial review hardening
+
+The first adversarial review of the Phase 3 stack found fifteen issues, and every
+one of them was addressed in the same phase rather than deferred:
+
+* *Value-free diagnostics.* Every divergence, envelope, and parser diagnostic now
+  names the event kind and its non-secret coordinates (invocation, stream,
+  offsets, byte lengths, digests) instead of formatting whole events, commands,
+  or environment entries. A divergence or a malformed `NAME=VALUE` entry can no
+  longer put the recorded launch environment or exact stream bytes into
+  `failure.json` or the CLI error text. `Event::kind`/`Event::describe` and
+  `Command::kind`/`Command::describe` are the single source of those
+  descriptions, and a protocol unit test pins the tag names against the wire form
+  and asserts that no marker value survives. Parser failures are reduced by
+  `crates/simferret/src/diagnostics.rs`: a private artifact reports only a
+  category and a location, and a user-authored specification or scenario reports
+  only a location as well, because both serde and TOML format the offending value
+  with escaping a redactor cannot reliably undo. The generic frame readers, the
+  retained canonical specification, and the surplus-event diagnostic all use the
+  same reduction, and canaries place the secret in the offending value itself,
+  including one that embeds the delimiter the parser quotes it with. Semantic
+  launch validation is value-free too: the user, working directory, executable
+  argument, digest, and manifest-descriptor diagnostics name the field and the
+  expected shape rather than the value, the working-directory and executable
+  paths map the layer-path helper's value-bearing error onto a field-specific
+  one, and the recorded OCI manifest digest is validated before it can be named.
+  Record-path canaries assert that neither the CLI text nor the shareable failure
+  bundle carries a marker placed in those fields, including a traversal path.
+  Guest-reported free-form strings are not descriptions either: a diverging
+  `network-configured`, `outage-activated`, `network-restored`, or request event
+  can carry any bytes in its gateway, peer, rule, or request-identifier field, so
+  `Event::describe` names the tag, the request phase, the typed error, and the
+  numeric coordinates only, and the fault-transition diagnostics in
+  `failure.json` take their peer and rule from the validated network profile the
+  run configured instead of from the event. The protocol canary places a marker
+  in each of those fields, and an end-to-end record canary asserts that a rejected
+  activation's strings appear in neither the CLI text nor the bundle. The store's
+  raw-closure reader follows the same rule: an unknown object role and an object
+  that exceeds its policy limit are named by their position, so a tampered
+  `closure.json` cannot carry a marker into the CLI text or the failure bundle of
+  a replay that rejects it. Three more semantic rejections follow the same rule:
+  the overlay collision names the fixed `/tmp` or `/dev` subtree instead of the
+  colliding entry path, the replay scenario-name comparison names the
+  disagreement instead of either name, and a repeated raw-closure role names the
+  object's position. The layer reader is value-free as well: a rejected member
+  names the layer and member position plus a fixed category, never the path, the
+  symbolic-link target, the media type, or a raw header field, and the tar
+  parser's own errors are reduced to fixed context. The replay identity
+  comparisons and the version check name the differing field only, because a
+  recorded identity can carry an arbitrary string or a private host path. The
+  binary and OCI assembly boundaries reduce a source-locator failure to the field
+  it belongs to and the error's category, because the root's own diagnostics
+  quote the locator and it is a user-authored specification value.
+* *Owner-only image cache.* The `.images` cache is created `0700` with `0600`
+  entries, and a reused entry is validated before it is opened: its type,
+  ownership, and mode are checked first and repaired where possible, then it is
+  hashed through the same `O_NOFOLLOW | O_NONBLOCK` reader the replay inputs use,
+  so a writer-less FIFO or a device node is rejected instead of blocking the run.
+* *Validated asynchronous events.* The driver folds events it does not
+  synchronously await, so the checker validates them instead: a start, exit,
+  termination, cleanup, launch failure, or input acknowledgement for an unknown
+  invocation, an input acknowledgement after the invocation was terminated, a
+  duplicate start, exit, termination, cleanup, network configuration, activation,
+  or restoration, a termination after its exit, a cleanup before its exit or
+  without reaping a process, a configuration that is not the fixed private
+  profile, and an activation without its prohibition rule are all
+  stream-structure violations. A launch failure is an alternative outcome to a
+  start record rather than an event of a running invocation, so it is retained for
+  an invocation that never started; it may still not repeat, and it may not arrive
+  after the invocation exited. `process_safety` also requires exactly one
+  termination record, for the first invocation, which is what the acceptance
+  profile performs.
+* *Complete stream evaluation.* Per-invocation offset, sequence, and input-stream
+  violations are now evaluated alongside the trace-level ones; sequences must
+  start at one and stay contiguous; each accepted input must advance the accepted
+  offset by exactly its byte count and name a distinct later command; an
+  end-of-input must be unique and last; every response line but the startup line
+  must have its own accepted command; every invocation must end on a complete
+  stdout line; and no invocation may write a single stderr byte. The
+  end-of-input acknowledgement is required rather than merely permitted: the
+  acceptance contract ends the surviving invocation's input, so its accounting
+  must show exactly one end of input for the restarted invocation and none for
+  the terminated one, and a recording that omits it cannot pass. The accounting
+  also correlates responses with commands: the trace retains each data
+  acknowledgement's event identifier and the event that carried each response
+  line's first byte, so a response recorded before the command it answers is a
+  violation even though the ordered lines and the aggregate counts are unchanged.
+  The same evidence anchors the fault witnesses: `controlled_outage` and
+  `bounded_recovery` require the witness's acknowledgement to follow the
+  activation or restoration, so a response whose bytes were already present before
+  the transition cannot count once its newline arrives. The witness arithmetic is
+  lazy, so a witness that precedes its transition fails the property instead of
+  underflowing, and the accepted input offset is compared through a checked sum,
+  so a positive byte count can no longer repeat a saturated offset and pass.
+* *Process evidence.* The first cleanup barrier must reap at least two processes
+  (the terminated primary and the escaped descendant) and the escaped-descendant
+  line must precede the termination request, with termination, exit, and cleanup
+  ordered by event identifier.
+* *Restart recovery bound.* `bounded_recovery` now requires the restarted
+  invocation to answer its first command within the scenario's liveness bound, so
+  the first invocation's responses can no longer satisfy the property.
+* *Strict response matching.* The driver requires each invocation's *next*
+  complete line to equal the expected line, and an already-observed failure takes
+  precedence over a matching line: it stops as soon as the invocation writes to
+  stderr or its current stdout line exceeds the response bound, because the
+  pinned fixture writes to stderr only when it is failing and a line over the
+  bound can never be valid. The same health test gates every process command and
+  the end-of-input step, so a failure observed by the pre-command drain stops the
+  drive as well, and the wait for an exit consults the same test before its first
+  blocking receive, so a failing tail folded by the acknowledgement it awaited
+  ends the wait instead of becoming a receive error. The over-bound condition is
+  sticky for the invocation: a line that completes with a newline still fails the
+  health test, so a known-invalid response cannot become a timeout merely because
+  its terminator arrived. The exit wait also ends on any complete stdout line the
+  driver did not consume and on a pending byte: every expected response is
+  complete and consumed by then, so a further line or even one byte can only be a
+  response the checker must reject. A wrong
+  response, a reported application error, or an over-long unfinished line
+  therefore fails the property through the checker instead of blocking until the
+  VM deadline.
+* *Schedule-free passive replay.* A replayed guest reproduces the recorded
+  execution, including the input it received, so the host sends nothing. Passive
+  replay therefore consumes the recorded event stream in order, requires every
+  event to match byte for byte, requires the stream to end with the agent-stopped
+  acknowledgement, and lets the checker recompute the report from those events.
+  It no longer re-decides the command schedule from its own queue timing, so a
+  recording whose failing response became visible one command later than it would
+  in a faster replay still replays to the same failing report.
+* *Outage bookkeeping.* The driver tracks the administrative outage and restores
+  the network before an early shutdown, because the agent refuses to stop while
+  an outage is active. A network acknowledgement also folds the lifecycle events
+  of a stopped invocation, because the runtime serializes an exit and its cleanup
+  barrier as separate frames that can arrive after the host has already read the
+  exit record. The fake guest enforces both the refusal and a separately
+  delivered barrier, so forgetting either is a test failure rather than a
+  production-only infrastructure error.
+* *Process-command safety.* The driver waits for an invocation's startup line
+  before its first command, folds every already-queued event before each process
+  command, and treats a terminal event observed while awaiting a response as an
+  orderly end. Passive replay can deliver events ahead of the commands that own
+  them, so a drain parks those events and preserves the exact read order.
+* *Envelope and acknowledgement correlation.* Every event's command identifier is
+  bounded by the last issued command, synchronous acknowledgements must name the
+  awaited command, every network acknowledgement must carry the values the host
+  configured rather than only its variant, `input-accepted` contents are
+  validated against the sent bytes, the shutdown drain accepts only workload
+  events and requires the agent-stopped acknowledgement to name its command, and
+  only passive replay may park an event whose command has not been issued yet.
+* *Preparation-time bounds.* `payload_bytes` is constrained to the fixture's
+  hex-encoded token limit (63 bytes) and the serialized start command, start
+  event, and widest input frames are preflighted in both record and replay, so an
+  undeliverable launch identity or input fails before QEMU starts. Every
+  published artifact is hashed through the same bounded reader the replay path
+  uses, so the recorded event stream, assertion report, workload lock, run
+  manifest, replay log, and diagnostic logs are each required to fit their
+  reader's limit before anything is published.
+* *Acceptance harness.* The missing-raw case asserts the intended diagnostic
+  instead of any nonzero exit, and a removed closure-referenced raw object is
+  covered too. The fresh-root witness check concatenates each invocation's stdout
+  frames before it splits them into lines, exactly as the host checker
+  reconstructs the streams, so a line split across frames still counts. Only the
+  acceptance report, process status, and shareable failure bundles are uploaded
+  from the Phase 3 diagnostics artifact.
+* *Stronger fresh-root witness.* The fixture mutates its own executable's mode in
+  the immutable workload root, outside the writable overlay, and each invocation
+  must report `state value=fresh root=fresh`. A reused workload root is therefore
+  observable even if the overlay alone were recreated.
+
+=== Phase 3 regression tests
+
+`crates/simferret/src/checker.rs` unit tests cover a complete structured run and
+each individual failure: a reused root reported as `stale` (including a stale
+root witness while the `/tmp` marker is fresh), a mismatched response line, a
+cleanup barrier that reaped fewer than two processes, a sequence that does not
+start at one, a sequence gap, a non-contiguous output offset, a non-contiguous
+input offset, a replayed input command identifier, a missing input
+acknowledgement, a missing end of input for the restarted invocation, a response
+recorded before the input acknowledgement it answers, a witness acknowledged
+before the activation or restoration it is measured against, an
+unterminated stdout line, a stderr byte, a missing restoration, an outage response that arrives only after
+restoration, a restart that answers outside the liveness bound, exit totals that
+disagree with the recorded frames, and a typed launch failure that cannot satisfy
+a workload property.
+
+`crates/simferret/src/run.rs` drives the whole pipeline against a deterministic
+fake VM that models the pinned fixture's line protocol, so the driver, checker,
+manifest, and replay preflight are exercised without QEMU. The tests cover:
+
+* a workload recording that passes every property, records the workload identity
+  in the manifest and the lock, publishes the raw and derived closure, and
+  passively replays twice from the store after the live source is deleted;
+* a self-consistently changed lock whose artifact digest is updated in the
+  manifest, an independently changed launch identity, a missing raw closure with
+  the derived entry still present, a changed raw object, a changed derived
+  template, and a changed scenario artifact, each refused before launch;
+* an intentionally corrupted fixture response that fails `process_safety` and
+  `response_integrity`, publishes a complete run, and reproduces the same failing
+  report on replay with CLI status 1;
+* owner-only run directories and artifacts, and a failure bundle that contains
+  neither the recorded environment value nor a workload output line;
+* an application failure inside the outage window, which must restore the network
+  before the shutdown handshake because the guest refuses to stop while an outage
+  is active;
+* a wrong response line, which must fail the property with the guest stopped
+  instead of blocking the driver;
+* a workload that exits before its first command, whose queued exit must be
+  observed rather than raced by a process command;
+* a duplicated input acknowledgement, which must fail `process_safety` as a
+  stream-structure violation;
+* the preparation-time preflight of an undeliverable launch identity and an
+  oversized planned input;
+* the owner-only guest image cache, including repair of a world-readable entry
+  and refusal of a non-regular one; and
+* a replayed launch-identity divergence, whose error text and shareable failure
+  bundle must carry no environment value and no workload stream byte;
+* a malformed private artifact and a malformed workload specification, whose
+  diagnostics must not quote the launch environment;
+* a late cleanup barrier, a wrong network acknowledgement, a late agent-stopped
+  acknowledgement, and an event for an unissued command, each of which must be
+  folded or rejected exactly as the protocol requires;
+* a failing application that writes to stderr and stays alive, which must fail
+  the property instead of exhausting the VM deadline;
+* a launch identity at the start-command boundary, which the response-frame
+  preflight must still reject;
+* a writer-less FIFO in the guest image cache, which must be rejected without
+  blocking;
+* an oversized published artifact, which must be refused before publication;
+* a malformed canonical specification whose launch field carries the marker, and
+  a malformed protocol frame whose launch field carries the marker, neither of
+  which may quote it; and
+* an over-bound unfinished stdout line, which must stop the wait instead of
+  reaching the VM deadline, including when it follows a matching response in a
+  separate frame;
+* a termination for an invocation that already exited, and a duplicated
+  termination, both of which must fail process safety; and
+* a correctly typed but invalid user or working directory, and an OCI entrypoint
+  whose first argument is not absolute, not in the workload, or escapes it
+  through a traversal component, none of which may quote the value in the CLI
+  text or the failure bundle, plus a manifest descriptor selected by a marker
+  digest;
+* an input acknowledgement after an invocation was terminated, and a termination
+  that arrives after the invocation completed cleanup;
+* an over-bound tail that becomes visible only after the end-of-input
+  acknowledgement, which must still stop the run; and
+* a recording whose failing response became visible one command later than a
+  faster replay would observe it, which must still replay to the same report;
+* a failing tail folded by the end-of-input acknowledgement, on stderr and as an
+  over-bound unfinished stdout line, which must stop the run and publish a
+  failing report instead of becoming a receive error;
+* a workload that exits cleanly after its last response and before its input can
+  be ended, whose recording must fail `response_integrity`; and
+* a rejected outage activation whose peer and rule carry a marker, which must
+  leave the error text and the whole failure bundle free of it while the report
+  still names the validated profile's peer and rule;
+* a workload that answers the state command during the preceding echo command,
+  which the driver accepts because the line is already buffered and only the
+  checker can reject; and
+* a tampered raw closure whose role and digest carry a marker, neither of which
+  may appear in the CLI text or the failure bundle; and
+* a failed start for each invocation, which must publish a failing report with a
+  typed launch failure instead of waiting for a startup line that never arrives;
+* a complete short stdout line the driver never asked for, folded by the
+  end-of-input acknowledgement, which must end the exit wait; and
+* a tampered manifest scenario name, which must not appear in the CLI text or the
+  failure bundle;
+* a pending stdout byte folded by the end-of-input acknowledgement, before and
+  after it, which must end the exit wait; and
+* a replay whose recorded version or VM identity differs, whose diagnostic must
+  name the field without either value;
+* a missing binary path and a missing OCI layout, whose locator must not appear
+  in the CLI text or the failure bundle; and
+* a recording whose output sequence is the maximum value, whose next frame must
+  report the structural violation instead of overflowing the comparison;
+* an outage witness and a recovery witness that both precede their transition,
+  which must fail the property instead of underflowing;
+* a trace whose input acknowledgements repeat a saturated offset, which must fail
+  process safety; and
+* a record against a marked runs directory whose store is not owner-only, whose
+  retained report must name a fixed label; and
+* a sanitizer case covering the plain, QEMU-escaped, and debug-escaped
+  representations of a private path and a longer unrelated name that shares its
+  prefix.
+
+`crates/simferret/tests/rfd3_phase3.rs` pins the public contract: the strict
+versioned workload scenario, the seeded choice plan and its bounds, the request
+phase to expected-response mapping, and that an incomplete or structurally
+invalid run cannot satisfy any property.
+
+`crates/simferret/src/workload/mod.rs` unit tests cover overlay collisions at and
+below `/tmp` and `/dev` and the launch paths the overlay invalidates.
+
+=== Deliberate limits
+
+The host checker understands the checked-in acceptance fixture's line protocol
+only; general protocol adapters and automatic property inference remain excluded,
+as the RFD requires. The dynamically linked fixture packages the glibc
+interpreter and `libc.so.6` from the pinned development environment, which is
+what makes its closure reproducible in this repository; standalone dynamic
+binaries remain unsupported. The workload store is shared by the runs in one runs
+directory and refuses a second, different raw closure, so each source form uses
+its own runs directory. The chunked command write is a host-side transport
+change: the wire format, the guest's per-byte acknowledgement, and the versioned
+protocol are unchanged.
+
+The workload driver folds every already-queued event before it issues a process
+command, and it treats a terminal event observed while awaiting a response as an
+orderly end, so an invocation that has already exited is reported as an
+application failure rather than raced. The residual window is the interval
+between that drain and the guest reading the command: if the invocation is
+released inside it, the guest answers with the exit record and the protocol
+classifies the acknowledgement mismatch as an infrastructure error. Closing that
+window completely would require a typed rejection event for a command that races
+a process exit, which is a protocol change and is left to a later increment.

@@ -216,10 +216,15 @@ pub fn assemble(specification: &Path, store: &Path) -> io::Result<AssembledWorkl
 /// canonical tree and encoded guest template. No live source is consulted.
 pub fn load(store: &Path) -> io::Result<LoadedWorkload> {
     let root = Root::open(store)?;
-    let closure_bytes = root.read_file(RAW_CLOSURE_PATH, MAX_CACHE_METADATA_BYTES)?;
+    let closure_bytes = read_required(
+        &root,
+        RAW_CLOSURE_PATH,
+        MAX_CACHE_METADATA_BYTES,
+        &format!("raw closure {RAW_CLOSURE_PATH}"),
+    )?;
     let closure_sha256 = sha256_bytes(&closure_bytes);
     let closure: Closure = serde_json::from_slice(&closure_bytes)
-        .map_err(|error| invalid(format!("malformed raw closure: {error}")))?;
+        .map_err(|error| crate::diagnostics::json_error("malformed raw closure", &error))?;
     if closure.version != CLOSURE_VERSION {
         return Err(invalid(format!(
             "unsupported raw closure version {}",
@@ -236,6 +241,7 @@ pub fn load(store: &Path) -> io::Result<LoadedWorkload> {
     }
     let objects = read_objects(&root, &closure)?;
     let graph = replay_graph(&closure, &objects)?;
+    super::validate_overlay_compatibility(&graph.tree, &graph.launch)?;
     if graph.launch != closure.launch {
         return Err(invalid(
             "re-derived launch identity does not match the raw closure",
@@ -289,7 +295,12 @@ pub fn load(store: &Path) -> io::Result<LoadedWorkload> {
 }
 
 fn binary_graph(root: &Root, source: &BinarySource) -> io::Result<WorkloadGraph> {
-    let executable = root.read_file(&source.path, MAX_FILE_BYTES)?;
+    // The locator is a user-authored specification value and the root's own
+    // diagnostics quote it, so the boundary names the field and the error
+    // category instead.
+    let executable = root
+        .read_file(&source.path, MAX_FILE_BYTES)
+        .map_err(|error| source_locator_error("the workload executable", &error))?;
     super::validate_static_elf(&executable)?;
     let (uid, gid) = normalize_required_user(&source.user)?;
     let install = normalize_layer_path(BINARY_INSTALL_PATH.as_bytes())?;
@@ -393,7 +404,9 @@ fn binary_tree_and_launch(
 }
 
 fn oci_graph(root: &Root, source: &OciSource) -> io::Result<WorkloadGraph> {
-    let layout = root.open_directory(&source.layout)?;
+    let layout = root
+        .open_directory(&source.layout)
+        .map_err(|error| source_locator_error("the workload layout directory", &error))?;
     let objects = oci::read_objects(&layout, &source.manifest_digest)?;
     let graph = oci::parse_graph(&objects)?;
     Ok(WorkloadGraph {
@@ -404,6 +417,17 @@ fn oci_graph(root: &Root, source: &OciSource) -> io::Result<WorkloadGraph> {
         launch: graph.launch,
         layers: graph.layers,
     })
+}
+
+/// Reduce a source-locator failure to the field it belongs to and the error's
+/// category. The root's diagnostics quote the locator they failed on, and that
+/// string comes from the user-authored specification and reaches the shareable
+/// failure bundle.
+fn source_locator_error(field: &str, error: &io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{field} is unavailable ({:?})", error.kind()),
+    )
 }
 
 fn oci_roles(objects: &OciObjects) -> Vec<(String, Vec<u8>)> {
@@ -422,6 +446,7 @@ fn oci_roles(objects: &OciObjects) -> Vec<(String, Vec<u8>)> {
 
 fn publish(store: &Path, graph: WorkloadGraph) -> io::Result<AssembledWorkload> {
     validate_canonical_tree(&graph.tree, MAX_VIEW_ENTRIES, MAX_EXPANDED_LAYER_BYTES)?;
+    super::validate_overlay_compatibility(&graph.tree, &graph.launch)?;
     let expanded_bytes = graph.tree.expanded_bytes();
     let canonical_digest = graph.tree.canonical_digest();
     let tree_bytes = graph.tree.encode();
@@ -445,11 +470,15 @@ fn publish(store: &Path, graph: WorkloadGraph) -> io::Result<AssembledWorkload> 
         )));
     }
     let mut records = Vec::with_capacity(graph.objects.len());
-    for (role, data) in &graph.objects {
-        let limit = role_limit(role)?;
+    for (index, (role, data)) in graph.objects.iter().enumerate() {
+        let Some(limit) = role_limit(role) else {
+            return Err(invalid(format!(
+                "assembled raw closure object {index} names an unknown role"
+            )));
+        };
         if data.len() > limit {
             return Err(invalid(format!(
-                "{role} object exceeds its {limit}-byte policy limit"
+                "raw object {index} exceeds its {limit}-byte policy limit"
             )));
         }
         records.push(ObjectRecord {
@@ -558,8 +587,10 @@ fn replay_graph(
             if objects.len() != 2 {
                 return Err(invalid("binary closure names unexpected objects"));
             }
-            let canonical: CanonicalBinarySpec = serde_json::from_slice(specification)
-                .map_err(|error| invalid(format!("malformed canonical specification: {error}")))?;
+            let canonical: CanonicalBinarySpec =
+                serde_json::from_slice(specification).map_err(|error| {
+                    crate::diagnostics::json_error("malformed canonical specification", &error)
+                })?;
             if canonical.version != WORKLOAD_SPEC_VERSION || canonical.kind != SourceKind::Binary {
                 return Err(invalid("canonical specification is not a version-1 binary"));
             }
@@ -588,10 +619,15 @@ fn replay_graph(
             })
         }
         SourceKind::Oci => {
-            let manifest_digest = closure
+            // The recorded digest is a raw closure value, so it is validated
+            // before it can reach a diagnostic that names it.
+            let raw_digest = closure
                 .manifest_digest
                 .clone()
                 .ok_or_else(|| invalid("OCI closure has no manifest digest"))?;
+            let hex = super::spec::parse_digest(&raw_digest)
+                .map_err(|_| invalid("the OCI closure manifest digest is not a sha256 digest"))?;
+            let manifest_digest = format!("sha256:{hex}");
             let layer_count = closure.layers.len();
             let expected = expected_oci_roles(layer_count);
             if objects.len() != expected.len()
@@ -654,19 +690,23 @@ fn read_objects(root: &Root, closure: &Closure) -> io::Result<BTreeMap<String, V
         )));
     }
     let mut objects = BTreeMap::new();
-    for record in &closure.objects {
-        let limit = role_limit(&record.role)?;
+    for (index, record) in closure.objects.iter().enumerate() {
+        let Some(limit) = role_limit(&record.role) else {
+            // The role is an arbitrary string from a private artifact, so the
+            // diagnostic names the object's position instead of its value.
+            return Err(invalid(format!(
+                "raw closure object {index} names an unknown role"
+            )));
+        };
         if record.bytes > limit {
             return Err(invalid(format!(
-                "raw object {} exceeds the {limit}-byte policy limit",
-                record.digest
+                "raw object {index} exceeds the {limit}-byte policy limit"
             )));
         }
         let hex = parse_digest(&record.digest)?;
         if objects.contains_key(&record.role) {
             return Err(invalid(format!(
-                "raw closure names role {:?} more than once",
-                record.role
+                "raw closure object {index} repeats the role of an earlier object"
             )));
         }
         let data = read_required(
@@ -686,21 +726,19 @@ fn read_objects(root: &Root, closure: &Closure) -> io::Result<BTreeMap<String, V
     Ok(objects)
 }
 
-fn role_limit(role: &str) -> io::Result<usize> {
+fn role_limit(role: &str) -> Option<usize> {
     match role {
-        "oci-layout" => Ok(MAX_LAYOUT_BYTES),
-        "index.json" => Ok(MAX_INDEX_BYTES),
-        "manifest" => Ok(MAX_MANIFEST_BYTES),
-        "config" => Ok(MAX_CONFIG_BYTES),
-        "executable" => Ok(MAX_FILE_BYTES),
-        "workload-specification" => Ok(MAX_SPECIFICATION_BYTES),
+        "oci-layout" => Some(MAX_LAYOUT_BYTES),
+        "index.json" => Some(MAX_INDEX_BYTES),
+        "manifest" => Some(MAX_MANIFEST_BYTES),
+        "config" => Some(MAX_CONFIG_BYTES),
+        "executable" => Some(MAX_FILE_BYTES),
+        "workload-specification" => Some(MAX_SPECIFICATION_BYTES),
         _ => match role.strip_prefix("layer-") {
             Some(index) if !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()) => {
-                Ok(MAX_LAYER_BYTES)
+                Some(MAX_LAYER_BYTES)
             }
-            _ => Err(invalid(format!(
-                "raw closure names unknown object role {role:?}"
-            ))),
+            _ => None,
         },
     }
 }
@@ -849,7 +887,7 @@ fn verify_derived(
         "derived lock",
     )?;
     let lock: DerivedLock = serde_json::from_slice(&lock_bytes)
-        .map_err(|error| invalid(format!("malformed derived lock: {error}")))?;
+        .map_err(|error| crate::diagnostics::json_error("malformed derived lock", &error))?;
     if lock.version != DERIVED_LOCK_VERSION
         || lock.canonical_digest != canonical_digest
         || lock.tree_sha256 != tree_sha256

@@ -71,6 +71,7 @@ jobs:
             env SIMFERRET_PHASE2_TEST_BINARY="$binary" \
             ./scripts/rfd3-phase2-runtime.sh
       - run: nix develop --command ./scripts/phase4-acceptance-test.sh
+      - run: nix develop --command ./scripts/rfd3-phase3-acceptance.sh
       - run: nix develop --command ./scripts/qemu-replay-smoke.sh
       - run: nix develop --command ./scripts/qemu-network-replay-smoke.sh
       - run: nix develop --command ./scripts/phase4-acceptance.sh
@@ -78,9 +79,19 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-replay-diagnostics
+          # The Phase 3 run directories and the workload store carry the private
+          # replay closure, the exact workload streams, and the recorded launch
+          # environment, so only the acceptance report, the process status, and
+          # the shareable failure bundles are uploaded.
           path: |
             .poc/qemu-replay-smoke/
             .poc/qemu-network-replay-smoke/
             .poc/phase4-acceptance/
             .poc/rfd3-phase1-evidence/
+            .poc/rfd3-phase3-acceptance/*/evidence.txt
+            .poc/rfd3-phase3-acceptance/*/*.status
+            .poc/rfd3-phase3-acceptance/*/*.duration-ns
+            .poc/rfd3-phase3-acceptance/*/*.stdout
+            .poc/rfd3-phase3-acceptance/*/*.stderr
+            .poc/rfd3-phase3-acceptance/*/*/failures/**
           if-no-files-found: ignore

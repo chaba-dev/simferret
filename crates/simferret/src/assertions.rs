@@ -24,6 +24,30 @@ pub enum AssertionName {
     ControlledOutage,
     Restoration,
     BoundedRecovery,
+    /// The packaged workload started, was terminated, was cleaned up, restarted
+    /// from a fresh root, and exited as the scenario requires.
+    ProcessSafety,
+    /// Every recorded output frame reconstructs the expected response for its
+    /// command, and the exit record's totals and digests match the frames.
+    ResponseIntegrity,
+}
+
+impl AssertionName {
+    /// The assertion names a network-fixture run reports, in order.
+    pub const NETWORK_PROFILE: [Self; 4] = [
+        Self::Safety,
+        Self::ControlledOutage,
+        Self::Restoration,
+        Self::BoundedRecovery,
+    ];
+    /// The assertion names a workload-driven run reports, in order.
+    pub const WORKLOAD_PROFILE: [Self; 5] = [
+        Self::ProcessSafety,
+        Self::ResponseIntegrity,
+        Self::ControlledOutage,
+        Self::Restoration,
+        Self::BoundedRecovery,
+    ];
 }
 
 impl AssertionReport {

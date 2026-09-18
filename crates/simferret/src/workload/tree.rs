@@ -332,16 +332,10 @@ pub fn join_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
 /// escaping `..` component, drop empty and `.` components, and bound the length.
 pub fn normalize_layer_path(raw: &[u8]) -> io::Result<Vec<u8>> {
     if raw.is_empty() || raw.contains(&0) {
-        return Err(invalid(format!(
-            "invalid layer path {:?}",
-            String::from_utf8_lossy(raw)
-        )));
+        return Err(invalid("a layer path is empty or contains a NUL byte"));
     }
     if raw[0] == b'/' {
-        return Err(invalid(format!(
-            "absolute layer path {:?}",
-            String::from_utf8_lossy(raw)
-        )));
+        return Err(invalid("absolute layer paths are unsupported"));
     }
     let mut parts: Vec<&[u8]> = Vec::new();
     for part in raw.split(|byte| *byte == b'/') {
@@ -349,10 +343,7 @@ pub fn normalize_layer_path(raw: &[u8]) -> io::Result<Vec<u8>> {
             continue;
         }
         if part == b".." {
-            return Err(invalid(format!(
-                "escaping layer path {:?}",
-                String::from_utf8_lossy(raw)
-            )));
+            return Err(invalid("layer paths must not contain '..' components"));
         }
         parts.push(part);
     }
@@ -372,24 +363,17 @@ pub fn normalize_layer_path(raw: &[u8]) -> io::Result<Vec<u8>> {
 
 /// Reject a symbolic link target that is invalid regardless of the rest of the
 /// tree.
-pub fn validate_symlink_syntax(link_path: &[u8], target: &[u8]) -> io::Result<()> {
+pub fn validate_symlink_syntax(target: &[u8]) -> io::Result<()> {
     if target.is_empty() || target.contains(&0) {
-        return Err(invalid(format!(
-            "invalid symbolic link target at {:?}",
-            String::from_utf8_lossy(link_path)
-        )));
+        return Err(invalid(
+            "a symbolic link target is empty or contains a NUL byte",
+        ));
     }
     if target.len() > super::MAX_SYMLINK_TARGET_BYTES {
-        return Err(invalid(format!(
-            "symbolic link target at {:?} is too long",
-            String::from_utf8_lossy(link_path)
-        )));
+        return Err(invalid("a symbolic link target exceeds the length limit"));
     }
     if target[0] == b'/' {
-        return Err(invalid(format!(
-            "absolute symbolic link target at {:?}",
-            String::from_utf8_lossy(link_path)
-        )));
+        return Err(invalid("absolute symbolic link targets are unsupported"));
     }
     Ok(())
 }
@@ -412,7 +396,7 @@ pub fn validate_symlinks(tree: &Tree) -> io::Result<()> {
 }
 
 fn resolve_symlink(tree: &Tree, link_path: &[u8], target: &[u8]) -> io::Result<()> {
-    validate_symlink_syntax(link_path, target)?;
+    validate_symlink_syntax(target)?;
     let mut components: Vec<Vec<u8>> = Vec::new();
     for part in parent_of(link_path)
         .unwrap_or_default()
@@ -435,10 +419,7 @@ fn resolve_symlink(tree: &Tree, link_path: &[u8], target: &[u8]) -> io::Result<(
         index += 1;
         if part == b".." {
             if resolved.pop().is_none() {
-                return Err(invalid(format!(
-                    "escaping symbolic link target at {:?}",
-                    String::from_utf8_lossy(link_path)
-                )));
+                return Err(invalid("a symbolic link target escapes the workload root"));
             }
             continue;
         }
@@ -452,13 +433,10 @@ fn resolve_symlink(tree: &Tree, link_path: &[u8], target: &[u8]) -> io::Result<(
         {
             hops += 1;
             if hops > super::MAX_SYMLINK_HOPS {
-                return Err(invalid(format!(
-                    "symbolic link chain too deep at {:?}",
-                    String::from_utf8_lossy(link_path)
-                )));
+                return Err(invalid("a symbolic link chain exceeds the hop limit"));
             }
             let nested = entry.link_target();
-            validate_symlink_syntax(link_path, nested)?;
+            validate_symlink_syntax(nested)?;
             let expansion: Vec<Vec<u8>> = nested
                 .split(|b| *b == b'/')
                 .filter(|piece| !piece.is_empty() && *piece != b".")

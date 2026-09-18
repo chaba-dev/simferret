@@ -616,6 +616,7 @@ impl Runtime {
 
     /// Request unconditional termination of the invocation.
     pub fn terminate(&mut self, invocation: u64) -> io::Result<Vec<Event>> {
+        let scope = self.config.scope;
         let active = self.invocation_mut(invocation)?;
         if active.exit.is_some() {
             return Err(io::Error::new(
@@ -623,15 +624,18 @@ impl Runtime {
                 "the invocation has already exited",
             ));
         }
-        // The workload is being killed, so the queued input can no longer be
-        // delivered. Dropping it and closing the child's standard input before
-        // signalling keeps a later poll from writing to a pipe whose readers
-        // are already gone, which would be reported as an infrastructure
-        // failure instead of the requested termination.
+        // The command is an unconditional signal, so it is delivered before the
+        // child's standard input is closed: a workload that treats end of input
+        // as a clean exit would otherwise leave the process before the signal
+        // landed, and the exit record would not report the requested
+        // termination. The queued input is dropped in the same critical section,
+        // so no later poll can write to a pipe whose readers are gone, which
+        // would be reported as an infrastructure failure instead of the
+        // requested termination.
         active.terminating = true;
+        signal_members(active.pid, scope, TERMINATION_SIGNAL)?;
         active.pending_input.clear();
         active.stdin = None;
-        signal_members(active.pid, self.config.scope, TERMINATION_SIGNAL)?;
         Ok(vec![Event::TerminationRequested {
             invocation,
             signal: TERMINATION_SIGNAL,
