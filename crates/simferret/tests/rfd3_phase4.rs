@@ -300,6 +300,12 @@ fn base_layer() -> Vec<Member> {
     vec![
         directory("bin"),
         file_with("bin/busybox", &busybox, 0o755, 0, 0, 0),
+        // BusyBox resolves an applet from the name it is invoked with, so the
+        // workload needs the applets it calls as links to the one binary.
+        symlink("bin/sh", "busybox", 0),
+        symlink("bin/stat", "busybox", 0),
+        symlink("bin/readlink", "busybox", 0),
+        symlink("bin/cat", "busybox", 0),
         // 0751 keeps the directory traversable for the workload's "other" class
         // while proving a non-default mode, owner, and timestamp survive.
         Member {
@@ -527,6 +533,7 @@ fn assemble_conformance(temp: &TempDir) -> PathBuf {
     let config = json!({
         "config": {
             "Entrypoint": [INSTALL_PATH, "sh", "-c", CONFORMANCE_SCRIPT],
+            "Env": ["PATH=/bin"],
             "User": "1001:1001",
             "WorkingDir": "/",
         }
@@ -558,6 +565,10 @@ fn template_encoding_preserves_oci_conformance_metadata() {
             "workload",
             "workload/bin",
             "workload/bin/busybox",
+            "workload/bin/cat",
+            "workload/bin/readlink",
+            "workload/bin/sh",
+            "workload/bin/stat",
             "workload/data",
             "workload/data/keep",
             "workload/link",
