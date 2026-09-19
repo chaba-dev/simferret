@@ -8,6 +8,12 @@
 # workload output and traffic volumes. Every command runs without elevated
 # privileges, a container daemon, a registry, or a host mount.
 #
+# The evidence checks are fail-closed: an unreadable artifact, a failed
+# measurement producer, a leaked canary in either its plain or its hex
+# encoding, or an unexpected file in a shareable bundle stops the run. The
+# classification check also records its own canary workload, so it never relies
+# on a value that could appear by coincidence.
+#
 # The guest-visible OCI conformance check changes root, drops credentials, and
 # creates device nodes, so it runs separately as PID 1 under
 # `scripts/rfd3-phase4-runtime.sh`; this script records its result when it is
@@ -15,6 +21,8 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/rfd3-phase4-checks.sh
+source "$repo_root/scripts/rfd3-phase4-checks.sh"
 output_root="${SIMFERRET_RFD3_PHASE4_OUTPUT:-$repo_root/.poc/rfd3-phase4-acceptance}"
 kernel="${SIMFERRET_KERNEL:-}"
 qemu="${QEMU_SYSTEM_X86_64:-qemu-system-x86_64}"
@@ -22,6 +30,7 @@ binary="$repo_root/target/x86_64-unknown-linux-musl/release/simferret"
 python="${PYTHON:-python3}"
 phase3_script="$repo_root/scripts/rfd3-phase3-acceptance.sh"
 runtime_script="$repo_root/scripts/rfd3-phase4-runtime.sh"
+scenario="$repo_root/scenarios/rfd3-workload-acceptance.toml"
 ambient_canary="SIMFERRET_PHASE4_AMBIENT_CANARY"
 ambient_value="ambient-canary-value"
 
@@ -77,14 +86,6 @@ expect_status() {
   fi
 }
 
-require_absent() {
-  local name="$1" needle="$2" path="$3"
-  if grep -R -F -- "$needle" "$path" >/dev/null 2>&1; then
-    echo "$name: '$needle' must not appear under $path" >&2
-    exit 1
-  fi
-}
-
 require_mode() {
   local path="$1" expected="$2"
   local mode
@@ -97,6 +98,12 @@ require_mode() {
 
 json_field() {
   "$python" -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"
+}
+
+# The run directory one `simferret run` or `simferret replay` invocation
+# published, as the command reported it.
+artifact_directory() {
+  awk -F ': ' '$1 == "artifacts" { print substr($0, length($1) + 3) }' "$1"
 }
 
 # The phase 3 demonstration builds the static and dynamic fixtures, packages the
@@ -161,8 +168,10 @@ if [[ "$ambient_canonical" != "$assembly_canonical" ]]; then
   echo "the ambient environment changed the canonical identity" >&2
   exit 1
 fi
-# The canary value, the host output path, and every host environment value the
-# process was given must stay out of the retained closure and derived lock.
+# The ambient canary value, the host output path, and the recorded launch
+# environment must stay out of the retained closure and derived lock. The
+# launch environment is exactly the specification's, so no ambient variable is
+# inherited.
 require_absent "ambient canary" "$ambient_value" "$ambient/store"
 require_absent "host path" "$output_dir" "$ambient/store/raw/closure.json"
 require_absent "host path" "$output_dir" "$ambient/store/derived/$ambient_canonical/lock.json"
@@ -176,8 +185,7 @@ fi
 # Private artifacts are owner-only and the shareable bundle excludes workload data
 # ---------------------------------------------------------------------------
 private_runs="$phase3_run/runs-binary"
-record_run="$(awk -F ': ' '$1 == "artifacts" { print substr($0, length($1) + 3) }' \
-  "$phase3_run/record-binary.stdout")"
+record_run="$(artifact_directory "$phase3_run/record-binary.stdout")"
 # The run directory, the guest image cache, and the workload store carry the
 # recorded environment, the exact streams, and the replay closure, so each is
 # owner-only. The runs directory that contains them holds only owner-only
@@ -189,20 +197,80 @@ for artifact in events.jsonl assertions.json workload.lock manifest.json; do
   require_mode "$record_run/$artifact" 600
 done
 
-mapfile -t bundles < <(find "$private_runs/failures" -mindepth 1 -maxdepth 1 -type d | sort)
-if [[ "${#bundles[@]}" -lt 1 ]]; then
-  echo "the rejected tamper cases published no shareable failure bundle" >&2
+# Phase 3's fixture records the fixed launch value `acceptance`, which cannot
+# distinguish a real leak from a coincidental match. A dedicated canary
+# recording therefore carries a distinctive launch environment and per-run
+# stream tokens, so the classification check has values that cannot appear in a
+# shareable artifact by accident.
+canary_dir="$output_dir/classification"
+canary_value="simferret-phase4-canary-$(od -An -v -tx1 -N8 /dev/urandom | tr -d ' \n')"
+mkdir -p "$canary_dir"
+cp "$assembly/app" "$canary_dir/app"
+cat >"$canary_dir/workload.toml" <<EOF
+version = 1
+kind = "binary"
+path = "app"
+args = []
+env = ["MODE=$canary_value"]
+working_directory = "/"
+user = "65534:65534"
+EOF
+run_timed canary-record env SIMFERRET_KERNEL="$kernel" QEMU_SYSTEM_X86_64="$qemu" \
+  "$binary" run --workload "$canary_dir/workload.toml" --scenario "$scenario" \
+  --seed 42 --runs-dir "$canary_dir/runs"
+expect_status canary-record 0
+canary_run="$(artifact_directory "$output_dir/canary-record.stdout")"
+if [[ -z "$canary_run" || ! -d "$canary_run" ]]; then
+  echo "the canary recording published no run directory" >&2
   exit 1
 fi
+jq -e '.passed' "$canary_run/assertions.json" >/dev/null
+# Removing one retained raw object makes the next replay of the canary
+# recording fail before QEMU starts, so it publishes a shareable failure bundle
+# for a store that carries the canary launch environment.
+canary_object="$(jq -r '.objects[0].digest' "$canary_dir/runs/.workload-store/raw/closure.json")"
+canary_object_path="$canary_dir/runs/.workload-store/raw/sha256/${canary_object#sha256:}"
+if [[ ! -f "$canary_object_path" ]]; then
+  echo "the canary store retains no object $canary_object" >&2
+  exit 1
+fi
+mv "$canary_object_path" "$canary_object_path.saved"
+run_timed canary-replay env SIMFERRET_KERNEL="$kernel" QEMU_SYSTEM_X86_64="$qemu" \
+  "$binary" replay "$canary_run"
+expect_status canary-replay 1
+
+# Every shareable bundle the Phase 3 demonstration and the canary recording
+# published, including the ones a tampered copy of a run directory published.
+mapfile -t bundles < <(find "$phase3_run" "$canary_dir/runs" -type d -name failures \
+  -exec find {} -mindepth 1 -maxdepth 1 -type d \; | sort)
+if [[ "${#bundles[@]}" -lt 1 ]]; then
+  echo "the rejected cases published no shareable failure bundle" >&2
+  exit 1
+fi
+if ! stream_canary_list="$(stream_canaries "$record_run/events.jsonl" "$canary_run/events.jsonl")"; then
+  echo "the recorded workload streams produced no canary" >&2
+  exit 1
+fi
+mapfile -t stream_canary_values <<<"$stream_canary_list"
+if [[ "${#stream_canary_values[@]}" -eq 0 || -z "${stream_canary_values[0]}" ]]; then
+  echo "the recorded workload streams produced no canary" >&2
+  exit 1
+fi
+if ! environment_canary_list="$(environment_canaries "$record_run")" ||
+  ! canary_environment_list="$(environment_canaries "$canary_run")"; then
+  echo "the recorded runs named no launch environment" >&2
+  exit 1
+fi
+mapfile -t environment_canary_values <<<"$environment_canary_list"
+mapfile -t canary_environment_values <<<"$canary_environment_list"
 for bundle in "${bundles[@]}"; do
-  # A shareable bundle carries typed errors and counts, never the recorded launch
-  # environment or the exact workload stream bytes.
-  require_absent "shareable environment" "MODE=acceptance" "$bundle"
-  require_absent "shareable stream bytes" "ready version=1" "$bundle"
-  if ! grep -R -F '"error_kind"' "$bundle" >/dev/null 2>&1; then
-    echo "the shareable bundle $bundle names no typed error" >&2
-    exit 1
-  fi
+  # A shareable bundle carries a typed error and counts, never the recorded
+  # launch environment or the exact workload stream bytes. The canaries are
+  # searched in plain text and in the hex encoding the event stream uses, so a
+  # leaked `workload_output.bytes` value cannot hide.
+  require_shareable_bundle "$bundle" \
+    "${environment_canary_values[@]}" "${canary_environment_values[@]}" \
+    "${stream_canary_values[@]}"
 done
 
 # ---------------------------------------------------------------------------
@@ -211,43 +279,29 @@ done
 measurements="$output_dir/measurements.txt"
 : >"$measurements"
 for name in binary oci-static oci-dynamic; do
-  run_dir="$(awk -F ': ' '$1 == "artifacts" { print substr($0, length($1) + 3) }' \
-    "$phase3_run/record-$name.stdout")"
+  run_dir="$(artifact_directory "$phase3_run/record-$name.stdout")"
   if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then
     echo "the Phase 3 $name recording published no run directory" >&2
     exit 1
   fi
   jq -e '.passed' "$run_dir/assertions.json" >/dev/null
-  read -r stdout_bytes stderr_bytes attempted succeeded unavailable <<<"$("$python" - "$run_dir/events.jsonl" <<'PY'
-import json
-import sys
-
-stdout_bytes = 0
-stderr_bytes = 0
-streams = {}
-with open(sys.argv[1], encoding="utf-8") as handle:
-    for line in handle:
-        event = json.loads(line)["event"]
-        if event["type"] == "workload_exited":
-            stdout_bytes += event["stdout_bytes"]
-            stderr_bytes += event["stderr_bytes"]
-        elif event["type"] == "workload_output" and event["stream"] == "stdout":
-            streams.setdefault(event["invocation"], bytearray()).extend(
-                bytes.fromhex(event["bytes"])
-            )
-# The packaged workload, not the agent, originates the network traffic, so its
-# volume is read from the reconstructed stdout lines it printed.
-succeeded = 0
-unavailable = 0
-for data in streams.values():
-    for line in bytes(data).split(b"\n"):
-        if line.startswith(b"network state=ok "):
-            succeeded += 1
-        elif line.startswith(b"network state=unavailable "):
-            unavailable += 1
-print(stdout_bytes, stderr_bytes, succeeded + unavailable, succeeded, unavailable)
-PY
-)"
+  # The measurement producer is checked before its output is read: a producer
+  # that fails or prints nothing must never be recorded as an empty result.
+  if ! measurement="$(workload_measurement "$run_dir/events.jsonl")"; then
+    echo "the $name workload measurement failed" >&2
+    exit 1
+  fi
+  read -r stdout_bytes stderr_bytes attempted succeeded unavailable <<<"$measurement"
+  require_nonnegative_integers "$name workload measurement" \
+    "$stdout_bytes" "$stderr_bytes" "$attempted" "$succeeded" "$unavailable"
+  if [[ "$attempted" -ne $((succeeded + unavailable)) ]]; then
+    echo "the $name traffic measurement is inconsistent: $attempted attempted, $succeeded succeeded, $unavailable unavailable" >&2
+    exit 1
+  fi
+  if [[ "$attempted" -eq 0 || "$succeeded" -eq 0 ]]; then
+    echo "the $name recording measured no workload traffic" >&2
+    exit 1
+  fi
   canonical="$(jq -r '.workload.canonical_digest' "$run_dir/workload.lock")"
   {
     printf '%s_canonical=%s\n' "$name" "$canonical"
@@ -282,7 +336,10 @@ fi
   printf 'assembly_template_bytes=%s\n' "$assembly_template_bytes"
   printf 'ambient_identity_unchanged=%s\n' "$ambient_canonical"
   printf 'shareable_bundles=%s\n' "${#bundles[@]}"
+  printf 'shareable_canaries=%s\n' \
+    "$((${#environment_canary_values[@]} + ${#canary_environment_values[@]} + ${#stream_canary_values[@]}))"
   printf 'shareable_excludes_environment_and_streams=yes\n'
+  printf 'classification_canary_recorded=yes\n'
   printf 'private_artifacts=run directory, guest image cache, workload store, and run artifacts are owner-only\n'
   printf 'guest_visible_conformance=%s\n' "$conformance"
   cat "$measurements"
