@@ -339,19 +339,21 @@ fn base_layer() -> Vec<Member> {
 }
 
 /// The upper layer legally replaces one file, whiteouts one lower path, marks
-/// `opaque` opaque, and adds a symlink and a file. The markers appear after the
-/// additions they coexist with, so an implementation that applied markers in
-/// archive order would delete the same-layer additions and change the asserted
-/// tree.
+/// `opaque` opaque, and adds a symlink and a file. The whiteout marker and the
+/// opaque marker both appear after the same-layer entries they coexist with, so
+/// an implementation that applied markers in archive order would delete a
+/// same-layer addition and change the asserted tree.
 fn upper_layer() -> Vec<Member> {
     vec![
         // The replacement shares its directory with no marker.
         file_with("replace/keep", b"upper", 0o640, 1001, 1001, 1_700_000_008),
         // The whiteout shares its directory only with `kept`.
         file_with(WHITEOUT_MARKER, b"", 0o644, 0, 0, 0),
-        // The opaque marker shares its directory with a same-layer addition.
+        // The same-layer addition under `opaque` must survive the marker that
+        // follows it. It stays world-readable so the workload's nonzero user can
+        // read it while its non-default owner is still asserted.
+        file_with("opaque/added", b"added", 0o644, 1300, 1300, 1_700_000_006),
         file_with(OPACITY_MARKER, b"", 0o644, 0, 0, 0),
-        file_with("opaque/added", b"added", 0o640, 1300, 1300, 1_700_000_006),
         symlink("link", "replace/keep", 1_700_000_004),
     ]
 }
@@ -360,11 +362,16 @@ fn upper_layer() -> Vec<Member> {
 const REPLACEMENT_PATH: &str = "replace/keep";
 const REPLACEMENT_LOWER: &[u8] = b"base";
 const REPLACEMENT_LOWER_MODE: u32 = 0o600;
+const REPLACEMENT_LOWER_OWNER: (u32, u32) = (1000, 1000);
+const REPLACEMENT_LOWER_MTIME: u32 = 1_700_000_007;
 /// The lower-layer entry the upper layer whiteouts, and its sibling that must
 /// survive the same marker.
 const WHITEOUT_MARKER: &str = "hide/.wh.removed";
 const WHITEOUT_PATH: &str = "hide/removed";
 const WHITEOUT_LOWER: &[u8] = b"gone";
+const WHITEOUT_LOWER_MODE: u32 = 0o640;
+const WHITEOUT_LOWER_OWNER: (u32, u32) = (1200, 1200);
+const WHITEOUT_LOWER_MTIME: u32 = 1_700_000_001;
 const WHITEOUT_SURVIVOR: &str = "hide/kept";
 /// The directory the upper layer marks opaque, its lower-layer children, and the
 /// same-layer addition that must survive the marker.
@@ -372,7 +379,18 @@ const OPACITY_MARKER: &str = "opaque/.wh..wh..opq";
 const OPACITY_DIRECTORY: &str = "opaque";
 const OPACITY_LOWER_CHILDREN: &[&str] =
     &["opaque/lower-child", "opaque/nested", "opaque/nested/deep"];
+const OPACITY_LOWER_CHILD: &str = "opaque/lower-child";
+const OPACITY_LOWER_CHILD_BYTES: &[u8] = b"hidden";
+const OPACITY_LOWER_CHILD_MODE: u32 = 0o644;
+const OPACITY_LOWER_CHILD_OWNER: (u32, u32) = (0, 0);
+const OPACITY_NESTED: &str = "opaque/nested";
+const OPACITY_NESTED_MODE: u32 = 0o755;
+const OPACITY_NESTED_DEEP: &str = "opaque/nested/deep";
+const OPACITY_NESTED_DEEP_BYTES: &[u8] = b"deep";
+const OPACITY_NESTED_DEEP_MODE: u32 = 0o644;
+const OPACITY_LOWER_MTIME: u32 = 1_700_000_001;
 const OPACITY_ADDITION: &str = "opaque/added";
+const OPACITY_ADDITION_MODE: u32 = 0o644;
 
 /// One upper-layer mechanism a variant layout omits, so the conformance suite can
 /// prove each mechanism is load-bearing on its own rather than being masked by
@@ -476,7 +494,7 @@ fn each_layer_mechanism_is_independently_load_bearing() {
         .expect("the opacity addition survives");
     assert_eq!(addition.data.as_deref(), Some(b"added".as_slice()));
     assert_eq!(
-        addition.mode, 0o640,
+        addition.mode, OPACITY_ADDITION_MODE,
         "the opacity addition keeps its own metadata"
     );
 
@@ -492,6 +510,17 @@ fn each_layer_mechanism_is_independently_load_bearing() {
             )
         });
     assert_eq!(survivor.data.as_deref(), Some(WHITEOUT_LOWER));
+    assert_eq!(survivor.mode, WHITEOUT_LOWER_MODE);
+    assert_eq!((survivor.uid, survivor.gid), WHITEOUT_LOWER_OWNER);
+    assert_eq!(survivor.mtime, WHITEOUT_LOWER_MTIME);
+    assert_eq!(
+        without_whiteout
+            .tree
+            .get(WHITEOUT_SURVIVOR.as_bytes())
+            .and_then(|entry| entry.data.as_deref()),
+        Some(b"safe".as_slice()),
+        "the whiteout never touched its sibling"
+    );
 
     let without_replacement = load(&assemble_variant(
         &temp,
@@ -510,6 +539,8 @@ fn each_layer_mechanism_is_independently_load_bearing() {
         });
     assert_eq!(survivor.data.as_deref(), Some(REPLACEMENT_LOWER));
     assert_eq!(survivor.mode, REPLACEMENT_LOWER_MODE);
+    assert_eq!((survivor.uid, survivor.gid), REPLACEMENT_LOWER_OWNER);
+    assert_eq!(survivor.mtime, REPLACEMENT_LOWER_MTIME);
 
     let without_opacity = load(&assemble_variant(&temp, "no-opacity", Mechanism::Opacity)).unwrap();
     assert!(
@@ -526,6 +557,32 @@ fn each_layer_mechanism_is_independently_load_bearing() {
              what hid it"
         );
     }
+    let restored = without_opacity
+        .tree
+        .get(OPACITY_LOWER_CHILD.as_bytes())
+        .expect("the hidden lower child is restored");
+    assert_eq!(restored.data.as_deref(), Some(OPACITY_LOWER_CHILD_BYTES));
+    assert_eq!(restored.mode, OPACITY_LOWER_CHILD_MODE);
+    assert_eq!((restored.uid, restored.gid), OPACITY_LOWER_CHILD_OWNER);
+    assert_eq!(restored.mtime, OPACITY_LOWER_MTIME);
+    let nested = without_opacity
+        .tree
+        .get(OPACITY_NESTED.as_bytes())
+        .expect("the hidden nested directory is restored");
+    assert_eq!(
+        nested.kind,
+        simferret::workload::EntryKind::Directory,
+        "the restored nested directory keeps its kind"
+    );
+    assert_eq!(nested.mode, OPACITY_NESTED_MODE);
+    assert_eq!(nested.mtime, OPACITY_LOWER_MTIME);
+    let deep = without_opacity
+        .tree
+        .get(OPACITY_NESTED_DEEP.as_bytes())
+        .expect("the hidden nested file is restored");
+    assert_eq!(deep.data.as_deref(), Some(OPACITY_NESTED_DEEP_BYTES));
+    assert_eq!(deep.mode, OPACITY_NESTED_DEEP_MODE);
+    assert_eq!(deep.mtime, OPACITY_LOWER_MTIME);
 }
 
 /// The workload reports exactly the metadata it can observe inside its root.
@@ -550,7 +607,7 @@ busybox 755 0 0 0
 replace 751 2000 2000 1700000003
 keep 640 1001 1001 1700000008 upper
 kept 644 1200 1200 1700000005 safe
-added 640 1300 1300 1700000006 added
+added 644 1300 1300 1700000006 added
 link replace/keep
 linkmode 777 1700000004
 removed=absent
@@ -790,6 +847,82 @@ fn tree_paths(tree: &simferret::workload::Tree) -> Vec<String> {
     paths
 }
 
+/// The credentials the conformance workload runs as. The runtime drops to them
+/// with no supplementary groups, so group membership is exactly `gid`.
+const CONFORMANCE_UID: u32 = 1001;
+const CONFORMANCE_GID: u32 = 1001;
+
+/// Every path the conformance script reads, so a fixture change cannot make the
+/// guest run fail on permissions the host suite never checks.
+const CONFORMANCE_READ_PATHS: &[&str] = &[
+    "/bin/busybox",
+    "/replace/keep",
+    "/hide/kept",
+    "/opaque/added",
+];
+
+/// Whether `entry` grants `bit` to the launch credentials. A mode bit is
+/// granted by the owner class, the group class, or the other class, and no
+/// other class applies because the workload has no supplementary groups.
+fn granted(entry: &simferret::workload::Entry, uid: u32, gid: u32, bit: u32) -> bool {
+    if entry.uid == uid {
+        return entry.mode & (bit << 6) != 0;
+    }
+    if entry.gid == gid {
+        return entry.mode & (bit << 3) != 0;
+    }
+    entry.mode & bit != 0
+}
+
+#[test]
+fn the_conformance_workload_can_read_every_path_it_reports() {
+    // The guest-visible test returns early without root, so an unreadable
+    // fixture would only fail in the root CI job. This test decides the same
+    // permissions the runtime grants the workload: every ancestor of a reported
+    // path must be searchable and the path itself readable by the launch
+    // credentials, and the executable must be executable.
+    let temp = TempDir::new("conformance-access");
+    let loaded = load(&assemble_conformance(&temp)).unwrap();
+    let root = loaded.tree.get(b".").expect("the canonical root exists");
+    assert!(
+        granted(root, CONFORMANCE_UID, CONFORMANCE_GID, 0o1),
+        "the workload cannot traverse the root"
+    );
+    for path in CONFORMANCE_READ_PATHS {
+        let relative = path.strip_prefix('/').expect("paths are absolute");
+        let mut prefix = String::new();
+        for component in relative.split('/') {
+            prefix = if prefix.is_empty() {
+                component.to_owned()
+            } else {
+                format!("{prefix}/{component}")
+            };
+            let entry = loaded
+                .tree
+                .get(prefix.as_bytes())
+                .unwrap_or_else(|| panic!("{path} has no {prefix}"));
+            let needed = if prefix == relative { 0o4 } else { 0o1 };
+            assert!(
+                granted(entry, CONFORMANCE_UID, CONFORMANCE_GID, needed),
+                "{prefix} is not {} for the launch credentials",
+                if needed == 0o4 {
+                    "readable"
+                } else {
+                    "searchable"
+                }
+            );
+        }
+    }
+    let executable = loaded
+        .tree
+        .get(b"bin/busybox")
+        .expect("the executable exists");
+    assert!(
+        granted(executable, CONFORMANCE_UID, CONFORMANCE_GID, 0o1),
+        "the workload cannot execute /bin/busybox"
+    );
+}
+
 #[test]
 fn template_encoding_preserves_oci_conformance_metadata() {
     // The encoded guest template is a pure function of the canonical view, so
@@ -866,7 +999,7 @@ fn template_encoding_preserves_oci_conformance_metadata() {
     // The same-layer addition under an opaque directory survives the marker and
     // keeps its own metadata.
     let added = find("workload/opaque/added");
-    assert_eq!(added.mode, 0o100640);
+    assert_eq!(added.mode, 0o100644);
     assert_eq!(
         (added.uid, added.gid, added.mtime),
         (1300, 1300, 1_700_000_006)
