@@ -1729,7 +1729,9 @@ container daemon:
 * `scripts/rfd3-phase4-acceptance.sh`, which runs the Phase 3
   record-and-two-replay demonstration for the standalone binary, the converging
   static OCI layout, and the dynamically linked OCI layout, then adds the Phase 4
-  measurements and checks; and
+  measurements and checks;
+* `scripts/rfd3-phase4-checks-test.sh`, which regression-tests the shared
+  evidence checks against leaked, malformed, and unreadable artifacts; and
 * `scripts/rfd3-phase4-runtime.sh`, which runs the guest-visible conformance
   suite as PID 1 in a private PID namespace. The test binary is built
   unprivileged, and only that namespace run uses the runner's passwordless
@@ -1745,10 +1747,16 @@ runner can run one command or the other.
 === Guest-visible OCI conformance
 
 `crates/simferret/tests/rfd3_phase4.rs` builds one local `linux/amd64` OCI layout
-with a base and an upper layer. The upper layer legally replaces `data/keep`,
-whiteouts `data/removed`, marks `data` opaque so `data/sub` and `data/lower-only`
-disappear, and adds a symbolic link; the base layer carries a non-default
-directory mode, owner, and timestamp.
+with a base and an upper layer. Each layer mechanism owns its own subtree,
+because opacity hides every lower child of its directory: the upper layer
+legally replaces `replace/keep`, whiteouts `hide/removed` while `hide/kept`
+survives, marks `opaque` opaque so its lower children disappear while the
+same-layer `opaque/added` survives, and adds a symbolic link; the base layer
+carries a non-default directory mode, owner, and timestamp.
+`each_layer_mechanism_is_independently_load_bearing` assembles four variants that
+each omit exactly one mechanism and requires the lower-layer entry that
+mechanism should have affected to reappear with its own bytes and metadata, so
+no mechanism can be masked by another.
 
 `template_encoding_preserves_oci_conformance_metadata` decodes the encoded CPIO
 template and pins every header, so a whiteout or opaque marker can never appear
@@ -1762,13 +1770,15 @@ normalized nonzero user. The workload reports what it sees inside its root:
 root 755 0 0 0
 bin 755 0 0 0
 busybox 755 0 0 0
-data 751 2000 2000 1700000003
+replace 751 2000 2000 1700000003
 keep 640 1001 1001 1700000008 upper
-link data/keep
+kept 644 1200 1200 1700000005 safe
+added 640 1300 1300 1700000006 added
+link replace/keep
 linkmode 777 1700000004
 removed=absent
-sub=absent
 lower=absent
+nested=absent
 ----
 
 Every value matches the canonical view, so modes, owners, modification times,
@@ -1781,28 +1791,42 @@ job runs it.
 === Ambient input and artifact classification
 
 `ambient_host_environment_never_enters_the_assembled_workload` asserts the launch
-environment is exactly the specification's and that no ambient variable name or
-value reaches the retained closure.
+environment is exactly the specification's and then assembles the same
+specification in a child process that carries a distinctive canary variable,
+requiring neither the canary's name nor its value to reach any retained byte.
 `an_unrelated_host_file_never_enters_the_assembled_workload` places an unrelated
-file beside the binary source and inside an OCI layout directory and requires
-neither to enter the closure. `a_host_source_path_never_enters_the_retained_closure`
-requires the host source path to stay out of the closure.
+file beside the binary source and inside an OCI layout directory, assembles each
+form twice, and requires both assemblies to agree on the closure, canonical
+tree, and template identities, on every retained raw-object digest, and on the
+absence of the unrelated path and content.
+`a_host_source_path_never_enters_the_retained_closure` walks the whole store,
+including the derived cache entry's lock, tree, and encoded template, and
+requires the host source path to stay out of every retained byte.
 
 The unprivileged acceptance run repeats the ambient check with a distinctive
-canary value and requires the canary, the host output path, and every host
-environment value to stay out of the raw closure and derived lock, while the
-recorded launch environment is exactly `["MODE=acceptance"]`. It also requires
-the run directory, the guest image cache, the workload store, and every
-host-written run artifact to be owner-only, and requires every shareable failure
-bundle to carry a typed error while excluding the recorded environment value
-(`MODE=acceptance`) and the exact workload stream bytes (`ready version=1`). The
-existing `private_run_artifacts_are_owner_only_and_failures_exclude_workload_data`
-unit test remains the focused regression.
+canary value and requires the canary, the host output path, and the recorded
+launch environment to stay out of the raw closure and derived lock, while the
+launch environment is exactly `["MODE=acceptance"]`. It also requires the run
+directory, the guest image cache, the workload store, and every host-written run
+artifact to be owner-only, and it records its own canary workload so the
+classification check has a launch value and per-run stream tokens that cannot
+occur in a shareable artifact by coincidence. Every failure bundle the Phase 3
+demonstration and the canary recording published — including the ones a
+tampered copy of a run directory published — must carry exactly a typed failure
+report and optional sanitized log tails, and must contain none of those canaries
+in plain text or in the hex encoding the event stream uses. The checks
+themselves are fail-closed and regression-tested by
+`scripts/rfd3-phase4-checks-test.sh`, which rejects a leaked canary in either
+encoding, an unexpected file or field in a bundle, a missing report, an
+unreadable tree, and a failed measurement producer. The run-level
+`private_run_artifacts_are_owner_only_and_failures_exclude_workload_data` unit
+test remains the focused regression.
 
 === Coverage map
 
 Every RFD identity class and adversarial case is covered before QEMU starts. The
-checked-in tests are:
+guest-visible metadata case is listed last because it runs the real runtime
+instead of a host-only check. The checked-in tests are:
 
 [cols="1,2",options="header"]
 |===
@@ -1814,6 +1838,7 @@ checked-in tests are:
   `replay_rejects_every_independently_changed_workload_identity` (raw object)
 | Manifest, config, stored layer, DiffID | `a_changed_manifest_and_layer_under_the_old_digest_is_rejected`,
   `a_self_consistent_config_change_is_rejected_by_relationship_checks`,
+  `corrupt_or_missing_selected_blobs_are_rejected`,
   `unsupported_oci_constructs_are_rejected_before_publication`
 | Normalized filesystem | `tampered_raw_or_derived_content_is_rejected` (`derived-tree`,
   `derived-template`), the Phase 3 acceptance `tampered-template` case
@@ -1825,6 +1850,7 @@ checked-in tests are:
 | Layer archive, per-layer duplicate, whiteout order, opacity, links |
   `duplicate_paths_in_one_layer_are_rejected`,
   `layer_semantics_are_order_independent_and_legally_replace_lower_entries`,
+  `each_layer_mechanism_is_independently_load_bearing`,
   `root_level_opacity_keeps_only_upper_layer_additions`,
   `an_opaque_marker_may_not_traverse_a_lower_symlink`,
   `additions_may_not_traverse_a_lower_non_directory`,
@@ -1850,6 +1876,13 @@ checked-in tests are:
   escaped descendant retaining a pipe
 | Replay rejections | `replay_rejects_every_independently_changed_workload_identity`,
   `a_workload_replay_divergence_never_leaks_the_launch_environment`
+| Guest-visible metadata and input exclusion |
+  `canonical_metadata_survives_cpio_encoding_and_is_visible_in_the_guest`,
+  `template_encoding_preserves_oci_conformance_metadata`,
+  `each_layer_mechanism_is_independently_load_bearing`,
+  `ambient_host_environment_never_enters_the_assembled_workload`,
+  `an_unrelated_host_file_never_enters_the_assembled_workload`,
+  `a_host_source_path_never_enters_the_retained_closure`
 |===
 
 === Measurements
@@ -1867,8 +1900,8 @@ A representative unprivileged run produced:
 ----
 qemu_version=QEMU emulator version 11.1.0
 kernel=/nix/store/s40h0m3746r0l287laa9sxa9345bkykf-linux-6.18.49/bzImage
-phase3_duration_ns=198418947542
-assembly_duration_ns=9291141
+phase3_duration_ns=243010262387
+assembly_duration_ns=7914396
 assembly_canonical=bfb6c8c9fe7ee7f612dca4b0dc76695c826ec2970bca968b3a401c21087f8c91
 assembly_closure=2ad827acc0e604d1f806ba18a4e0930fddfaf7cb67916b4694d74873f6e93e62
 assembly_entries=3
@@ -1877,8 +1910,10 @@ assembly_raw_objects=2
 assembly_store_bytes=144410
 assembly_template_bytes=71424
 ambient_identity_unchanged=bfb6c8c9fe7ee7f612dca4b0dc76695c826ec2970bca968b3a401c21087f8c91
-shareable_bundles=3
+shareable_bundles=13
+shareable_canaries=23
 shareable_excludes_environment_and_streams=yes
+classification_canary_recorded=yes
 private_artifacts=run directory, guest image cache, workload store, and run artifacts are owner-only
 guest_visible_conformance=not run here; run scripts/rfd3-phase4-runtime.sh as root
 binary_canonical=bfb6c8c9fe7ee7f612dca4b0dc76695c826ec2970bca968b3a401c21087f8c91
@@ -1901,18 +1936,21 @@ oci-dynamic_traffic_succeeded=4
 oci-dynamic_traffic_unavailable=2
 ----
 
-Assembly of the 70912-byte static fixture costs about 9ms and produces a
+Assembly of the 70912-byte static fixture costs about 8ms and produces a
 144410-byte store and a 71424-byte template; the whole Phase 3 demonstration
 records three source forms, records three intentionally corrupt runs, replays
-each successful recording twice, and runs every tamper case in about 198s. Each
+each successful recording twice, and runs every tamper case in about 243s, and
+the classification check adds one canary recording and one rejected replay. Each
 form's workload emits 551 bytes on stdout and no stderr, and originates six
 TFTP attempts: four succeed, and the two inside the bounded outage return the
 typed administrative rejection. The Phase 3 evidence above records the per-form
 record and replay durations, initramfs sizes, replay-log growth, semantic
 outcome digests, and store sizes; the phase 4 run adds assembly cost, output
-volume, and workload traffic volume. Every observed divergence remains the
-single intentional corruption, which fails `process_safety` and
-`response_integrity` with CLI status 1 for both source forms.
+volume, workload traffic volume, and the classification check, which inspected
+13 published failure bundles against 23 launch-environment and per-run stream
+canaries. Every observed divergence remains the single intentional corruption,
+which fails `process_safety` and `response_integrity` with CLI status 1 for both
+source forms.
 
 === Supported profiles, self-hosted requirements, and invocations
 
