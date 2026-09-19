@@ -294,7 +294,10 @@ fn oci_spec(layout: &str, digest: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// The base layer carries ordinary entries with non-default metadata plus the
-/// lower-layer entries the upper layer replaces, removes, or hides.
+/// lower-layer entries the upper layer replaces, removes, or hides. Each
+/// mechanism lives in its own subtree, because opacity hides every lower child of
+/// its directory: sharing one directory would let opacity mask both the
+/// replacement and the whiteout.
 fn base_layer() -> Vec<Member> {
     let busybox = busybox();
     vec![
@@ -306,6 +309,8 @@ fn base_layer() -> Vec<Member> {
         symlink("bin/stat", "busybox", 0),
         symlink("bin/readlink", "busybox", 0),
         symlink("bin/cat", "busybox", 0),
+        // Legal replacement: the upper layer writes new bytes and metadata over
+        // an existing lower-layer file in a directory nothing else touches.
         // 0751 keeps the directory traversable for the workload's "other" class
         // while proving a non-default mode, owner, and timestamp survive.
         Member {
@@ -313,61 +318,244 @@ fn base_layer() -> Vec<Member> {
             uid: 2000,
             gid: 2000,
             mtime: 1_700_000_003,
-            ..directory("data")
+            ..directory("replace")
         },
-        file_with("data/keep", b"base", 0o600, 1000, 1000, 1_700_000_007),
-        file_with("data/removed", b"gone", 0o600, 0, 0, 1_700_000_001),
-        directory("data/sub"),
-        file_with("data/sub/child", b"child", 0o644, 0, 0, 1_700_000_001),
-        file_with("data/lower-only", b"lower", 0o644, 0, 0, 1_700_000_001),
+        file_with("replace/keep", b"base", 0o600, 1000, 1000, 1_700_000_007),
+        // Whiteout: `hide/removed` is marked, and `hide/kept` must survive with
+        // its own lower-layer bytes and metadata.
+        directory("hide"),
+        file_with("hide/removed", b"gone", 0o640, 1200, 1200, 1_700_000_001),
+        file_with("hide/kept", b"safe", 0o644, 1200, 1200, 1_700_000_005),
+        // Opacity: every lower child of `opaque` must disappear, including a
+        // nested directory, while a same-layer addition survives.
+        directory("opaque"),
+        file_with("opaque/lower-child", b"hidden", 0o644, 0, 0, 1_700_000_001),
+        Member {
+            mtime: 1_700_000_001,
+            ..directory("opaque/nested")
+        },
+        file_with("opaque/nested/deep", b"deep", 0o644, 0, 0, 1_700_000_001),
     ]
 }
 
 /// The upper layer legally replaces one file, whiteouts one lower path, marks
-/// `data` opaque so every remaining lower child is hidden, and adds a symlink.
-/// The markers appear after the additions they coexist with, so an
-/// implementation that applied markers in archive order would delete the
-/// same-layer addition and change the asserted tree.
+/// `opaque` opaque, and adds a symlink and a file. The markers appear after the
+/// additions they coexist with, so an implementation that applied markers in
+/// archive order would delete the same-layer additions and change the asserted
+/// tree.
 fn upper_layer() -> Vec<Member> {
     vec![
-        Member {
-            mode: 0o751,
-            uid: 2000,
-            gid: 2000,
-            mtime: 1_700_000_003,
-            ..directory("data")
-        },
-        file_with("data/keep", b"upper", 0o640, 1001, 1001, 1_700_000_008),
-        file_with("data/.wh.removed", b"", 0o644, 0, 0, 0),
-        file_with("data/.wh..wh..opq", b"", 0o644, 0, 0, 0),
-        symlink("link", "data/keep", 1_700_000_004),
+        // The replacement shares its directory with no marker.
+        file_with("replace/keep", b"upper", 0o640, 1001, 1001, 1_700_000_008),
+        // The whiteout shares its directory only with `kept`.
+        file_with(WHITEOUT_MARKER, b"", 0o644, 0, 0, 0),
+        // The opaque marker shares its directory with a same-layer addition.
+        file_with(OPACITY_MARKER, b"", 0o644, 0, 0, 0),
+        file_with("opaque/added", b"added", 0o640, 1300, 1300, 1_700_000_006),
+        symlink("link", "replace/keep", 1_700_000_004),
     ]
+}
+
+/// The lower-layer entry the upper layer legally replaces.
+const REPLACEMENT_PATH: &str = "replace/keep";
+const REPLACEMENT_LOWER: &[u8] = b"base";
+const REPLACEMENT_LOWER_MODE: u32 = 0o600;
+/// The lower-layer entry the upper layer whiteouts, and its sibling that must
+/// survive the same marker.
+const WHITEOUT_MARKER: &str = "hide/.wh.removed";
+const WHITEOUT_PATH: &str = "hide/removed";
+const WHITEOUT_LOWER: &[u8] = b"gone";
+const WHITEOUT_SURVIVOR: &str = "hide/kept";
+/// The directory the upper layer marks opaque, its lower-layer children, and the
+/// same-layer addition that must survive the marker.
+const OPACITY_MARKER: &str = "opaque/.wh..wh..opq";
+const OPACITY_DIRECTORY: &str = "opaque";
+const OPACITY_LOWER_CHILDREN: &[&str] =
+    &["opaque/lower-child", "opaque/nested", "opaque/nested/deep"];
+const OPACITY_ADDITION: &str = "opaque/added";
+
+/// One upper-layer mechanism a variant layout omits, so the conformance suite can
+/// prove each mechanism is load-bearing on its own rather than being masked by
+/// another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mechanism {
+    None,
+    Replacement,
+    Whiteout,
+    Opacity,
+}
+
+/// The upper layer with exactly one mechanism removed.
+fn upper_layer_without(mechanism: Mechanism) -> Vec<Member> {
+    upper_layer()
+        .into_iter()
+        .filter(|member| match mechanism {
+            Mechanism::None => true,
+            Mechanism::Replacement => member.name != REPLACEMENT_PATH,
+            Mechanism::Whiteout => member.name != WHITEOUT_MARKER,
+            Mechanism::Opacity => member.name != OPACITY_MARKER,
+        })
+        .collect()
+}
+
+/// Write a conformance layout that omits `mechanism` from its upper layer and
+/// return the selected manifest digest.
+fn write_conformance_layout(directory: &Path, mechanism: Mechanism) -> String {
+    let config = json!({
+        "config": {
+            "Entrypoint": [INSTALL_PATH, "sh", "-c", CONFORMANCE_SCRIPT],
+            "Env": ["PATH=/bin"],
+            "User": "1001:1001",
+            "WorkingDir": "/",
+        }
+    });
+    write_layout(
+        directory,
+        &[base_layer(), upper_layer_without(mechanism)],
+        config,
+    )
+}
+
+/// Assemble one conformance variant into its own store under `temp`. The layout
+/// locator must be relative to the specification, so each variant gets its own
+/// directory holding the layout, the specification, and the store.
+fn assemble_variant(temp: &TempDir, name: &str, mechanism: Mechanism) -> PathBuf {
+    let form = temp.join(name);
+    let layout = form.join("layout");
+    let digest = write_conformance_layout(&layout, mechanism);
+    let specification = form.join("workload.toml");
+    fs::write(&specification, oci_spec("layout", &digest)).unwrap();
+    let store = form.join("store");
+    assemble(&specification, &store).unwrap();
+    store
+}
+
+#[test]
+fn each_layer_mechanism_is_independently_load_bearing() {
+    // A conformance fixture that put the replacement, the whiteout, and the
+    // opacity marker in one directory would prove nothing about the whiteout and
+    // nothing about the replacement: opacity hides every lower child of its
+    // directory, so both cases would pass even if the marker or the replacement
+    // were dropped. Each variant here omits exactly one mechanism and requires
+    // the lower-layer entry the mechanism should have affected to survive with
+    // its original bytes and metadata.
+    let temp = TempDir::new("mechanism-controls");
+
+    let baseline = load(&assemble_variant(&temp, "baseline", Mechanism::None)).unwrap();
+    assert!(
+        baseline.tree.get(WHITEOUT_PATH.as_bytes()).is_none(),
+        "the whiteout target survives the baseline"
+    );
+    assert_eq!(
+        baseline
+            .tree
+            .get(WHITEOUT_SURVIVOR.as_bytes())
+            .expect("the whiteout leaves its sibling alone")
+            .data
+            .as_deref(),
+        Some(b"safe".as_slice())
+    );
+    assert_eq!(
+        baseline
+            .tree
+            .get(REPLACEMENT_PATH.as_bytes())
+            .expect("the replacement survives")
+            .data
+            .as_deref(),
+        Some(b"upper".as_slice())
+    );
+    for path in OPACITY_LOWER_CHILDREN {
+        assert!(
+            baseline.tree.get(path.as_bytes()).is_none(),
+            "{path} survives the baseline"
+        );
+    }
+    let addition = baseline
+        .tree
+        .get(OPACITY_ADDITION.as_bytes())
+        .expect("the opacity addition survives");
+    assert_eq!(addition.data.as_deref(), Some(b"added".as_slice()));
+    assert_eq!(
+        addition.mode, 0o640,
+        "the opacity addition keeps its own metadata"
+    );
+
+    let without_whiteout =
+        load(&assemble_variant(&temp, "no-whiteout", Mechanism::Whiteout)).unwrap();
+    let survivor = without_whiteout
+        .tree
+        .get(WHITEOUT_PATH.as_bytes())
+        .unwrap_or_else(|| {
+            panic!(
+                "omitting the whiteout marker did not restore {WHITEOUT_PATH}, so the \
+                 marker is not what removed it"
+            )
+        });
+    assert_eq!(survivor.data.as_deref(), Some(WHITEOUT_LOWER));
+
+    let without_replacement = load(&assemble_variant(
+        &temp,
+        "no-replacement",
+        Mechanism::Replacement,
+    ))
+    .unwrap();
+    let survivor = without_replacement
+        .tree
+        .get(REPLACEMENT_PATH.as_bytes())
+        .unwrap_or_else(|| {
+            panic!(
+                "omitting the replacement did not restore {REPLACEMENT_PATH}, so the \
+                 replacement is not what replaced it"
+            )
+        });
+    assert_eq!(survivor.data.as_deref(), Some(REPLACEMENT_LOWER));
+    assert_eq!(survivor.mode, REPLACEMENT_LOWER_MODE);
+
+    let without_opacity = load(&assemble_variant(&temp, "no-opacity", Mechanism::Opacity)).unwrap();
+    assert!(
+        without_opacity
+            .tree
+            .get(OPACITY_DIRECTORY.as_bytes())
+            .is_some(),
+        "the marked directory itself survives the marker"
+    );
+    for path in OPACITY_LOWER_CHILDREN {
+        assert!(
+            without_opacity.tree.get(path.as_bytes()).is_some(),
+            "omitting the opaque marker did not restore {path}, so the marker is not \
+             what hid it"
+        );
+    }
 }
 
 /// The workload reports exactly the metadata it can observe inside its root.
 const CONFORMANCE_SCRIPT: &str = r#"printf 'root %s\n' "$(stat -c '%a %u %g %Y' /)"
 printf 'bin %s\n' "$(stat -c '%a %u %g %Y' /bin)"
 printf 'busybox %s\n' "$(stat -c '%a %u %g %Y' /bin/busybox)"
-printf 'data %s\n' "$(stat -c '%a %u %g %Y' /data)"
-printf 'keep %s %s\n' "$(stat -c '%a %u %g %Y' /data/keep)" "$(cat /data/keep)"
+printf 'replace %s\n' "$(stat -c '%a %u %g %Y' /replace)"
+printf 'keep %s %s\n' "$(stat -c '%a %u %g %Y' /replace/keep)" "$(cat /replace/keep)"
+printf 'kept %s %s\n' "$(stat -c '%a %u %g %Y' /hide/kept)" "$(cat /hide/kept)"
+printf 'added %s %s\n' "$(stat -c '%a %u %g %Y' /opaque/added)" "$(cat /opaque/added)"
 printf 'link %s\n' "$(readlink /link)"
 printf 'linkmode %s\n' "$(stat -c '%a %Y' /link)"
-if [ -e /data/removed ]; then printf 'removed=present\n'; else printf 'removed=absent\n'; fi
-if [ -e /data/sub ]; then printf 'sub=present\n'; else printf 'sub=absent\n'; fi
-if [ -e /data/lower-only ]; then printf 'lower=present\n'; else printf 'lower=absent\n'; fi
+if [ -e /hide/removed ]; then printf 'removed=present\n'; else printf 'removed=absent\n'; fi
+if [ -e /opaque/lower-child ]; then printf 'lower=present\n'; else printf 'lower=absent\n'; fi
+if [ -e /opaque/nested ]; then printf 'nested=present\n'; else printf 'nested=absent\n'; fi
 "#;
 
 const CONFORMANCE_EXPECTED: &str = "\
 root 755 0 0 0
 bin 755 0 0 0
 busybox 755 0 0 0
-data 751 2000 2000 1700000003
+replace 751 2000 2000 1700000003
 keep 640 1001 1001 1700000008 upper
-link data/keep
+kept 644 1200 1200 1700000005 safe
+added 640 1300 1300 1700000006 added
+link replace/keep
 linkmode 777 1700000004
 removed=absent
-sub=absent
 lower=absent
+nested=absent
 ";
 
 // ---------------------------------------------------------------------------
@@ -545,6 +733,63 @@ fn assemble_conformance(temp: &TempDir) -> PathBuf {
     store
 }
 
+/// Whether `haystack` contains `needle` anywhere, for byte-level leak checks.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Every regular file below one directory with its bytes, so a test can prove a
+/// canary never reaches a retained artifact. The paths are relative to `root`.
+fn stored_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let entry = entry.unwrap();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                files.push((
+                    entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(entry.path()).unwrap(),
+                ));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Every retained raw object digest, sorted, so two stores can be compared by
+/// content rather than by path.
+fn raw_object_digests(store: &Path) -> Vec<String> {
+    let mut digests = fs::read_dir(store.join("raw/sha256"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    digests.sort();
+    digests
+}
+
+/// The retained raw closure as parsed JSON, so a test can assert on the values
+/// the closure records instead of searching its text for names it never holds.
+fn closure_value(store: &Path) -> Value {
+    serde_json::from_slice(&fs::read(store.join("raw/closure.json")).unwrap()).unwrap()
+}
+
+/// Every entry path in a canonical tree, sorted.
+fn tree_paths(tree: &simferret::workload::Tree) -> Vec<String> {
+    let mut paths: Vec<String> = tree
+        .iter()
+        .map(|(path, _)| String::from_utf8_lossy(path).into_owned())
+        .collect();
+    paths.sort();
+    paths
+}
+
 #[test]
 fn template_encoding_preserves_oci_conformance_metadata() {
     // The encoded guest template is a pure function of the canonical view, so
@@ -569,9 +814,13 @@ fn template_encoding_preserves_oci_conformance_metadata() {
             "workload/bin/readlink",
             "workload/bin/sh",
             "workload/bin/stat",
-            "workload/data",
-            "workload/data/keep",
+            "workload/hide",
+            "workload/hide/kept",
             "workload/link",
+            "workload/opaque",
+            "workload/opaque/added",
+            "workload/replace",
+            "workload/replace/keep",
         ]
     );
     let find = |name: &str| {
@@ -585,14 +834,18 @@ fn template_encoding_preserves_oci_conformance_metadata() {
     assert_eq!(root.mode, 0o040755);
     assert_eq!((root.uid, root.gid, root.mtime), (0, 0, 0));
 
-    let data = find("workload/data");
-    assert_eq!(data.mode, 0o040751);
+    let replacement_directory = find("workload/replace");
+    assert_eq!(replacement_directory.mode, 0o040751);
     assert_eq!(
-        (data.uid, data.gid, data.mtime),
+        (
+            replacement_directory.uid,
+            replacement_directory.gid,
+            replacement_directory.mtime
+        ),
         (2000, 2000, 1_700_000_003)
     );
 
-    let keep = find("workload/data/keep");
+    let keep = find("workload/replace/keep");
     assert_eq!(keep.mode, 0o100640);
     assert_eq!(
         (keep.uid, keep.gid, keep.mtime),
@@ -600,10 +853,30 @@ fn template_encoding_preserves_oci_conformance_metadata() {
     );
     assert_eq!(keep.data, b"upper");
 
+    // The whiteout removes only `removed`; its sibling keeps the lower-layer
+    // bytes and metadata the same layer never touched.
+    let kept = find("workload/hide/kept");
+    assert_eq!(kept.mode, 0o100644);
+    assert_eq!(
+        (kept.uid, kept.gid, kept.mtime),
+        (1200, 1200, 1_700_000_005)
+    );
+    assert_eq!(kept.data, b"safe");
+
+    // The same-layer addition under an opaque directory survives the marker and
+    // keeps its own metadata.
+    let added = find("workload/opaque/added");
+    assert_eq!(added.mode, 0o100640);
+    assert_eq!(
+        (added.uid, added.gid, added.mtime),
+        (1300, 1300, 1_700_000_006)
+    );
+    assert_eq!(added.data, b"added");
+
     let link = find("workload/link");
     assert_eq!(link.mode, 0o120777);
     assert_eq!(link.mtime, 1_700_000_004);
-    assert_eq!(link.data, b"data/keep");
+    assert_eq!(link.data, b"replace/keep");
 
     let busybox = find("workload/bin/busybox");
     assert_eq!(busybox.mode, 0o100755);
@@ -619,14 +892,27 @@ fn canonical_metadata_survives_cpio_encoding_and_is_visible_in_the_guest() {
     let loaded = load(&store).unwrap();
 
     // The host-side canonical view already carries the layer semantics.
-    assert!(loaded.tree.get(b"data/removed").is_none());
-    assert!(loaded.tree.get(b"data/sub").is_none());
-    assert!(loaded.tree.get(b"data/lower-only").is_none());
-    assert!(loaded.tree.get(b"data/.wh.removed").is_none());
-    assert!(loaded.tree.get(b"data/.wh..wh..opq").is_none());
+    for path in OPACITY_LOWER_CHILDREN {
+        assert!(
+            loaded.tree.get(path.as_bytes()).is_none(),
+            "{path} survives the baseline"
+        );
+    }
+    assert!(loaded.tree.get(WHITEOUT_PATH.as_bytes()).is_none());
+    assert!(loaded.tree.get(WHITEOUT_MARKER.as_bytes()).is_none());
+    assert!(loaded.tree.get(OPACITY_MARKER.as_bytes()).is_none());
+    assert_eq!(
+        loaded
+            .tree
+            .get(WHITEOUT_SURVIVOR.as_bytes())
+            .expect("the whiteout leaves its sibling alone")
+            .data
+            .as_deref(),
+        Some(b"safe".as_slice())
+    );
     let keep = loaded
         .tree
-        .get(b"data/keep")
+        .get(REPLACEMENT_PATH.as_bytes())
         .expect("the replacement survives");
     assert_eq!(keep.data.as_deref(), Some(b"upper".as_slice()));
     assert_eq!(
@@ -679,26 +965,52 @@ fn ambient_host_environment_never_enters_the_assembled_workload() {
     let first = assemble(&temp.join("workload.toml"), &temp.join("store-a")).unwrap();
     let loaded = load(&temp.join("store-a")).unwrap();
     // The launch environment is exactly the specification's, so no ambient
-    // variable is inherited.
+    // variable can be inherited whatever this process's environment holds.
     assert_eq!(
         loaded.launch.environment,
         vec!["MODE=acceptance".to_string()]
     );
+    assert_eq!(
+        closure_value(&temp.join("store-a"))["launch"]["environment"],
+        json!(["MODE=acceptance"])
+    );
 
-    // No ambient variable name or value reaches the retained closure. The
-    // canaries are the test process's own environment values, so this holds
-    // without mutating the environment of a parallel test process.
-    let closure = fs::read_to_string(temp.join("store-a/raw/closure.json")).unwrap();
-    for name in ["PATH", "HOME"] {
-        if let Ok(value) = std::env::var(name)
-            && !value.is_empty()
-        {
+    // A distinctive canary in the assembling process's environment must not
+    // reach any retained artifact. The canary is set on a child process, so the
+    // assertion neither depends on nor mutates this test process's environment,
+    // and the canary value cannot occur in the store by coincidence.
+    let canary_name = "SIMFERRET_PHASE4_AMBIENT_CANARY";
+    let canary_value = "simferret-phase4-ambient-canary-6f2a1c";
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_simferret"))
+        .args(["workload", "assemble", "--specification"])
+        .arg(temp.join("workload.toml"))
+        .arg("--store")
+        .arg(temp.join("store-canary"))
+        .env(canary_name, canary_value)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the canary assembly failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let canary_store = temp.join("store-canary");
+    let canary_loaded = load(&canary_store).unwrap();
+    assert_eq!(
+        canary_loaded.canonical_digest, loaded.canonical_digest,
+        "an ambient variable changed the canonical identity"
+    );
+    assert_eq!(canary_loaded.closure_sha256, first.closure_sha256);
+    assert_eq!(canary_loaded.launch.environment, loaded.launch.environment);
+    for (path, bytes) in stored_files(&canary_store) {
+        for needle in [canary_name.as_bytes(), canary_value.as_bytes()] {
             assert!(
-                !closure.contains(&value),
-                "the {name} value entered the closure: {closure}"
+                !contains(&bytes, needle),
+                "{} carries {:?}",
+                path.display(),
+                String::from_utf8_lossy(needle)
             );
         }
-        assert!(!closure.contains(&format!("{name}=")), "{closure}");
     }
 
     // Assembly is deterministic: a second assembly of the same source
@@ -711,43 +1023,93 @@ fn ambient_host_environment_never_enters_the_assembled_workload() {
 
 #[test]
 fn an_unrelated_host_file_never_enters_the_assembled_workload() {
+    // The raw closure records roles, digests, and byte counts and never file
+    // names, so searching its text for a name proves nothing. Each source form
+    // is therefore assembled twice: once alone, and once with an unrelated
+    // regular file beside the binary source and inside the OCI layout
+    // directory. Every identity, every retained raw object, the canonical tree,
+    // and the encoded guest template must be identical.
     let temp = TempDir::new("unrelated");
     fs::write(temp.join("app"), static_elf()).unwrap();
     fs::write(temp.join("workload.toml"), binary_spec("app", "1000:1000")).unwrap();
-    // An unrelated regular file beside the source and an unrelated blob in an
-    // OCI layout must not enter the closure.
-    fs::write(temp.join("unrelated-host-file"), b"host-marker").unwrap();
-
     let layout = temp.join("layout");
     let digest = write_layout(
         &layout,
         &[base_layer()],
         json!({"config": {"Entrypoint": [INSTALL_PATH], "User": "1000:1000"}}),
     );
-    fs::write(temp.join("layout/unrelated-host-file"), b"layout-marker").unwrap();
     fs::write(temp.join("oci.toml"), oci_spec("layout", &digest)).unwrap();
+
+    let baseline_binary =
+        assemble(&temp.join("workload.toml"), &temp.join("baseline-binary")).unwrap();
+    let baseline_oci = assemble(&temp.join("oci.toml"), &temp.join("baseline-oci")).unwrap();
+    let baseline_binary_objects = raw_object_digests(&temp.join("baseline-binary"));
+    let baseline_oci_objects = raw_object_digests(&temp.join("baseline-oci"));
+
+    fs::write(temp.join("unrelated-host-file"), b"host-marker").unwrap();
+    fs::write(layout.join("unrelated-host-file"), b"layout-marker").unwrap();
 
     let binary = assemble(&temp.join("workload.toml"), &temp.join("store-binary")).unwrap();
     assert_eq!(
         binary.entries, 3,
         "only the root, bin, and the executable are present"
     );
-    let binary_closure = fs::read_to_string(temp.join("store-binary/raw/closure.json")).unwrap();
-    assert!(
-        !binary_closure.contains("unrelated-host-file"),
-        "{binary_closure}"
+    assert_eq!(binary.entries, baseline_binary.entries);
+    assert_eq!(binary.canonical_digest, baseline_binary.canonical_digest);
+    assert_eq!(binary.closure_sha256, baseline_binary.closure_sha256);
+    assert_eq!(binary.tree_sha256, baseline_binary.tree_sha256);
+    assert_eq!(binary.template_sha256, baseline_binary.template_sha256);
+    assert_eq!(binary.expanded_bytes, baseline_binary.expanded_bytes);
+    assert_eq!(binary.raw_objects, baseline_binary.raw_objects);
+    assert_eq!(
+        raw_object_digests(&temp.join("store-binary")),
+        baseline_binary_objects,
+        "an unrelated file beside the source changed the retained objects"
     );
 
     let oci = assemble(&temp.join("oci.toml"), &temp.join("store-oci")).unwrap();
-    assert!(
-        !oci.tree_sha256.is_empty(),
-        "the OCI source assembles without the unrelated layout file"
+    assert_eq!(oci.entries, baseline_oci.entries);
+    assert_eq!(oci.canonical_digest, baseline_oci.canonical_digest);
+    assert_eq!(oci.closure_sha256, baseline_oci.closure_sha256);
+    assert_eq!(oci.tree_sha256, baseline_oci.tree_sha256);
+    assert_eq!(oci.template_sha256, baseline_oci.template_sha256);
+    assert_eq!(oci.expanded_bytes, baseline_oci.expanded_bytes);
+    assert_eq!(oci.raw_objects, baseline_oci.raw_objects);
+    assert_eq!(
+        raw_object_digests(&temp.join("store-oci")),
+        baseline_oci_objects,
+        "an unrelated file inside the layout changed the retained objects"
     );
-    let oci_closure = fs::read_to_string(temp.join("store-oci/raw/closure.json")).unwrap();
-    assert!(
-        !oci_closure.contains("unrelated-host-file"),
-        "{oci_closure}"
-    );
+
+    // The canonical tree and the encoded template both name every entry they
+    // carry, so neither may name an unrelated file, and no retained byte may
+    // carry its content.
+    for store in [temp.join("store-binary"), temp.join("store-oci")] {
+        let loaded = load(&store).unwrap();
+        let paths = tree_paths(&loaded.tree);
+        assert!(
+            paths.iter().all(|path| !path.contains("unrelated")),
+            "{paths:?}"
+        );
+        let names: Vec<String> = decode_cpio(&loaded.template)
+            .iter()
+            .map(|entry| String::from_utf8_lossy(&entry.name).into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.contains("unrelated")),
+            "{names:?}"
+        );
+        for (path, bytes) in stored_files(&store) {
+            for marker in [b"host-marker".as_slice(), b"layout-marker".as_slice()] {
+                assert!(
+                    !contains(&bytes, marker),
+                    "{} carries {:?}",
+                    path.display(),
+                    String::from_utf8_lossy(marker)
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -755,19 +1117,36 @@ fn a_host_source_path_never_enters_the_retained_closure() {
     let temp = TempDir::new("host-path");
     fs::write(temp.join("app"), static_elf()).unwrap();
     fs::write(temp.join("workload.toml"), binary_spec("app", "1000:1000")).unwrap();
-    assemble(&temp.join("workload.toml"), &temp.join("store")).unwrap();
+    let assembled = assemble(&temp.join("workload.toml"), &temp.join("store")).unwrap();
+    let store = temp.join("store");
 
     let root = temp.0.to_str().unwrap();
-    for name in ["raw/closure.json", "derived"] {
-        let path = temp.join("store").join(name);
-        if path.is_file() {
-            let contents = fs::read_to_string(&path).unwrap();
-            assert!(
-                !contents.contains(root),
-                "{name} carries the host path: {contents}"
-            );
-        }
+    // The derived cache entry is a directory, so it has to be walked rather
+    // than read as one file: the lock and the encoded template are host-written
+    // artifacts that must not name the host path either.
+    let derived = store.join("derived").join(&assembled.canonical_digest);
+    assert!(
+        derived.is_dir(),
+        "the derived cache entry must be a directory"
+    );
+    for name in ["lock.json", "template.cpio", "tree.bin"] {
+        let bytes = fs::read(derived.join(name)).unwrap();
+        assert!(
+            !contains(&bytes, root.as_bytes()),
+            "derived/{name} carries the host path"
+        );
     }
-    let closure = fs::read_to_string(temp.join("store/raw/closure.json")).unwrap();
-    assert!(!closure.contains(root), "{closure}");
+    let closure = fs::read(store.join("raw/closure.json")).unwrap();
+    assert!(
+        !contains(&closure, root.as_bytes()),
+        "the raw closure carries the host path"
+    );
+    // No other retained byte may carry it either.
+    for (path, bytes) in stored_files(&store) {
+        assert!(
+            !contains(&bytes, root.as_bytes()),
+            "{} carries the host path",
+            path.display()
+        );
+    }
 }
