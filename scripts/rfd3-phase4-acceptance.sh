@@ -256,8 +256,7 @@ fi
 
 # Every shareable bundle the Phase 3 demonstration and the canary recording
 # published, including the ones a tampered copy of a run directory published.
-if ! bundle_list="$(find "$phase3_run" "$canary_dir/runs" -type d -name failures \
-  -exec find {} -mindepth 1 -maxdepth 1 -type d \; | sort)"; then
+if ! bundle_list="$(published_bundles "$phase3_run" "$canary_dir/runs")"; then
   echo "the published shareable bundles could not be listed" >&2
   exit 1
 fi

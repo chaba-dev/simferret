@@ -318,6 +318,43 @@ mkdir -p "$truncated_lock"
 expect_fail "a lock jq cannot finish reading" \
   "cannot read the launch environment" environment_canaries "$truncated_lock"
 
+# published_bundles: discovery has to report every published bundle and fail
+# rather than return a partial list. A nested `find -exec` reports a failing
+# child as an expression result, so the two steps are listed separately.
+discovery_root="$test_root/discovery"
+mkdir -p "$discovery_root/first/failures/bundle-a" \
+  "$discovery_root/second/failures/bundle-b" \
+  "$discovery_root/second/failures/bundle-c" \
+  "$discovery_root/second/not-a-failure"
+if ! discovered_list="$(published_bundles "$discovery_root")"; then
+  echo "published_bundles failed on a readable tree" >&2
+  exit 1
+fi
+mapfile -t discovered <<<"$discovered_list"
+if [[ "${#discovered[@]}" -ne 3 ]]; then
+  echo "published_bundles found ${#discovered[@]} bundles; expected 3" >&2
+  printf '%s\n' "${discovered[@]}" >&2
+  exit 1
+fi
+for expected in \
+  "$discovery_root/first/failures/bundle-a" \
+  "$discovery_root/second/failures/bundle-b" \
+  "$discovery_root/second/failures/bundle-c"; do
+  if ! printf '%s\n' "${discovered[@]}" | grep -F -x -- "$expected" >/dev/null; then
+    echo "published_bundles did not list $expected" >&2
+    exit 1
+  fi
+done
+expect_fail "a bundle root that cannot be listed" \
+  "could not be listed" published_bundles "$discovery_root" "$test_root/no-such-root"
+if [[ "$(id -u)" -ne 0 ]]; then
+  mkdir -p "$discovery_root/third/failures/hidden"
+  chmod 000 "$discovery_root/third/failures"
+  expect_fail "an unreadable failures directory" \
+    "could not be listed" published_bundles "$discovery_root/third"
+  chmod 700 "$discovery_root/third/failures"
+fi
+
 # require_canary_bundle: the canary recording's own bundle has to be one of the
 # inspected bundles, or the classification check would silently test other
 # bundles' results.

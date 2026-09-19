@@ -56,9 +56,13 @@ bundle = sys.argv[1]
 canaries = sys.argv[2:]
 allowed = {"failure.json", "logs/qemu.log", "logs/serial.log"}
 report_fields = {"version", "error_kind", "error", "diagnostics"}
-# The published FailureReport and FailureDiagnostics structures. Every field is
-# required and no other field is published, so a report that carries an
-# unexpected nested value fails here even when its value is not a known canary.
+# The published FailureReport and FailureDiagnostics structures, validated to
+# the depth that can carry a private value: the report and diagnostics fields
+# are exact, the traffic and packet-counter objects are exact, and `network`
+# and the fault transitions are checked as containers rather than field by
+# field. Every field is required and no other field is published, so a report
+# that carries an unexpected nested value fails here even when its value is not
+# a known canary.
 diagnostic_fields = {
     "operation",
     "stage",
@@ -237,6 +241,35 @@ environment_canaries() {
     return 1
   fi
   printf '%s\n%s\n' "$entry" "${entry#*=}"
+}
+
+# published_bundles ROOT...
+#
+# Print every shareable bundle below the given roots, one per line, sorted. The
+# discovery is checked in two steps because a nested `find -exec` reports the
+# child's failure as an expression result rather than as an exit status: a
+# partial list must never be mistaken for the published set.
+published_bundles() {
+  local root="$1"
+  shift
+  local failures bundle
+  if ! failures="$(
+    find "$root" "$@" -type d -name failures | sort
+  )"; then
+    printf 'the published failure directories could not be listed\n' >&2
+    return 1
+  fi
+  while IFS= read -r directory; do
+    [[ -n "$directory" ]] || continue
+    if ! bundle_list="$(find "$directory" -mindepth 1 -maxdepth 1 -type d | sort)"; then
+      printf 'the shareable bundles under %s could not be listed\n' "$directory" >&2
+      return 1
+    fi
+    while IFS= read -r bundle; do
+      [[ -n "$bundle" ]] || continue
+      printf '%s\n' "$bundle"
+    done <<<"$bundle_list"
+  done <<<"$failures"
 }
 
 # require_canary_bundle BUNDLE_DIR BUNDLE...
