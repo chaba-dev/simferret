@@ -847,8 +847,10 @@ fn tree_paths(tree: &simferret::workload::Tree) -> Vec<String> {
     paths
 }
 
-/// The credentials the conformance workload runs as. The runtime drops to them
-/// with no supplementary groups, so group membership is exactly `gid`.
+/// The credentials the conformance fixture declares. The permission test
+/// asserts the loaded launch identity matches them and then decides permissions
+/// for that identity, so changing the fixture's `User` cannot leave the check
+/// evaluating credentials the runtime does not use.
 const CONFORMANCE_UID: u32 = 1001;
 const CONFORMANCE_GID: u32 = 1001;
 
@@ -883,9 +885,15 @@ fn the_conformance_workload_can_read_every_path_it_reports() {
     // credentials, and the executable must be executable.
     let temp = TempDir::new("conformance-access");
     let loaded = load(&assemble_conformance(&temp)).unwrap();
+    let (uid, gid) = (loaded.launch.uid, loaded.launch.gid);
+    assert_eq!(
+        (uid, gid),
+        (CONFORMANCE_UID, CONFORMANCE_GID),
+        "the conformance workload's credentials changed"
+    );
     let root = loaded.tree.get(b".").expect("the canonical root exists");
     assert!(
-        granted(root, CONFORMANCE_UID, CONFORMANCE_GID, 0o1),
+        granted(root, uid, gid, 0o1),
         "the workload cannot traverse the root"
     );
     for path in CONFORMANCE_READ_PATHS {
@@ -903,7 +911,7 @@ fn the_conformance_workload_can_read_every_path_it_reports() {
                 .unwrap_or_else(|| panic!("{path} has no {prefix}"));
             let needed = if prefix == relative { 0o4 } else { 0o1 };
             assert!(
-                granted(entry, CONFORMANCE_UID, CONFORMANCE_GID, needed),
+                granted(entry, uid, gid, needed),
                 "{prefix} is not {} for the launch credentials",
                 if needed == 0o4 {
                     "readable"
@@ -918,7 +926,7 @@ fn the_conformance_workload_can_read_every_path_it_reports() {
         .get(b"bin/busybox")
         .expect("the executable exists");
     assert!(
-        granted(executable, CONFORMANCE_UID, CONFORMANCE_GID, 0o1),
+        granted(executable, uid, gid, 0o1),
         "the workload cannot execute /bin/busybox"
     );
 }
