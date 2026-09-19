@@ -371,44 +371,61 @@ content-addressed guest workload, and preserve exact passive replay.
 
 * Phase 4 — Acceptance and evidence
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
-- [ ] Automate both record-and-two-replay demonstrations on GitHub-hosted x86-64
-  Linux without elevated privileges or a container daemon.
-- [ ] Cover every workload identity class with compatibility or tampering tests.
-- [ ] Cover adversarial descriptor, layer-archive, whiteout, path, link, file
+- [X] Automate both record-and-two-replay demonstrations on GitHub-hosted x86-64
+  Linux without elevated privileges or a container daemon. ~ci.yml~ runs
+  ~scripts/rfd3-phase4-acceptance.sh~, which runs the Phase 3 demonstration for
+  both source forms and the dynamically linked OCI fixture.
+- [X] Cover every workload identity class with compatibility or tampering tests.
+  ~EVIDENCE.adoc~ maps each RFD identity class to its checked-in test.
+- [X] Cover adversarial descriptor, layer-archive, whiteout, path, link, file
   type, per-layer duplicate, expansion, immutable-read, and raw/derived cache
-  cases before VM launch.
-- [ ] Verify canonical modes, owners, modification times, links, replacements,
+  cases before VM launch. ~EVIDENCE.adoc~ carries the coverage map.
+- [X] Verify canonical modes, owners, modification times, links, replacements,
   whiteouts, and opacity survive CPIO encoding and are visible in the guest.
-- [ ] Verify no ambient host environment, mutable source, or unrelated host file
-  enters the assembled workload.
-- [ ] Verify shareable successful-run metadata and failure bundles exclude raw
+  ~crates/simferret/tests/rfd3_phase4.rs~ encodes a real OCI conformance layout,
+  decodes the template, and runs the real runtime as PID 1 in a private PID
+  namespace through ~scripts/rfd3-phase4-runtime.sh~.
+- [X] Verify no ambient host environment, mutable source, or unrelated host file
+  enters the assembled workload. The Phase 4 suite and the acceptance run check
+  each case independently.
+- [X] Verify shareable successful-run metadata and failure bundles exclude raw
   config, lock values, environment values, and workload bytes, while private
-  artifacts are owner-only and explicitly classified.
-- [ ] Document supported OCI and binary profiles, self-hosted requirements, and
-  exact invocations.
-- [ ] Record assembly cost, initramfs and replay-log growth, record and replay
+  artifacts are owner-only and explicitly classified. The acceptance run checks
+  the modes and the bundle contents; the run-level unit test remains the focused
+  regression.
+- [X] Document supported OCI and binary profiles, self-hosted requirements, and
+  exact invocations in ~README.md~ and ~EVIDENCE.adoc~.
+- [X] Record assembly cost, initramfs and replay-log growth, record and replay
   duration, workload traffic and output volume, and all observed divergence in
   ~EVIDENCE.adoc~.
-- [ ] Decide whether checkpoint branching, OCI-profile expansion, or serial
-  control optimization is the next evidence-driven RFD.
+- [X] Decide whether checkpoint branching, OCI-profile expansion, or serial
+  control optimization is the next evidence-driven RFD. ~EVIDENCE.adoc~
+  recommends checkpoint branching.
 
 * Exit criteria
 
-- [ ] Every acceptance criterion in the RFD has linked automated or captured
-  evidence.
-- [ ] Binary and OCI inputs converge before the guest runtime boundary.
-- [ ] Replay reconstructs workload identity independently and uses no live or
+- [X] Every acceptance criterion in the RFD has linked automated or captured
+  evidence. ~EVIDENCE.adoc~ carries the acceptance and coverage maps.
+- [X] Binary and OCI inputs converge before the guest runtime boundary. The
+  Phase 1 convergence test and the Phase 3 acceptance agree on one canonical
+  digest for the standalone binary and the static OCI source.
+- [X] Replay reconstructs workload identity independently and uses no live or
   ambient workload input after QEMU starts; derived cache alone is insufficient.
-- [ ] The packaged workload demonstrably owns the process and network behavior
-  used by acceptance assertions.
-- [ ] The agent exposes only an unprivileged child chroot and generic protocol;
-  the dedicated VM remains the host security boundary.
-- [ ] The implementation preserves RFD 1 and RFD 2's VM adapter, replay,
+  The Phase 3 acceptance removes every live source and rechecks the raw closure
+  before QEMU starts.
+- [X] The packaged workload demonstrably owns the process and network behavior
+  used by acceptance assertions. The workload, not the agent, originates every
+  recorded request and TFTP attempt.
+- [X] The agent exposes only an unprivileged child chroot and generic protocol;
+  the dedicated VM remains the host security boundary. The Phase 2 runtime
+  contract is unchanged.
+- [X] The implementation preserves RFD 1 and RFD 2's VM adapter, replay,
   artifact, and normalization ownership boundaries and documents the intentional
-  host-only refinement for workload-specific assertions.
-- [ ] No registry runtime, container daemon, host mount, second workload,
+  host-only refinement for workload-specific assertions. ~EVIDENCE.adoc~
+  records the boundary.
+- [X] No registry runtime, container daemon, host mount, second workload,
   persistent disk, richer fault model, or exploration engine exists without new
   evidence and an RFD.

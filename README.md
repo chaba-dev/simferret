@@ -344,6 +344,52 @@ after deleting the live source:
 ./scripts/rfd3-phase3-acceptance.sh
 ```
 
+## RFD 3 acceptance and evidence
+
+The complete RFD 3 demonstration runs unprivileged on x86-64 Linux:
+
+```shell
+.agents/dev ./scripts/rfd3-phase4-acceptance.sh
+```
+
+It runs the Phase 3 record-and-two-replay demonstration for the standalone
+binary, the converging static OCI layout, and the dynamically linked OCI layout,
+then measures assembly cost, proves a distinctive ambient environment value and
+the host output path never enter the retained closure, checks that private run
+artifacts are owner-only while the shareable failure bundles exclude the recorded
+environment value and the exact workload stream bytes, and records the workload
+output and traffic volumes. CI runs the same command on GitHub-hosted Ubuntu.
+
+The supported profiles are the RFD's bounded set: a standalone fixed-address,
+little-endian x86-64 Linux ELF, or one direct `linux/amd64` manifest selected by
+digest from a local OCI image layout with plain or gzip layers and OCI whiteout
+and opaque-directory semantics. Relocated (static PIE) binaries, standalone
+dynamic binaries, device nodes, sockets, FIFOs, setuid and setgid modes, hard
+links, sparse files, ACLs, unsupported extended attributes, descriptor URLs, and
+embedded descriptor data are rejected before QEMU starts. No registry, container
+daemon, host mount, or network access participates.
+
+The guest-visible conformance check assembles a real OCI layout, encodes the
+canonical tree as the guest template, extracts it exactly as the guest initramfs
+does, and runs an ordinary workload that reports the modes, owners, modification
+times, symbolic links, replacements, whiteouts, and opacity it observes. It
+changes root, drops credentials, and creates device nodes, so it runs as PID 1 in
+a private PID namespace and needs root:
+
+```shell
+.agents/dev cargo build --locked --test rfd3_phase4
+.agents/dev sudo --preserve-env=PATH,SIMFERRET_BUSYBOX \
+  ./scripts/rfd3-phase4-runtime.sh
+```
+
+On GitHub-hosted Ubuntu the runner provides passwordless `sudo`; a self-hosted
+runner needs the same, or an equivalent unprivileged path, plus the pinned Nix
+environment that provides QEMU, the kernel, BusyBox, the static and dynamic C
+compilers, `readelf`, and `python3`. The unprivileged acceptance command needs
+only QEMU and the pinned kernel; `scripts/rfd3-phase4-acceptance.sh` records the
+conformance result when it is already root and otherwise names the checked-in
+runtime command.
+
 ## Development
 
 The Nix flake provides the pinned Rust toolchain and Jujutsu. On an x86-64 Linux
