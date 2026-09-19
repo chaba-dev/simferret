@@ -38,9 +38,13 @@ if [[ -z "$binary" ]]; then
     echo "cargo is not on PATH; set SIMFERRET_PHASE4_TEST_BINARY to the built test binary." >&2
     exit 1
   fi
-  binary="$(cargo test --manifest-path "$repo_root/Cargo.toml" --locked \
-    --test rfd3_phase4 --no-run --message-format=json 2>/dev/null |
-    python3 -c '
+  # Cargo writes the machine-readable messages to stdout and every diagnostic to
+  # stderr, so the build's own output stays visible and a failure is reported
+  # instead of silently leaving no binary behind.
+  if ! binary="$(
+    cargo test --manifest-path "$repo_root/Cargo.toml" --locked \
+      --test rfd3_phase4 --no-run --message-format=json |
+      python3 -c '
 import json
 import sys
 
@@ -54,7 +58,11 @@ for line in sys.stdin:
             and target.get("name") == "rfd3_phase4"
             and message.get("executable")):
         print(message["executable"])
-' | tail -1)"
+' | tail -1
+  )"; then
+    echo "cargo could not build the RFD 3 Phase 4 test binary." >&2
+    exit 1
+  fi
 fi
 if [[ -z "$binary" || ! -x "$binary" ]]; then
   echo "Cannot locate the RFD 3 Phase 4 test binary." >&2
