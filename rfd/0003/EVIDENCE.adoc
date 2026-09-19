@@ -1753,10 +1753,10 @@ legally replaces `replace/keep`, whiteouts `hide/removed` while `hide/kept`
 survives, marks `opaque` opaque so its lower children disappear while the
 same-layer `opaque/added` survives, and adds a symbolic link; the base layer
 carries a non-default directory mode, owner, and timestamp.
-`each_layer_mechanism_is_independently_load_bearing` assembles four variants that
-each omit exactly one mechanism and requires the lower-layer entry that
-mechanism should have affected to reappear with its own bytes and metadata, so
-no mechanism can be masked by another.
+`each_layer_mechanism_is_independently_load_bearing` assembles a baseline and
+three variants that each omit exactly one mechanism, and requires the
+lower-layer entry that mechanism should have affected to reappear with its own
+bytes, mode, owner, and timestamp, so no mechanism can be masked by another.
 
 `template_encoding_preserves_oci_conformance_metadata` decodes the encoded CPIO
 template and pins every header, so a whiteout or opaque marker can never appear
@@ -1773,7 +1773,7 @@ busybox 755 0 0 0
 replace 751 2000 2000 1700000003
 keep 640 1001 1001 1700000008 upper
 kept 644 1200 1200 1700000005 safe
-added 640 1300 1300 1700000006 added
+added 644 1300 1300 1700000006 added
 link replace/keep
 linkmode 777 1700000004
 removed=absent
@@ -1783,10 +1783,13 @@ nested=absent
 
 Every value matches the canonical view, so modes, owners, modification times,
 symbolic links, legal replacement, whiteout, and opacity survive CPIO encoding
-and are observed inside the workload root. The check needs root to change root
-and drop credentials, and a private PID namespace for the guest-wide cleanup
-barrier; it is the checked-in `scripts/rfd3-phase4-runtime.sh` command and the CI
-job runs it.
+and are observed inside the workload root. The guest-visible check needs root to
+change root and drop credentials, and a private PID namespace for the
+guest-wide cleanup barrier, so it returns early without root; the unprivileged
+`the_conformance_workload_can_read_every_path_it_reports` test decides the same
+permissions the runtime grants the workload, and fails on a fixture the guest
+run could not read. The guest-visible check is the checked-in
+`scripts/rfd3-phase4-runtime.sh` command and the CI job runs it.
 
 === Ambient input and artifact classification
 
@@ -1804,21 +1807,24 @@ including the derived cache entry's lock, tree, and encoded template, and
 requires the host source path to stay out of every retained byte.
 
 The unprivileged acceptance run repeats the ambient check with a distinctive
-canary value and requires the canary, the host output path, and the recorded
-launch environment to stay out of the raw closure and derived lock, while the
-launch environment is exactly `["MODE=acceptance"]`. It also requires the run
+canary value and requires the ambient canary value and the host output path to
+stay out of the raw closure and derived lock, while the recorded launch
+environment is exactly `["MODE=acceptance"]`. It also requires the run
 directory, the guest image cache, the workload store, and every host-written run
 artifact to be owner-only, and it records its own canary workload so the
 classification check has a launch value and per-run stream tokens that cannot
 occur in a shareable artifact by coincidence. Every failure bundle the Phase 3
 demonstration and the canary recording published — including the ones a
-tampered copy of a run directory published — must carry exactly a typed failure
-report and optional sanitized log tails, and must contain none of those canaries
-in plain text or in the hex encoding the event stream uses. The checks
-themselves are fail-closed and regression-tested by
-`scripts/rfd3-phase4-checks-test.sh`, which rejects a leaked canary in either
-encoding, an unexpected file or field in a bundle, a missing report, an
-unreadable tree, and a failed measurement producer. The run-level
+tampered copy of a run directory published, and the canary recording's own
+bundle, which must be among them — must carry exactly the published report and
+diagnostics fields and optional sanitized log tails, and must contain none of
+those canaries in plain text or in the hex encoding the event stream uses. The
+check rejects an unreadable, linked, or special entry instead of skipping it, so
+it never certifies a tree it did not read. The checks themselves are
+fail-closed and regression-tested by `scripts/rfd3-phase4-checks-test.sh`, which
+rejects a leaked canary in either encoding, an unexpected file or nested field,
+a missing or untyped report, an unreadable bundle directory, a recording
+without stdout, and a failed measurement producer. The run-level
 `private_run_artifacts_are_owner_only_and_failures_exclude_workload_data` unit
 test remains the focused regression.
 
@@ -1879,6 +1885,7 @@ instead of a host-only check. The checked-in tests are:
 | Guest-visible metadata and input exclusion |
   `canonical_metadata_survives_cpio_encoding_and_is_visible_in_the_guest`,
   `template_encoding_preserves_oci_conformance_metadata`,
+  `the_conformance_workload_can_read_every_path_it_reports`,
   `each_layer_mechanism_is_independently_load_bearing`,
   `ambient_host_environment_never_enters_the_assembled_workload`,
   `an_unrelated_host_file_never_enters_the_assembled_workload`,
@@ -1900,8 +1907,8 @@ A representative unprivileged run produced:
 ----
 qemu_version=QEMU emulator version 11.1.0
 kernel=/nix/store/s40h0m3746r0l287laa9sxa9345bkykf-linux-6.18.49/bzImage
-phase3_duration_ns=243010262387
-assembly_duration_ns=7914396
+phase3_duration_ns=268084342470
+assembly_duration_ns=21232422
 assembly_canonical=bfb6c8c9fe7ee7f612dca4b0dc76695c826ec2970bca968b3a401c21087f8c91
 assembly_closure=2ad827acc0e604d1f806ba18a4e0930fddfaf7cb67916b4694d74873f6e93e62
 assembly_entries=3
@@ -1936,10 +1943,10 @@ oci-dynamic_traffic_succeeded=4
 oci-dynamic_traffic_unavailable=2
 ----
 
-Assembly of the 70912-byte static fixture costs about 8ms and produces a
+Assembly of the 70912-byte static fixture takes milliseconds and produces a
 144410-byte store and a 71424-byte template; the whole Phase 3 demonstration
 records three source forms, records three intentionally corrupt runs, replays
-each successful recording twice, and runs every tamper case in about 243s, and
+each successful recording twice, and runs every tamper case in about 270s, and
 the classification check adds one canary recording and one rejected replay. Each
 form's workload emits 551 bytes on stdout and no stderr, and originates six
 TFTP attempts: four succeed, and the two inside the bounded outage return the
