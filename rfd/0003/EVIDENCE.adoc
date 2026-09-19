@@ -1907,8 +1907,8 @@ A representative unprivileged run produced:
 ----
 qemu_version=QEMU emulator version 11.1.0
 kernel=/nix/store/s40h0m3746r0l287laa9sxa9345bkykf-linux-6.18.49/bzImage
-phase3_duration_ns=268084342470
-assembly_duration_ns=21232422
+phase3_duration_ns=252719240552
+assembly_duration_ns=20518347
 assembly_canonical=bfb6c8c9fe7ee7f612dca4b0dc76695c826ec2970bca968b3a401c21087f8c91
 assembly_closure=2ad827acc0e604d1f806ba18a4e0930fddfaf7cb67916b4694d74873f6e93e62
 assembly_entries=3
@@ -1946,7 +1946,7 @@ oci-dynamic_traffic_unavailable=2
 Assembly of the 70912-byte static fixture takes milliseconds and produces a
 144410-byte store and a 71424-byte template; the whole Phase 3 demonstration
 records three source forms, records three intentionally corrupt runs, replays
-each successful recording twice, and runs every tamper case in about 270s, and
+each successful recording twice, and runs every tamper case in about 253s, and
 the classification check adds one canary recording and one rejected replay. Each
 form's workload emits 551 bytes on stdout and no stderr, and originates six
 TFTP attempts: four succeed, and the two inside the bounded outage return the
