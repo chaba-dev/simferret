@@ -60,9 +60,9 @@ report_fields = {"version", "error_kind", "error", "diagnostics"}
 # the depth that can carry a private value: the report and diagnostics fields
 # are exact, the traffic and packet-counter objects are exact, and `network`
 # and the fault transitions are checked as containers rather than field by
-# field. Every field is required and no other field is published, so a report
-# that carries an unexpected nested value fails here even when its value is not
-# a known canary.
+# field. Every field is required and no other field is published. Unknown
+# fields are rejected in the explicitly enumerated objects; the `network` and
+# fault-transition contents remain covered by the canary scan.
 diagnostic_fields = {
     "operation",
     "stage",

@@ -347,6 +347,34 @@ for expected in \
 done
 expect_fail "a bundle root that cannot be listed" \
   "could not be listed" published_bundles "$discovery_root" "$test_root/no-such-root"
+# The second listing needs its own regression: both cases above fail during the
+# recursive discovery, so a scoped `find` stub lets that step succeed, then
+# emits partial bundle output and fails.
+real_find="$(command -v find)"
+stub_dir="$test_root/stub-bin"
+mkdir -p "$stub_dir"
+cat >"$stub_dir/find" <<EOF
+#!/usr/bin/env bash
+for argument in "\$@"; do
+  if [[ "\$argument" == "-mindepth" ]]; then
+    printf '%s\\n' "\$STUB_PARTIAL_BUNDLE"
+    exit 1
+  fi
+done
+exec "$real_find" "\$@"
+EOF
+chmod +x "$stub_dir/find"
+partial_output="$test_root/partial-listing.txt"
+if (PATH="$stub_dir:$PATH" STUB_PARTIAL_BUNDLE="$discovery_root/first/failures/bundle-a" \
+  published_bundles "$discovery_root") >"$partial_output" 2>&1; then
+  echo "expected a partial second listing to fail" >&2
+  exit 1
+fi
+if ! grep -F "could not be listed" "$partial_output" >/dev/null; then
+  echo "a partial second listing did not report its failure:" >&2
+  cat "$partial_output" >&2
+  exit 1
+fi
 if [[ "$(id -u)" -ne 0 ]]; then
   mkdir -p "$discovery_root/third/failures/hidden"
   chmod 000 "$discovery_root/third/failures"
