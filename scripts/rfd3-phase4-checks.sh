@@ -36,22 +36,52 @@ require_absent() {
 # require_shareable_bundle BUNDLE CANARY...
 #
 # Fail unless BUNDLE is a shareable failure bundle: a `failure.json` with
-# exactly the published fields, optionally the sanitized diagnostic log tails,
-# nothing else, and no canary in any file in either its plain or its hex
-# encoding. A private run directory, store, event stream, or launch
-# environment that reached the bundle fails the check.
+# exactly the published report and diagnostics fields, optionally the sanitized
+# diagnostic log tails, nothing else, and no canary in any file in either its
+# plain or its hex encoding. A private run directory, store, event stream, or
+# launch environment that reached the bundle fails the check. Traversal is
+# strict: an unreadable, linked, or special entry is a failure rather than an
+# artifact that was skipped, so the check can never certify a tree it did not
+# read.
 require_shareable_bundle() {
   local bundle="$1"
   shift
   "$python" - "$bundle" "$@" <<'PY'
 import json
 import os
+import stat
 import sys
 
 bundle = sys.argv[1]
 canaries = sys.argv[2:]
 allowed = {"failure.json", "logs/qemu.log", "logs/serial.log"}
-fields = {"version", "error_kind", "error", "diagnostics"}
+report_fields = {"version", "error_kind", "error", "diagnostics"}
+# The published FailureReport and FailureDiagnostics structures. Every field is
+# required and no other field is published, so a report that carries an
+# unexpected nested value fails here even when its value is not a known canary.
+diagnostic_fields = {
+    "operation",
+    "stage",
+    "backend_mode",
+    "fixture_mode",
+    "network_status",
+    "network",
+    "fault_transitions",
+    "traffic",
+    "packet_counters",
+}
+traffic_fields = {"requests_attempted", "requests_succeeded", "requests_unavailable"}
+counter_fields = {"available", "incoming", "outgoing", "reason"}
+# run.rs maps io::ErrorKind onto this vocabulary.
+error_kinds = {
+    "watchdog",
+    "invalid-data",
+    "early-termination",
+    "channel-failure",
+    "not-found",
+    "permission-denied",
+    "infrastructure",
+}
 
 
 def fail(message):
@@ -59,31 +89,89 @@ def fail(message):
     raise SystemExit(1)
 
 
+def is_nonnegative(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def require_fields(node, fields, what):
+    if not isinstance(node, dict):
+        fail(f"{what} is not an object")
+    if set(node) != fields:
+        fail(f"{what} names {sorted(node)}; expected {sorted(fields)}")
+    return node
+
+
+def validate_diagnostics(diagnostics):
+    node = require_fields(diagnostics, diagnostic_fields, "diagnostics")
+    for name in ["operation", "stage", "backend_mode", "fixture_mode", "network_status"]:
+        if not isinstance(node[name], str) or not node[name]:
+            fail(f"diagnostics.{name} is not a nonempty string")
+    if node["network"] is not None and not isinstance(node["network"], dict):
+        fail("diagnostics.network is neither null nor an object")
+    if not isinstance(node["fault_transitions"], list):
+        fail("diagnostics.fault_transitions is not a list")
+    traffic = require_fields(node["traffic"], traffic_fields, "diagnostics.traffic")
+    for name in sorted(traffic_fields):
+        if not is_nonnegative(traffic[name]):
+            fail(f"diagnostics.traffic.{name} is not a nonnegative integer")
+    counters = require_fields(node["packet_counters"], counter_fields, "diagnostics.packet_counters")
+    if not isinstance(counters["available"], bool):
+        fail("diagnostics.packet_counters.available is not a boolean")
+    for name in ["incoming", "outgoing"]:
+        if counters[name] is not None and not is_nonnegative(counters[name]):
+            fail(f"diagnostics.packet_counters.{name} is not null or a nonnegative integer")
+    if not isinstance(counters["reason"], str) or not counters["reason"]:
+        fail("diagnostics.packet_counters.reason is not a nonempty string")
+
+
 present = set()
 contents = []
-for root, directories, files in os.walk(bundle):
-    directories.sort()
-    for name in sorted(files):
-        path = os.path.join(root, name)
-        present.add(os.path.relpath(path, bundle))
-        with open(path, "rb") as handle:
-            contents.append((os.path.relpath(path, bundle), handle.read()))
-unexpected = sorted(present - allowed)
-if unexpected:
-    fail(f"shareable bundles carry only {sorted(allowed)}, found {unexpected}")
+
+
+def collect(directory, relative):
+    try:
+        entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+    except OSError as error:
+        fail(f"cannot read {relative or '.'}: {error}")
+    for entry in entries:
+        path = f"{relative}/{entry.name}" if relative else entry.name
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError as error:
+            fail(f"cannot stat {path}: {error}")
+        mode = info.st_mode
+        if stat.S_ISLNK(mode):
+            fail(f"{path} is a symbolic link")
+        if stat.S_ISDIR(mode):
+            if path != "logs":
+                fail(f"unexpected shareable directory {path}")
+            collect(entry.path, path)
+        elif stat.S_ISREG(mode):
+            if path not in allowed:
+                fail(f"unexpected shareable artifact {path}")
+            try:
+                with open(entry.path, "rb") as handle:
+                    data = handle.read()
+            except OSError as error:
+                fail(f"cannot read {path}: {error}")
+            present.add(path)
+            contents.append((path, data))
+        else:
+            fail(f"{path} is not a regular file")
+
+
+collect(bundle, "")
 if "failure.json" not in present:
     fail("the bundle carries no failure.json")
 report = json.loads(dict(contents)["failure.json"])
-if set(report) != fields:
-    fail(f"failure.json names {sorted(report)}; expected {sorted(fields)}")
+require_fields(report, report_fields, "failure.json")
 if report["version"] != 1:
     fail(f"failure.json has version {report['version']!r}")
-if not isinstance(report["error_kind"], str) or not report["error_kind"]:
-    fail("failure.json names no typed error")
+if report["error_kind"] not in error_kinds:
+    fail(f"failure.json names error kind {report['error_kind']!r}")
 if not isinstance(report["error"], str) or not report["error"]:
     fail("failure.json carries no error message")
-if not isinstance(report["diagnostics"], dict):
-    fail("failure.json carries no diagnostics object")
+validate_diagnostics(report["diagnostics"])
 
 for canary in canaries:
     plain = canary.encode()
@@ -95,31 +183,34 @@ print(f"{bundle}: {len(present)} shareable artifact(s), {len(canaries)} canaries
 PY
 }
 
-# stream_canaries EVENTS.JSONL...
+# stream_canaries EVENTS.JSONL
 #
-# Print every distinct stdout line the recorded runs produced, plus the tokens
+# Print every distinct stdout line the recorded run produced, plus the tokens
 # inside them. The streams are the private artifacts a shareable bundle must
 # not carry, and a leak could quote a whole line or a single per-run token, in
-# plain text or in the hex encoding the event stream uses.
+# plain text or in the hex encoding the event stream uses. A recording that
+# contains no stdout is an error rather than an empty canary set.
 stream_canaries() {
-  "$python" - "$@" <<'PY'
+  "$python" - "$1" <<'PY'
 import json
 import sys
 
 lines = set()
-for path in sys.argv[1:]:
-    streams = {}
-    with open(path, encoding="utf-8") as handle:
-        for line in handle:
-            event = json.loads(line)["event"]
-            if event["type"] == "workload_output" and event["stream"] == "stdout":
-                streams.setdefault(event["invocation"], bytearray()).extend(
-                    bytes.fromhex(event["bytes"])
-                )
-    for data in streams.values():
-        for line in bytes(data).split(b"\n"):
-            if line:
-                lines.add(line.decode())
+streams = {}
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for line in handle:
+        event = json.loads(line)["event"]
+        if event["type"] == "workload_output" and event["stream"] == "stdout":
+            streams.setdefault(event["invocation"], bytearray()).extend(
+                bytes.fromhex(event["bytes"])
+            )
+for data in streams.values():
+    for line in bytes(data).split(b"\n"):
+        if line:
+            lines.add(line.decode())
+if not lines:
+    print(f"{sys.argv[1]} recorded no workload stdout", file=sys.stderr)
+    raise SystemExit(1)
 for line in sorted(lines):
     print(line)
     for token in line.replace("=", " ").split():
@@ -137,12 +228,32 @@ PY
 # value, so a bundle that drops the `MODE=` prefix is still rejected.
 environment_canaries() {
   local entry
-  entry="$(jq -r '.workload.launch.environment[0]' "$1/workload.lock")"
+  if ! entry="$(jq -r '.workload.launch.environment[0]' "$1/workload.lock")"; then
+    printf 'cannot read the launch environment from %s\n' "$1/workload.lock" >&2
+    return 1
+  fi
   if [[ -z "$entry" || "$entry" != *=* ]]; then
     printf "the recorded run names no launch environment entry: '%s'\n" "$entry" >&2
     return 1
   fi
   printf '%s\n%s\n' "$entry" "${entry#*=}"
+}
+
+# require_canary_bundle BUNDLE_DIR BUNDLE...
+#
+# Fail unless at least one inspected bundle lives under BUNDLE_DIR, so a canary
+# experiment that published nothing cannot pass on other bundles' results.
+require_canary_bundle() {
+  local directory="$1"
+  shift
+  local bundle
+  for bundle in "$@"; do
+    if [[ "$bundle" == "$directory/"* ]]; then
+      return 0
+    fi
+  done
+  printf 'no shareable bundle was published under %s\n' "$directory" >&2
+  return 1
 }
 
 # workload_measurement EVENTS.JSONL

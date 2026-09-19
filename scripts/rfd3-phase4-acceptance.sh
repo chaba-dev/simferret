@@ -225,6 +225,13 @@ if [[ -z "$canary_run" || ! -d "$canary_run" ]]; then
   exit 1
 fi
 jq -e '.passed' "$canary_run/assertions.json" >/dev/null
+# The recording must carry the launch environment the script generated, or the
+# classification check would test a different value than the one it published.
+canary_environment="$(jq -c '.workload.launch.environment' "$canary_run/workload.lock")"
+if [[ "$canary_environment" != "[\"MODE=$canary_value\"]" ]]; then
+  echo "the canary recording did not keep its launch environment: $canary_environment" >&2
+  exit 1
+fi
 # Removing one retained raw object makes the next replay of the canary
 # recording fail before QEMU starts, so it publishes a shareable failure bundle
 # for a store that carries the canary launch environment.
@@ -238,16 +245,44 @@ mv "$canary_object_path" "$canary_object_path.saved"
 run_timed canary-replay env SIMFERRET_KERNEL="$kernel" QEMU_SYSTEM_X86_64="$qemu" \
   "$binary" replay "$canary_run"
 expect_status canary-replay 1
+# The rejected replay has to be the intended one, and it has to publish its own
+# bundle: otherwise the check below could silently fall back to the Phase 3
+# bundles and never exercise the canary.
+if ! grep -F "raw object $canary_object is missing" "$output_dir/canary-replay.stderr" >/dev/null; then
+  echo "the canary replay did not report the removed raw object" >&2
+  cat "$output_dir/canary-replay.stderr" >&2
+  exit 1
+fi
 
 # Every shareable bundle the Phase 3 demonstration and the canary recording
 # published, including the ones a tampered copy of a run directory published.
-mapfile -t bundles < <(find "$phase3_run" "$canary_dir/runs" -type d -name failures \
-  -exec find {} -mindepth 1 -maxdepth 1 -type d \; | sort)
+if ! bundle_list="$(find "$phase3_run" "$canary_dir/runs" -type d -name failures \
+  -exec find {} -mindepth 1 -maxdepth 1 -type d \; | sort)"; then
+  echo "the published shareable bundles could not be listed" >&2
+  exit 1
+fi
+mapfile -t bundles <<<"$bundle_list"
 if [[ "${#bundles[@]}" -lt 1 ]]; then
   echo "the rejected cases published no shareable failure bundle" >&2
   exit 1
 fi
-if ! stream_canary_list="$(stream_canaries "$record_run/events.jsonl" "$canary_run/events.jsonl")"; then
+canary_bundle_dir="$canary_dir/runs/failures"
+require_canary_bundle "$canary_bundle_dir" "${bundles[@]}"
+# Each recording is read on its own, so one recording without stdout cannot
+# hide behind the other's canaries.
+if ! record_stream_canaries="$(stream_canaries "$record_run/events.jsonl")"; then
+  echo "the Phase 3 recording produced no stream canary" >&2
+  exit 1
+fi
+if ! canary_stream_canaries="$(stream_canaries "$canary_run/events.jsonl")"; then
+  echo "the canary recording produced no stream canary" >&2
+  exit 1
+fi
+# The two recordings share their generic lines, so the merged canary set is
+# deduplicated before it is counted and searched.
+if ! stream_canary_list="$(
+  printf '%s\n%s\n' "$record_stream_canaries" "$canary_stream_canaries" | sort -u
+)"; then
   echo "the recorded workload streams produced no canary" >&2
   exit 1
 fi

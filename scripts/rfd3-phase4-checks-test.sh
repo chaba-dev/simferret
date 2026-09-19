@@ -52,7 +52,26 @@ report = {
     "version": 1,
     "error_kind": "infrastructure",
     "error": sys.argv[2],
-    "diagnostics": {"operation": "replay", "stage": "preflight"},
+    "diagnostics": {
+        "operation": "replay",
+        "stage": "preflight",
+        "backend_mode": "replay",
+        "fixture_mode": "empty-passive",
+        "network_status": "not-yet-validated",
+        "network": None,
+        "fault_transitions": [],
+        "traffic": {
+            "requests_attempted": 0,
+            "requests_succeeded": 0,
+            "requests_unavailable": 0,
+        },
+        "packet_counters": {
+            "available": False,
+            "incoming": None,
+            "outgoing": None,
+            "reason": "the selected QEMU user backend and replay filter expose no packet-counter API",
+        },
+    },
 }
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(report, handle)
@@ -98,36 +117,85 @@ printf '{}\n' >"$leaky_store/store/raw/closure.json"
 
 leaky_field="$test_root/leaky-field"
 mkdir -p "$leaky_field"
-cat >"$leaky_field/failure.json" <<EOF
-{
-  "version": 1,
-  "error_kind": "infrastructure",
-  "error": "raw closure raw/closure.json is missing",
-  "environment": ["MODE=acceptance"],
-  "diagnostics": {}
-}
-EOF
+"$python" - "$clean_bundle/failure.json" "$leaky_field/failure.json" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1]))
+report["environment"] = ["MODE=acceptance"]
+json.dump(report, open(sys.argv[2], "w"))
+PY
+
+nested_field="$test_root/nested-field"
+mkdir -p "$nested_field"
+"$python" - "$clean_bundle/failure.json" "$nested_field/failure.json" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1]))
+report["diagnostics"]["environment"] = ["MODE=acceptance"]
+json.dump(report, open(sys.argv[2], "w"))
+PY
+
+empty_diagnostics="$test_root/empty-diagnostics"
+mkdir -p "$empty_diagnostics"
+"$python" - "$clean_bundle/failure.json" "$empty_diagnostics/failure.json" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1]))
+report["diagnostics"] = {}
+json.dump(report, open(sys.argv[2], "w"))
+PY
+
+unknown_kind="$test_root/unknown-kind"
+mkdir -p "$unknown_kind"
+"$python" - "$clean_bundle/failure.json" "$unknown_kind/failure.json" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1]))
+report["error_kind"] = "other"
+json.dump(report, open(sys.argv[2], "w"))
+PY
+
+unreadable_bundle="$test_root/unreadable"
+mkdir -p "$unreadable_bundle/logs"
+cp "$clean_bundle/failure.json" "$unreadable_bundle/failure.json"
+printf 'guest: console\n' >"$unreadable_bundle/logs/serial.log"
+chmod 000 "$unreadable_bundle/logs"
+
+linked_bundle="$test_root/linked"
+mkdir -p "$linked_bundle" "$test_root/linked-target"
+cp "$clean_bundle/failure.json" "$linked_bundle/failure.json"
+ln -s "$test_root/linked-target" "$linked_bundle/logs"
+
+fifo_bundle="$test_root/fifo"
+mkdir -p "$fifo_bundle/logs"
+cp "$clean_bundle/failure.json" "$fifo_bundle/failure.json"
+mkfifo "$fifo_bundle/logs/qemu.log"
 
 untyped_bundle="$test_root/untyped"
 mkdir -p "$untyped_bundle"
-cat >"$untyped_bundle/failure.json" <<'EOF'
-{
-  "version": 1,
-  "error_kind": "",
-  "error": "raw closure raw/closure.json is missing",
-  "diagnostics": {}
-}
-EOF
+"$python" - "$clean_bundle/failure.json" "$untyped_bundle/failure.json" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1]))
+report["error_kind"] = ""
+json.dump(report, open(sys.argv[2], "w"))
+PY
 
 missing_field_bundle="$test_root/missing-field"
 mkdir -p "$missing_field_bundle"
-cat >"$missing_field_bundle/failure.json" <<'EOF'
-{
-  "version": 1,
-  "error_kind": "infrastructure",
-  "error": "raw closure raw/closure.json is missing"
-}
-EOF
+"$python" - "$clean_bundle/failure.json" "$missing_field_bundle/failure.json" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1]))
+del report["diagnostics"]
+json.dump(report, open(sys.argv[2], "w"))
+PY
 
 malformed_bundle="$test_root/malformed"
 mkdir -p "$malformed_bundle"
@@ -164,19 +232,36 @@ expect_fail "a lower-case hex canary" \
 expect_fail "an upper-case hex canary" \
   "carries the canary" require_shareable_bundle "$leaky_upper_hex" "$canary_value"
 expect_fail "an unexpected event stream" \
-  "shareable bundles carry only" require_shareable_bundle "$leaky_file" "$canary_value"
+  "unexpected shareable" require_shareable_bundle "$leaky_file" "$canary_value"
 expect_fail "an unexpected store copy" \
-  "shareable bundles carry only" require_shareable_bundle "$leaky_store" "$canary_value"
+  "unexpected shareable" require_shareable_bundle "$leaky_store" "$canary_value"
 expect_fail "an unexpected report field" \
   "expected" require_shareable_bundle "$leaky_field" "$canary_value"
+expect_fail "an unexpected diagnostics field" \
+  "expected" require_shareable_bundle "$nested_field" "$canary_value"
+expect_fail "empty diagnostics" \
+  "expected" require_shareable_bundle "$empty_diagnostics" "$canary_value"
+expect_fail "an unknown error kind" \
+  "names error kind" require_shareable_bundle "$unknown_kind" "$canary_value"
 expect_fail "a report without a typed error" \
-  "names no typed error" require_shareable_bundle "$untyped_bundle" "$canary_value"
+  "names error kind" require_shareable_bundle "$untyped_bundle" "$canary_value"
 expect_fail "a report without its diagnostics" \
   "expected" require_shareable_bundle "$missing_field_bundle" "$canary_value"
 expect_fail "a malformed report" \
   "Expecting value" require_shareable_bundle "$malformed_bundle" "$canary_value"
 expect_fail "a bundle with no report" \
   "carries no failure.json" require_shareable_bundle "$empty_bundle" "$canary_value"
+expect_fail "a linked bundle entry" \
+  "is a symbolic link" require_shareable_bundle "$linked_bundle" "$canary_value"
+expect_fail "a special bundle entry" \
+  "is not a regular file" require_shareable_bundle "$fifo_bundle" "$canary_value"
+if [[ "$(id -u)" -ne 0 ]]; then
+  # Root bypasses directory permissions, so this negative control is only
+  # meaningful for the unprivileged run the acceptance script also performs.
+  expect_fail "an unreadable bundle directory" \
+    "cannot read" require_shareable_bundle "$unreadable_bundle" "$canary_value"
+fi
+chmod 700 "$unreadable_bundle/logs"
 
 # stream_canaries and environment_canaries: the canary set has to carry both the
 # whole stream line and the per-run token, and both spellings of the recorded
@@ -202,17 +287,46 @@ if printf '%s\n' "${extracted[@]}" | grep -F -x -- "ignored" >/dev/null; then
 fi
 expect_fail "a stream without a recording" \
   "No such file" stream_canaries "$test_root/no-events.jsonl"
+# A recording that carries no stdout must not read as an empty canary set: the
+# acceptance script would otherwise check a bundle against nothing at all.
+printf '{"event": {"type": "workload_exited", "stdout_bytes": 0, "stderr_bytes": 0}}\n' \
+  >"$test_root/silent-events.jsonl"
+expect_fail "a recording without stdout" \
+  "recorded no workload stdout" stream_canaries "$test_root/silent-events.jsonl"
 
 lock_run="$test_root/lock-run"
 mkdir -p "$lock_run"
 printf '{"workload": {"launch": {"environment": ["MODE=acceptance"]}}}\n' >"$lock_run/workload.lock"
+empty_lock="$test_root/empty-lock"
+mkdir -p "$empty_lock"
+printf '{"workload": {"launch": {}}}\n' >"$empty_lock/workload.lock"
 mapfile -t extracted < <(environment_canaries "$lock_run")
 if [[ "${extracted[0]}" != "MODE=acceptance" || "${extracted[1]}" != "acceptance" ]]; then
   echo "environment_canaries did not extract the assignment and its value" >&2
   exit 1
 fi
 expect_fail "a lock without a launch environment" \
-  "names no launch environment entry" environment_canaries "$clean_bundle"
+  "names no launch environment entry" environment_canaries "$test_root/empty-lock"
+# jq can print a value and still fail on trailing input, so the assignment
+# itself has to be checked rather than only its result.
+truncated_lock="$test_root/truncated-lock"
+mkdir -p "$truncated_lock"
+{
+  printf '{"workload": {"launch": {"environment": ["MODE=acceptance"]}}}\n'
+  printf 'not json\n'
+} >"$truncated_lock/workload.lock"
+expect_fail "a lock jq cannot finish reading" \
+  "cannot read the launch environment" environment_canaries "$truncated_lock"
+
+# require_canary_bundle: the canary recording's own bundle has to be one of the
+# inspected bundles, or the classification check would silently test other
+# bundles' results.
+expect_pass "a canary bundle among the inspected bundles" \
+  require_canary_bundle "$test_root/canary/failures" \
+  "$clean_bundle" "$test_root/canary/failures/replay-attempt-1"
+expect_fail "a canary bundle that was never published" \
+  "no shareable bundle was published" require_canary_bundle "$test_root/canary/failures" \
+  "$clean_bundle" "$logged_bundle"
 
 # workload_measurement: a recorded stream is measured exactly, and a missing or
 # malformed recording fails instead of printing an empty result.
