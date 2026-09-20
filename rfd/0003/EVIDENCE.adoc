@@ -1713,3 +1713,305 @@ released inside it, the guest answers with the exit record and the protocol
 classifies the acknowledgement mismatch as an infrastructure error. Closing that
 window completely would require a typed rejection event for a command that races
 a process exit, which is a protocol change and is left to a later increment.
+
+== Phase 4 acceptance and evidence
+
+Phase 4 turns the Phase 1 to Phase 3 behaviour into checked-in acceptance
+evidence and closes the last open RFD acceptance criterion: canonical metadata
+and layer semantics must be observed correctly inside the workload root, not only
+in the host staging tree.
+
+=== Acceptance automation
+
+`.github/workflows/ci.yml` runs, on GitHub-hosted x86-64 Ubuntu without a
+container daemon:
+
+* `scripts/rfd3-phase4-acceptance.sh`, which runs the Phase 3
+  record-and-two-replay demonstration for the standalone binary, the converging
+  static OCI layout, and the dynamically linked OCI layout, then adds the Phase 4
+  measurements and checks;
+* `scripts/rfd3-phase4-checks-test.sh`, which regression-tests the shared
+  evidence checks against leaked, malformed, and unreadable artifacts; and
+* `scripts/rfd3-phase4-runtime.sh`, which runs the guest-visible conformance
+  suite as PID 1 in a private PID namespace. The test binary is built
+  unprivileged, and only that namespace run uses the runner's passwordless
+  `sudo`.
+
+Both commands are unprivileged in the sense the RFD requires: no registry,
+container daemon, host mount, TAP device, or KVM is used, and the only elevated
+operation is the chroot, setuid, and mknod the guest runtime itself performs.
+`scripts/rfd3-phase4-acceptance.sh` records the conformance result when it is
+already root and otherwise names the checked-in runtime command, so a self-hosted
+runner can run one command or the other.
+
+=== Guest-visible OCI conformance
+
+`crates/simferret/tests/rfd3_phase4.rs` builds one local `linux/amd64` OCI layout
+with a base and an upper layer. Each layer mechanism owns its own subtree,
+because opacity hides every lower child of its directory: the upper layer
+legally replaces `replace/keep`, whiteouts `hide/removed` while `hide/kept`
+survives, marks `opaque` opaque so its lower children disappear while the
+same-layer `opaque/added` survives, and adds a symbolic link; the base layer
+carries a non-default directory mode, owner, and timestamp.
+`each_layer_mechanism_is_independently_load_bearing` assembles a baseline and
+three variants that each omit exactly one mechanism, and requires the
+lower-layer entry that mechanism should have affected to reappear with its own
+bytes, mode, owner, and timestamp, so no mechanism can be masked by another.
+
+`template_encoding_preserves_oci_conformance_metadata` decodes the encoded CPIO
+template and pins every header, so a whiteout or opaque marker can never appear
+in the guest image. `canonical_metadata_survives_cpio_encoding_and_is_visible_in_the_guest`
+then extracts that template exactly as the guest initramfs does, materializes it
+through the real runtime, and runs the pinned static BusyBox workload as the
+normalized nonzero user. The workload reports what it sees inside its root:
+
+[source,text]
+----
+root 755 0 0 0
+bin 755 0 0 0
+busybox 755 0 0 0
+replace 751 2000 2000 1700000003
+keep 640 1001 1001 1700000008 upper
+kept 644 1200 1200 1700000005 safe
+added 644 1300 1300 1700000006 added
+link replace/keep
+linkmode 777 1700000004
+removed=absent
+lower=absent
+nested=absent
+----
+
+Every value matches the canonical view, so modes, owners, modification times,
+symbolic links, legal replacement, whiteout, and opacity survive CPIO encoding
+and are observed inside the workload root. The guest-visible check needs root to
+change root and drop credentials, and a private PID namespace for the
+guest-wide cleanup barrier, so it returns early without root; the unprivileged
+`the_conformance_workload_can_read_every_path_it_reports` test decides the same
+permissions the runtime grants the workload, and fails on a fixture the guest
+run could not read. The guest-visible check is the checked-in
+`scripts/rfd3-phase4-runtime.sh` command and the CI job runs it.
+
+=== Ambient input and artifact classification
+
+`ambient_host_environment_never_enters_the_assembled_workload` asserts the launch
+environment is exactly the specification's and then assembles the same
+specification in a child process that carries a distinctive canary variable,
+requiring neither the canary's name nor its value to reach any retained byte.
+`an_unrelated_host_file_never_enters_the_assembled_workload` places an unrelated
+file beside the binary source and inside an OCI layout directory, assembles each
+form twice, and requires both assemblies to agree on the closure, canonical
+tree, and template identities, on every retained raw-object digest, and on the
+absence of the unrelated path and content.
+`a_host_source_path_never_enters_the_retained_closure` walks the whole store,
+including the derived cache entry's lock, tree, and encoded template, and
+requires the host source path to stay out of every retained byte.
+
+The unprivileged acceptance run repeats the ambient check with a distinctive
+canary value and requires the ambient canary value and the host output path to
+stay out of the raw closure and derived lock, while the recorded launch
+environment is exactly `["MODE=acceptance"]`. It also requires the run
+directory, the guest image cache, the workload store, and every host-written run
+artifact to be owner-only, and it records its own canary workload so the
+classification check has a launch value and per-run stream tokens that cannot
+occur in a shareable artifact by coincidence. Every failure bundle the Phase 3
+demonstration and the canary recording published — including the ones a
+tampered copy of a run directory published, and the canary recording's own
+bundle, which must be among them — must carry exactly the published report and
+diagnostics fields and optional sanitized log tails, and must contain none of
+those canaries in plain text or in the hex encoding the event stream uses. The
+check rejects an unreadable, linked, or special entry instead of skipping it, so
+it never certifies a tree it did not read. The checks themselves are
+fail-closed and regression-tested by `scripts/rfd3-phase4-checks-test.sh`, which
+rejects a leaked canary in either encoding, an unexpected file or nested field,
+a missing or untyped report, an unreadable bundle directory, a recording
+without stdout, and a failed measurement producer. The run-level
+`private_run_artifacts_are_owner_only_and_failures_exclude_workload_data` unit
+test remains the focused regression.
+
+=== Coverage map
+
+Every RFD identity class and adversarial case is covered before QEMU starts. The
+guest-visible metadata case is listed last because it runs the real runtime
+instead of a host-only check. The checked-in tests are:
+
+[cols="1,2",options="header"]
+|===
+| Required case | Test
+
+| Specification identity | `a_retained_specification_with_a_reserved_owner_is_rejected_on_replay`,
+  `a_retained_specification_with_a_moved_install_path_is_rejected_on_replay`
+| Standalone executable | `tampered_raw_or_derived_content_is_rejected` (`raw-executable`),
+  `replay_rejects_every_independently_changed_workload_identity` (raw object)
+| Manifest, config, stored layer, DiffID | `a_changed_manifest_and_layer_under_the_old_digest_is_rejected`,
+  `a_self_consistent_config_change_is_rejected_by_relationship_checks`,
+  `corrupt_or_missing_selected_blobs_are_rejected`,
+  `unsupported_oci_constructs_are_rejected_before_publication`
+| Normalized filesystem | `tampered_raw_or_derived_content_is_rejected` (`derived-tree`,
+  `derived-template`), the Phase 3 acceptance `tampered-template` case
+| Launch arguments, environment, working directory, credentials |
+  `every_launch_identity_class_changes_the_closure`
+| Descriptor selection, platform, ambiguity, remote content |
+  `descriptor_selection_rejects_ambiguous_platform_less_and_remote_content`,
+  `unrelated_index_entries_and_blobs_are_ignored`
+| Layer archive, per-layer duplicate, whiteout order, opacity, links |
+  `duplicate_paths_in_one_layer_are_rejected`,
+  `layer_semantics_are_order_independent_and_legally_replace_lower_entries`,
+  `each_layer_mechanism_is_independently_load_bearing`,
+  `root_level_opacity_keeps_only_upper_layer_additions`,
+  `an_opaque_marker_may_not_traverse_a_lower_symlink`,
+  `additions_may_not_traverse_a_lower_non_directory`,
+  `symlink_targets_are_validated_when_read`
+| Paths, file types, hard links, expansion, oversize |
+  `unsupported_oci_constructs_are_rejected_before_publication`,
+  `oversized_inputs_are_rejected_by_their_bounds`,
+  `an_expanded_layer_beyond_the_limit_is_rejected`
+| Immutable read, source mutation, special files |
+  `a_self_contained_store_survives_source_mutation`,
+  `a_symlinked_layout_locator_is_rejected`, `a_fifo_specification_does_not_block`,
+  `a_special_file_in_the_store_is_rejected`
+| Raw and derived cache | `missing_raw_content_fails_even_with_a_valid_derived_entry`,
+  `a_store_reuses_identical_content_and_rejects_a_different_closure`,
+  `a_reused_store_path_must_already_be_owner_only`,
+  `a_failed_derived_publication_leaves_no_closure`
+| Binary profile rejections | `unsupported_binary_inputs_are_rejected`,
+  `a_relocated_binary_is_refused_with_a_profile_diagnostic`,
+  `the_same_relocated_executable_is_accepted_from_an_oci_source`,
+  `elf_address_space_boundaries_are_enforced_exactly`
+| Runtime rejections | the Phase 2 suite: privileged credentials, forbidden
+  descriptors, stale roots, malformed input offsets, output overflow, and an
+  escaped descendant retaining a pipe
+| Replay rejections | `replay_rejects_every_independently_changed_workload_identity`,
+  `a_workload_replay_divergence_never_leaks_the_launch_environment`
+| Guest-visible metadata and input exclusion |
+  `canonical_metadata_survives_cpio_encoding_and_is_visible_in_the_guest`,
+  `template_encoding_preserves_oci_conformance_metadata`,
+  `the_conformance_workload_can_read_every_path_it_reports`,
+  `each_layer_mechanism_is_independently_load_bearing`,
+  `ambient_host_environment_never_enters_the_assembled_workload`,
+  `an_unrelated_host_file_never_enters_the_assembled_workload`,
+  `a_host_source_path_never_enters_the_retained_closure`
+|===
+
+=== Measurements
+
+The checked-in acceptance command is:
+
+[source,shell]
+----
+.agents/dev ./scripts/rfd3-phase4-acceptance.sh
+----
+
+A representative unprivileged run produced:
+
+[source,text]
+----
+qemu_version=QEMU emulator version 11.1.0
+kernel=/nix/store/s40h0m3746r0l287laa9sxa9345bkykf-linux-6.18.49/bzImage
+phase3_duration_ns=252719240552
+assembly_duration_ns=20518347
+assembly_canonical=bfb6c8c9fe7ee7f612dca4b0dc76695c826ec2970bca968b3a401c21087f8c91
+assembly_closure=2ad827acc0e604d1f806ba18a4e0930fddfaf7cb67916b4694d74873f6e93e62
+assembly_entries=3
+assembly_expanded_bytes=70912
+assembly_raw_objects=2
+assembly_store_bytes=144410
+assembly_template_bytes=71424
+ambient_identity_unchanged=bfb6c8c9fe7ee7f612dca4b0dc76695c826ec2970bca968b3a401c21087f8c91
+shareable_bundles=13
+shareable_canaries=23
+shareable_excludes_environment_and_streams=yes
+classification_canary_recorded=yes
+private_artifacts=run directory, guest image cache, workload store, and run artifacts are owner-only
+guest_visible_conformance=not run here; run scripts/rfd3-phase4-runtime.sh as root
+binary_canonical=bfb6c8c9fe7ee7f612dca4b0dc76695c826ec2970bca968b3a401c21087f8c91
+binary_workload_stdout_bytes=551
+binary_workload_stderr_bytes=0
+binary_traffic_attempted=6
+binary_traffic_succeeded=4
+binary_traffic_unavailable=2
+oci-static_canonical=bfb6c8c9fe7ee7f612dca4b0dc76695c826ec2970bca968b3a401c21087f8c91
+oci-static_workload_stdout_bytes=551
+oci-static_workload_stderr_bytes=0
+oci-static_traffic_attempted=6
+oci-static_traffic_succeeded=4
+oci-static_traffic_unavailable=2
+oci-dynamic_canonical=445d1445fe4532202a9860803cd6aaeb45e223125a9970a44a6b70cf7e9daf89
+oci-dynamic_workload_stdout_bytes=551
+oci-dynamic_workload_stderr_bytes=0
+oci-dynamic_traffic_attempted=6
+oci-dynamic_traffic_succeeded=4
+oci-dynamic_traffic_unavailable=2
+----
+
+Assembly of the 70912-byte static fixture takes milliseconds and produces a
+144410-byte store and a 71424-byte template; the whole Phase 3 demonstration
+records three source forms, records three intentionally corrupt runs, replays
+each successful recording twice, and runs every tamper case in about 253s, and
+the classification check adds one canary recording and one rejected replay. Each
+form's workload emits 551 bytes on stdout and no stderr, and originates six
+TFTP attempts: four succeed, and the two inside the bounded outage return the
+typed administrative rejection. The Phase 3 evidence above records the per-form
+record and replay durations, initramfs sizes, replay-log growth, semantic
+outcome digests, and store sizes; the phase 4 run adds assembly cost, output
+volume, workload traffic volume, and the classification check, which inspected
+13 published failure bundles against 23 launch-environment and per-run stream
+canaries. Every observed divergence remains the single intentional corruption,
+which fails `process_safety` and `response_integrity` with CLI status 1 for both
+source forms.
+
+=== Supported profiles, self-hosted requirements, and invocations
+
+The supported inputs are the RFD's bounded set: a standalone fixed-address,
+little-endian x86-64 Linux ELF, or one direct `linux/amd64` manifest selected by
+digest from a local OCI image layout with plain or gzip layers and OCI whiteout
+and opaque-directory semantics. Relocated (static PIE) binaries, standalone
+dynamic binaries, device nodes, sockets, FIFOs, setuid and setgid modes, hard
+links, sparse files, ACLs, unsupported extended attributes, descriptor URLs, and
+embedded descriptor data are rejected before QEMU starts. No registry, container
+daemon, host mount, or network access participates. `README.md` carries the same
+profile statement and the exact invocations.
+
+The unprivileged acceptance command needs x86-64 Linux, the pinned Nix
+environment (QEMU, kernel, the static and dynamic C compilers, `readelf`,
+`python3`, `jq`), and no elevated privilege. The guest-visible conformance
+command additionally needs root for the guest runtime's chroot, setuid, and
+mknod, plus a PID namespace for the guest-wide cleanup barrier. GitHub-hosted
+Ubuntu provides passwordless `sudo`; a self-hosted runner needs the same or an
+equivalent unprivileged path.
+
+=== Next RFD decision
+
+The RFD's follow-up decision is to choose between checkpoint branching,
+OCI-profile expansion, and serial control optimization. The Phase 3 and Phase 4
+evidence point to checkpoint branching:
+
+* Assembly and replay are reliable across three source forms and two replays per
+  form, with byte-identical normalized events and matching semantic outcome
+  digests, so the packaging boundary is stable enough to build on.
+* The packaged workload is small (144 KB store, 2.2 MB initramfs for the static
+  forms) and records in about 10 to 20 seconds, so checkpoint size and restore
+  cost can be measured on a representative filesystem and process rather than the
+  built-in fixture.
+* No OCI compatibility failure was observed in the accepted profile; the
+  bounded layer semantics were sufficient for the static and dynamic fixtures,
+  so profile expansion has no concrete mismatch to justify it.
+* Record and replay cost is dominated by the QEMU run itself, not the serial
+  control protocol; the chunked writer already removed the one observed
+  transport bottleneck, so control optimization has no measured target.
+
+The next increment should therefore measure checkpoint-tree size, restore cost,
+and branching throughput on this packaged workload. OCI-profile expansion and
+serial control optimization move earlier only if checkpoint evidence shows they
+block it.
+
+=== Deliberate limits
+
+The guest-visible conformance workload is the pinned static BusyBox and reports
+metadata through its own `stat`, `readlink`, and existence tests; it is a
+repository fixture, not a general OCI conformance suite. The check extracts the
+encoded template exactly as the guest initramfs does and runs the real runtime,
+but it is a host-run guest test rather than a full QEMU boot, so it does not
+re-verify the kernel's own initramfs extraction beyond the Phase 3 acceptance
+boots. The identity and adversarial coverage map names the checked-in tests
+rather than generating one test per case, so a future change that removes a test
+must also update this evidence.
