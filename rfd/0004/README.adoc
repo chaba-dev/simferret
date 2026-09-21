@@ -418,7 +418,7 @@ that reproduce it are retained beside the probe in
 link:../../poc/time-model/EVIDENCE.adoc[the time-model evidence]; the raw
 per-run serial and replay artifacts stay in the untracked `.poc/` output
 directory. Validation results produced while implementing this proposal will be
-retained in `rfd/0004/EVIDENCE.adoc`.
+retained in link:EVIDENCE.adoc[RFD 4 evidence].
 
 The probe and the evidence document are introduced by the companion change that
 adds `scripts/time-model-probe.sh` and `poc/time-model/EVIDENCE.adoc`; they are
