@@ -267,6 +267,7 @@ read_rfd() {
 failures=0
 found=0
 title_width=35
+task_width=5
 row_numbers=()
 row_states=()
 row_tasks=()
@@ -442,6 +443,9 @@ for entry in "${entries[@]}"; do
 	if [[ "${#display_title}" -gt "${title_width}" ]]; then
 		title_width="${#display_title}"
 	fi
+	if [[ "${#task_summary}" -gt "${task_width}" ]]; then
+		task_width="${#task_summary}"
+	fi
 done
 
 if [[ "${found}" -eq 0 ]]; then
@@ -449,12 +453,12 @@ if [[ "${found}" -eq 0 ]]; then
 	exit 1
 fi
 
-printf "%s%-4s  %-13s  %5s  %-*s  %s%s\n" "${color_bold}" "RFD" "State" "Tasks" "${title_width}" "Title" "Labels" "${color_reset}"
-printf "%s%-4s  %-13s  %5s  %-*s  %s%s\n" "${color_dim}" "----" "-------------" "-----" "${title_width}" "$(printf '%*s' "${title_width}" '' | tr ' ' '-')" "--------------------" "${color_reset}"
+printf "%s%-4s  %-13s  %*s  %-*s  %s%s\n" "${color_bold}" "RFD" "State" "${task_width}" "Tasks" "${title_width}" "Title" "Labels" "${color_reset}"
+printf "%s%-4s  %-13s  %*s  %-*s  %s%s\n" "${color_dim}" "----" "-------------" "${task_width}" "$(printf '%*s' "${task_width}" '' | tr ' ' '-')" "${title_width}" "$(printf '%*s' "${title_width}" '' | tr ' ' '-')" "--------------------" "${color_reset}"
 for ((i = 0; i < ${#row_numbers[@]}; i++)); do
 	state_field="$(printf '%-13s' "${row_states[i]:-\(missing\)}")"
 	state_text="$(colorize_state "${row_states[i]}" "${state_field}")"
-	printf "%-4s  %s  %5s  %-*s  %s\n" "${row_numbers[i]}" "${state_text}" "${row_tasks[i]}" "${title_width}" "${row_titles[i]}" "${row_labels[i]}"
+	printf "%-4s  %s  %*s  %-*s  %s\n" "${row_numbers[i]}" "${state_text}" "${task_width}" "${row_tasks[i]}" "${title_width}" "${row_titles[i]}" "${row_labels[i]}"
 done
 
 if [[ "${failures}" -gt 0 ]]; then

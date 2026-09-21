@@ -35,12 +35,24 @@ run_failure() {
 }
 
 assert_labels_align() {
-	local header_column row_column
+	local header_column row_column rows=0
 	header_column="$(awk 'NR == 1 { print index($0, "Labels") }' "${output}")"
-	row_column="$(awk 'NR == 3 { print index($0, "software, process") }' "${output}")"
-	if [[ "${header_column}" -eq 0 || "${header_column}" -ne "${row_column}" ]]; then
+	if [[ "${header_column}" -eq 0 ]]; then
 		cat "${output}" >&2
-		printf 'Labels column is not vertically aligned\n' >&2
+		printf 'Labels header column was not found\n' >&2
+		exit 1
+	fi
+	while IFS= read -r row_column; do
+		rows=$((rows + 1))
+		if [[ "${row_column}" -ne "${header_column}" ]]; then
+			cat "${output}" >&2
+			printf 'Labels column is not vertically aligned\n' >&2
+			exit 1
+		fi
+	done < <(awk '/^[0-9][0-9][0-9][0-9]  / { print index($0, "software, process") }' "${output}")
+	if [[ "${rows}" -eq 0 ]]; then
+		cat "${output}" >&2
+		printf 'Labels column was not found in any RFD row\n' >&2
 		exit 1
 	fi
 }
@@ -101,6 +113,31 @@ reset_fixtures; write_valid_rfd prediscussion ""
 sed -i.bak 's/Valid RFD/A title long enough to exceed the minimum column width/' "${rfd_root}/README.adoc" "${rfd_root}/0001/README.adoc"
 rm "${rfd_root}/README.adoc.bak" "${rfd_root}/0001/README.adoc.bak"
 run_success "A title long enough to exceed the minimum column width"
+assert_labels_align
+
+reset_fixtures; write_valid_rfd prediscussion ""
+mkdir -p "${rfd_root}/0002"
+printf '\nlink:0002/README.adoc[2: Second RFD]\n' >>"${rfd_root}/README.adoc"
+cat >"${rfd_root}/0002/README.adoc" <<'EOF'
+:authors: Example Author <author@example.com>
+:state: prediscussion
+:discussion:
+:labels: software, process
+
+= RFD 2 Second RFD
+
+== Implementation
+
+See link:IMPLEMENTATION.org[implementation checklist].
+EOF
+{
+	printf '#+TITLE: RFD 0002 implementation checklist\n\nImplements [[file:README.adoc][RFD 2: Second RFD]].\n'
+	for ((task = 1; task <= 100; task++)); do
+		printf -- '- [x] Finished task %s.\n' "${task}"
+	done
+} >"${rfd_root}/0002/IMPLEMENTATION.org"
+run_success "0001  prediscussion      0/1  Valid RFD"
+run_success "0002  prediscussion  100/100  Second RFD"
 assert_labels_align
 
 reset_fixtures; write_valid_rfd discussion https://example.com/pull/1
