@@ -1,5 +1,5 @@
 :authors: Darwin Wu <tough.pasta0068@wunli88.com>
-:state: discussion
+:state: published
 :discussion: https://github.com/chaba-dev/simferret/pull/16
 :labels: determinism, qemu, replay, time, virtual-clock
 
