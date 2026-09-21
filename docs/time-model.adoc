@@ -1,0 +1,81 @@
+= Deterministic guest time model
+
+SimFerret pins the guest's QEMU time model so that the passage of time inside the
+guest is a reproducible function of the fixed VM configuration and the work the
+guest performs. This page is the entry point for that investigation: it maps each
+artifact to what it records and gives the command that reproduces the
+measurements. Current progress lives in the implementation checklist, not here.
+
+== Where everything lives
+
+[cols="1,2,3",options="header"]
+|===
+| Artifact | Path | What it records
+
+| RFD
+| link:../rfd/0004/README.adoc[RFD 4: Deterministic guest time model]
+| The proposal, the determinism, compatibility, and controllability needs it separates, what it excludes, and its acceptance criteria
+
+| Implementation checklist
+| link:../rfd/0004/IMPLEMENTATION.org[RFD 0004 implementation checklist]
+| Phase 0 (pin and validate the model), Phase 1 (identity, rejection, and migration), Phase 2 (contract and documentation), and the exit criteria
+
+| Pre-RFD measurement
+| link:../poc/time-model/EVIDENCE.adoc[Guest time-model measurements]
+| The exploratory probe results under `shift=auto`, `shift=auto,sleep=off`, `shift=7`, `shift=7,sleep=off`, and `shift=4,sleep=off`, with their caveats and the exploratory `shift=10` observation
+
+| Implementation evidence
+| link:../rfd/0004/EVIDENCE.adoc[RFD 4 evidence]
+| The pinned-scale selection and its reason, plus the validation results produced while implementing the RFD
+
+| Probe source
+| link:../poc/time-model/probe.c[`poc/time-model/probe.c`]
+| The five guest measurements — sleep, spin, race, sleep_loop, and the checksum control — and what each one does and does not establish
+
+| Probe harness
+| link:../scripts/time-model-probe.sh[`scripts/time-model-probe.sh`]
+| One pinned QEMU configuration, five requested runs, aggregation over completed runs only, and the `reproducible`, `varying`, or `inconclusive` verdict
+
+| Harness regression tests
+| link:../scripts/time-model-probe-test.sh[`scripts/time-model-probe-test.sh`]
+| The harness contract with a faked QEMU: incomplete runs are excluded rather than aborting the experiment, an inconclusive sample is not reported as reproducible, and an invalid experiment fails before or without QEMU
+|===
+
+== Reproducing a measurement
+
+[source,shell]
+----
+SIMFERRET_ICOUNT_OPTIONS=shift=N,sleep=off \
+SIMFERRET_TIME_MODEL_OUTPUT=<directory> \
+.agents/dev ./scripts/time-model-probe.sh
+----
+
+The harness writes `evidence.txt` with the configuration, the per-run status,
+duration, and replay-log size, and prints the measurements it compared. Raw
+per-run serial output and replay logs stay in the output directory, which defaults
+to the untracked `.poc/time-model-probe` tree. `SIMFERRET_TIME_MODEL_RUNS` and
+`SIMFERRET_QEMU_TIMEOUT` adjust the run count and the per-run deadline.
+
+== What the investigation established
+
+* Under the default `shift=auto`, the same fixed computation measured 42.65 ms and
+  126.05 ms of virtual time in two runs while returning the same result, a
+  deadline decision flipped between runs in the unsupported
+  `shift=auto,sleep=off` combination, and the replay log differed in every run.
+* Pinning the scale and disabling host-paced idle advancement made every measured
+  value exact across five complete runs at `shift=2`, `shift=3`, `shift=4`,
+  `shift=5`, and `shift=7`; the pinned value is recorded with its reason in the
+  evidence above.
+* The pinned scale is a semantic choice about an artificial performance model, not
+  a correctness choice: the validated window is flat in reproducibility, and
+  timeout-sensitive results are conclusions about the chosen model rather than
+  predictions of production timing.
+* Time, entropy, and ordering fault injection remain unimplemented, and the
+  arrival timing of live host input has no deterministic position in guest virtual
+  time; both are separate work.
+
+== Related increments
+
+* link:../rfd/0001/README.adoc[RFD 1: Deterministic execution proof of concept] established bounded record and replay.
+* link:../rfd/0002/README.adoc[RFD 2: Deterministic network fault model] added the deterministic network boundary.
+* link:../rfd/0003/README.adoc[RFD 3: Reproducible workload packaging] packages the workload that exercises the model.
