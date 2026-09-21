@@ -1,0 +1,135 @@
+= RFD 4 Evidence
+
+== Phase 0 pinned time model
+
+=== Scale selection
+
+The selection rule is the one the RFD records: a fixed value that boots and
+completes every validation run within the configured deadline on every host in
+the supported matrix, justified against its neighbors and recorded with the
+reason.
+
+The validation deadline is the probe's per-run QEMU deadline, 180 s
+(`SIMFERRET_QEMU_TIMEOUT`), and every configuration below was measured with the
+probe's default of five requested runs. A run that times out, exits nonzero, or
+reports a malformed measurement is recorded and excluded from the comparison; a
+configuration is rejected when no run completes, when the control checksum
+varies, or when the spin count and state disagree.
+
+The checked-in command is:
+
+[source,shell]
+----
+SIMFERRET_ICOUNT_OPTIONS=<shift=N,sleep=off> \
+SIMFERRET_TIME_MODEL_OUTPUT=<directory> \
+.agents/dev ./scripts/time-model-probe.sh
+----
+
+Every run used `sleep=off`, the pinned QEMU 11.1.0, the guest kernel 6.18.49,
+`-machine pc-i440fx-9.2,accel=tcg`, `-cpu qemu64`, one vCPU, `-rtc
+base=2000-01-01T00:00:00,clock=vm`, and one initramfs
+(`sha256 24d0dfffc169a4275657c61281097882447fd565ecff87eb619cc587a57e1b4c`), on
+the reference x86-64 Linux host (AMD Ryzen 5 3600, 12 threads, Linux 6.18.41).
+
+[cols="1,1,1,1,1,1,1",options="header"]
+|===
+| `-icount` options | 20 ms sleep | 100 × 1 ms sleeps | 2,000,000-iteration computation | Spin chunks | Replay log | Run wall time
+
+| `shift=2,sleep=off`
+| 20.076 ms
+| 111.577 ms
+| 42.746 ms
+| 128
+| 85,633 B
+| 6.32–6.67 s
+
+| `shift=3,sleep=off`
+| 20.103 ms
+| 115.003 ms
+| 86.960 ms
+| 64
+| 163,273 B
+| 6.30–6.39 s
+
+| `shift=4,sleep=off`
+| 21.951 ms
+| 117.778 ms
+| 182.042 ms
+| 64
+| 330,255 B
+| 6.70–6.76 s
+
+| `shift=5,sleep=off`
+| 20.284 ms
+| 124.969 ms
+| 387.858 ms
+| 64
+| 713,979 B
+| 7.71–7.76 s
+
+| `shift=7,sleep=off`
+| 20.948 ms
+| 207.060 ms
+| 2,262.144 ms
+| 64
+| 3,303,901 B
+| 14.07–14.27 s
+|===
+
+Every value is exact across its five runs: all twenty-five runs completed, no
+time measurement varied, and the control checksum was identical in all of them.
+The spin count is the one measurement that differs between models, 128 chunks at
+`shift=2` against 64 at `shift=3` and coarser, which is the polling quantization
+the probe documents rather than a reproducibility difference; the spin state
+agreed with the count in every run. The `shift=4` and `shift=7` rows reproduce
+link:../../poc/time-model/EVIDENCE.adoc[the pre-RFD measurement] exactly
+(21.951 ms, 117.78 ms, 330,255 B; 20.948 ms, 207.06 ms, 3,303,901 B), so the
+model is stable across sessions rather than only within one experiment.
+
+The chosen value is `shift=4,sleep=off`:
+
+* Correctness does not discriminate. `shift=2`, `shift=3`, `shift=4`, `shift=5`,
+  and `shift=7` all reproduce exactly, so the validated window is flat in
+  reproducibility and the choice is a semantic one about the artificial
+  performance model.
+* The fine direction has no measured failure mode and is cheaper on every
+  measured axis: the replay log falls from 3,303,901 B at `shift=7` to 85,633 B
+  at `shift=2`, the run wall time from 14.07 s to 6.32 s, and the fixed
+  computation from 2,262.144 ms to 42.746 ms. A rule of "the finest value
+  validated so far" would therefore keep moving as finer values are measured,
+  which is a poor basis for a versioned constant.
+* `shift=4` is the value the pre-RFD measurement analyzed and the published RFD
+  cites: it completes no slower than `auto` (6.70–6.76 s here against 6.77–6.80 s
+  under `auto`) and writes a replay log an order of magnitude smaller than
+  `shift=7`. Its immediate neighbors on both sides (`shift=3` and `shift=5`) are
+  validated here, so the choice is not at the edge of the measured window and its
+  justification is complete against both directions.
+* The coarse direction is the one with a measured failure mode. The exploratory
+  `shift=10` run produced no guest output within the deadline and a 117 MB
+  replay log, and the fixed computation grows faster than the exchange rate
+  between `shift=5` and `shift=7` (387.858 ms to 2,262.144 ms, 5.8x for two
+  steps), so the choice should sit inside the window rather than at its coarse
+  edge.
+* Observed overshoot is recorded rather than optimized, as the RFD requires, and
+  it is not monotonic in the scale. The 20 ms sleep overshoots by 0.076 ms at
+  `shift=2`, 0.103 ms at `shift=3`, 1.951 ms at `shift=4`, 0.284 ms at `shift=5`,
+  and 0.948 ms at `shift=7`; the 100 × 1 ms loop totals 111.577 ms, 115.003 ms,
+  117.778 ms, 124.969 ms, and 207.060 ms respectively.
+
+`shift=3` and `shift=2` are equally reproducible and cheaper, and either is
+available if the artifact size or the virtual-time inflation of CPU-bound work
+later matters more than stability of the constant; changing the value afterwards
+is a versioned change, because the model is part of VM identity and runs recorded
+under different models are not comparable.
+
+This section measures the reference host only, which is half of the rule. The
+supported matrix adds GitHub-hosted `ubuntu-latest` x86-64 Linux, where the
+Phase 0 continuous-integration gate requires every requested run to complete and
+the verdict to be `reproducible`, and where a host that cannot complete under the
+pinned model must fail as an unsupported execution rather than fall back to
+another model. Pinning a different scale later is a versioned change, because
+the model is part of VM identity and runs recorded under different models are not
+comparable.
+
+Raw per-run serial output, replay logs, and durations remain in the untracked
+`.poc/rfd4-phase0/` directory.
