@@ -112,8 +112,16 @@ matching SimFerret executable and rebuilt initial state, the specific verified
 replay log, normal QEMU termination, and matching normalized events,
 assertions, and semantic outcome digest. Matching VM identity is a necessary
 condition among these, not a sufficient one. Replay reproduces the timing the
-guest observed because the log records it, which is why variable clock scaling
-never broke replay.
+guest observed because the log records it. That is not unconditional either: the
+phase 3 acceptance observed a replay fail under the model the product launches
+today, where the guest's clock is coupled to host real time, when the replaying
+guest's instruction stream diverged from the recording's before a character
+write. `rfd/0003/EVIDENCE.adoc` records that failure, what it rules out (an
+incomplete recording, by the message rather than by a digest), that the mechanism
+is narrowed rather than proven and a QEMU defect is not ruled out, and that the
+observed rate is too thin to bound. The log records the timeline the guest
+observed; it does not make a timeline that depends on host scheduling
+reproducible.
 
 What is narrower than it may have appeared is *fresh execution*: a new
 recording of the same workload with the same inputs. That is the property this
