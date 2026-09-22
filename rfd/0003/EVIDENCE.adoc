@@ -377,6 +377,65 @@ Repeated independent runs reproduced every canonical digest and serial digest
 exactly; only durations and replay-log sizes moved with host scheduling, so no
 divergence, retry, or nondeterminism was observed in semantic output.
 
+==== Replay divergence under the host-coupled model
+
+That claim has an observed exception, and it matters to the model question rather
+than to this increment's construction. A continuous-integration run of the Phase 4
+acceptance (which runs this demonstration) failed in the binary source's first
+replay with
+
+[source,text]
+----
+qemu-system-x86_64: Missing character write event in the replay log
+  (insn total 2362086659/74 left, event 5431704 is EVENT_INSTRUCTION)
+----
+
+and a failure bundle recording `error_kind: early-termination`, `error: truncated
+serial event frame`, `stage: execution`, and `backend_mode: replay`.
+
+What it means. The replaying guest performed a character write at an instruction
+position where the replay log's next event is an instruction event. QEMU's
+`replay_char_write_event_load()` accepts only `EVENT_CHAR_WRITE` there, so the
+replaying guest's instruction stream had diverged from the recording's before
+that point. The run was recorded under the model the product launches today,
+`shift=auto`, where the guest's virtual clock is coupled to host real time, so
+the number of instructions the guest executes between its serial writes depends
+on how the host schedules it.
+
+What it rules out. A truncated or incomplete recording is ruled out by the
+message rather than by a digest: the log still held a well-formed event at that
+position, where a truncated log fails while reading one. The recording's own log
+digest could not be compared against its manifest for this run, because the
+uploaded bundle carries the replay's logs and `failure.json` only; a replay of a
+recording whose log was truncated would fail differently, and no such failure has
+been observed. A QEMU defect is not ruled out, but the same binary replays the
+same demonstration correctly under the pinned model below, and the message is the
+machinery reporting a divergence rather than misreading an intact log.
+
+Rate and reproduction. One failure in the continuous-integration history of this
+step (run 35713214491; the neighbouring revisions of the same branch passed it),
+and no failure in the local phase 3 acceptance run under deliberate load (eight
+CPU consumers and three parallel QEMU guests) that was recorded for comparison.
+The failure is rare rather than impossible, so a green run is not evidence that
+the recording is reproducible.
+
+The pinned model. The same demonstration, recorded and replayed under
+`shift=4,sleep=off` with the spike QEMU of RFD 4
+(`poc/time-model/qemu-nosleep-replay-flush.patch`), completed with both replays
+matching under the same load shape, and the Phase 4 acceptance under that model
+passes. Under `shift=4,sleep=off` the guest's virtual time is a function of its
+instruction count, so the positions this failure depends on cannot move with host
+scheduling. That is evidence for the pin, not proof that `shift=auto` is the only
+model that can diverge: the failure is too rare to bound a rate from one sample.
+
+Guards, proposed rather than built. Validate the recorded log's integrity against
+the manifest before replaying, so an incomplete recording is reported as an
+incomplete recording rather than as a guest divergence; and classify QEMU's
+replay-divergence message as a typed error, because the frame-level
+`truncated serial event frame` this currently surfaces as points at the symptom
+rather than at the divergence. Neither guard would make a host-coupled recording
+reproducible, which is the model question RFD 4 records.
+
 === Unsupported OCI constructs
 
 Eighteen representative constructs were refused before any output was
