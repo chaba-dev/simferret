@@ -19,6 +19,9 @@ authoritative merely because it exists; its `state` says how it should be read.
 
 | link:0004/README.adoc[4: Deterministic guest time model]
 | Remove host-dependent clock scaling and idle pacing from guest execution
+
+| link:0005/README.adoc[5: CI execution and historical results MVP]
+| GitHub Actions first, optional historical results, Ryusen acceptance, and a later Lighthouse review
 |===
 
 == Source format

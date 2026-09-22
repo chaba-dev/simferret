@@ -1,0 +1,37 @@
+#+TITLE: RFD 0005 implementation checklist
+#+STARTUP: showall
+
+Implements [[file:README.adoc][RFD 5: CI execution and historical results MVP]].
+
+* Foundation
+- [ ] Finish RFD 4 identity, rejection, migration policy, and documentation.
+- [ ] Inspect Ryusen's current recovery tests and define the durable-result oracle.
+- [ ] Measure Ryusen guest compatibility and record required runtime extensions.
+- [ ] Review the process coordination and retained-state design before implementation.
+
+* Execution MVP
+- [ ] Execute the real Ryusen server and worker under the supported guest profile.
+- [ ] Inject server-process failure and restart with retained SQLite state.
+- [ ] Assert completion without re-executing a durably accepted step.
+- [ ] Detect a deliberate regression with the same property checker.
+- [ ] Replay the failing recording twice with matching events and assertions.
+- [ ] Run the acceptance case in GitHub Actions and record time and artifact budgets.
+
+* CI distribution and reports
+- [ ] Specify the versioned CI-neutral report and stable test/runtime identities.
+- [ ] Separate property verdicts, infrastructure errors, and upload failures.
+- [ ] Define replay-environment availability and incompatible-version rejection.
+- [ ] Package a pinned runtime without per-job QEMU source builds.
+- [ ] Deliver a thin Action in a separate repository with an end-to-end consumer example.
+
+* Historical results
+- [ ] Settle repository visibility, authentication, authorization, and fork-PR trust.
+- [ ] Define safe summary fields, upload idempotency, retention, and deletion.
+- [ ] Implement optional upload without changing local test verdicts.
+- [ ] Show historical results by repository, revision, and stable test identity.
+- [ ] Verify execution and replay remain useful when the service is unavailable.
+
+* Lighthouse review gate
+- [ ] Recheck Lighthouse progress near completion of the Ryusen CI integration.
+- [ ] Confirm implemented acknowledgement and duplicate semantics before selecting tests.
+- [ ] Define controlled dependency boundaries and a separately scoped ingestion-failure increment.

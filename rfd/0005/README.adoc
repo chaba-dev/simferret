@@ -1,0 +1,131 @@
+:authors: Darwin Wu <tough.pasta0068@wunli88.com>
+:state: prediscussion
+:discussion:
+:labels: ci, product, replay
+
+= RFD 5 CI execution and historical results MVP
+
+== Decision and scope
+
+SimFerret will run in the user's CI, initially GitHub Actions, rather than
+requiring a hosted execution fleet. The main SimFerret release is open source.
+A separate Action repository will make pinned installation and execution easy
+to reference. Other CI systems should use the same CLI and report contract;
+execution must not depend on GitHub-specific APIs.
+
+A separate results service will receive optional uploads and provide historical
+results by repository, revision, and test. Local execution, reports, and replay
+must remain useful without that service. Upload failure must not rewrite the
+test verdict; upload status is reported separately.
+
+These product choices were agreed in the
+https://ampcode.com/threads/T-01a0ca68-a003-73a0-a12d-21735b1462ef[planning thread].
+This RFD remains prediscussion until its implementation contracts are reviewed;
+the acceptance sequence below is a proposed way to deliver the agreed scope,
+not evidence of implemented capabilities.
+
+== Existing foundation and gaps
+
+RFDs 1 through 3 establish bounded record/replay, a controlled network outage,
+workload packaging, and a supervised workload runtime. They do not establish
+general application test configuration or a CI results service. RFD 4 pins the
+guest time model, with identity/versioning and contract work still outstanding
+at this decision point.
+
+Replaying one retained recording is distinct from making fresh executions with
+the same seed identical. Live input arrival remains an unresolved source of
+fresh-execution variation. This MVP must not advertise seed-only reproduction;
+a stronger fresh-execution promise needs its own deterministic-ingress design.
+
+== First acceptance application: Ryusen
+
+Ryusen is the first execution-MVP gate. Use its local SQLite backend and real
+server and connected Rust SDK worker, not FoundationDB. The proposed test is:
+
+. Start the server and worker and submit a bounded workflow.
+. Observe a durably accepted step result at an explicitly defined boundary.
+. Kill and restart the server while retaining its SQLite data.
+. Require completion without re-executing the already accepted step.
+. Replay the recording twice with matching normalized events and assertions.
+. Demonstrate that a deliberately introduced regression fails the property.
+
+An authorized effect whose result is unresolved is a different case: Ryusen's
+contract may require `Unknown`, not automatic retry or exactly-once execution.
+Derive the oracle from Ryusen's current protocol and recovery tests before
+implementing either case.
+
+The current SimFerret runtime supervises one workload at a time and creates a
+fresh writable root on restart. Compatibility discovery must therefore resolve
+server/worker/client coordination, storage retained across process restart,
+threads, sockets, entropy, and guest filesystem needs. Do not silently change
+the existing fresh-root contract. A process crash with retained files does not
+establish VM power-loss or disk-durability behavior.
+
+== Follow-on application: Lighthouse
+
+Lighthouse is the second candidate, for ingestion failures. It does not gate the
+first release. Recheck its implementation and settled contracts when the Ryusen
+CI slice is close to integration; do not freeze its current proposal into
+SimFerret requirements. This is a milestone review, not a scheduled monitor.
+
+The current direction in the
+https://ampcode.com/threads/T-01a0cd03-0646-7549-8a5e-8c3395c92092[Lighthouse thread]
+is OTel Collector ingestion into ClickHouse, object-storage overflow during
+downstream failure, and separate catch-up Collectors. Candidate scenarios are
+primary outage, recovery with backlog, catch-up crash around acknowledgement,
+and simultaneous primary/overflow failure. Durable acceptance and duplicate
+semantics must be settled before writing assertions. Do not assume the older
+custom batch-receipt proposal is the OTLP client contract.
+
+Dependencies must be within controlled execution boundaries or explicitly
+scoped test doubles. A model test does not qualify a real cloud provider, and
+live cloud dependencies must not inherit the deterministic replay guarantee.
+
+== Delivery sequence and acceptance
+
+. Complete RFD 4's identity, compatibility rejection, and documentation work.
+. Establish Ryusen's supported guest profile and exact recovery oracle, then
+  specify the smallest runtime extension needed to execute it.
+. Run the recovery scenario in GitHub Actions, detect a deliberate regression,
+  retain replay artifacts, and reproduce the failing recording twice.
+. Define a versioned CI-neutral report with stable test identity, revision and
+  runtime identity, assertion outcomes, infrastructure errors, and replay
+  references. Measure execution time and artifact sizes to set CI budgets.
+. Distribute a pinned runtime and a thin Action from a separate repository;
+  avoid requiring a QEMU source build in every consumer job.
+. Add optional upload and historical results using that report contract.
+. Reassess Lighthouse before committing to its integration design.
+
+The execution milestone is independently useful, but the full product MVP also
+requires result ingestion and history. Passing local tests alone does not mean
+the Action, releases, or service have been published or deployed.
+
+== Open decisions and non-goals
+
+Before service implementation, decide public/private repository support,
+authentication and authorization, fork-PR upload trust, report idempotency,
+retention/deletion, and the initial history interface. No service stack or
+hosting provider is selected here.
+
+Replay bundles may contain private workload bytes and inputs. The proposed
+default is summary-only upload with full bundles retained as customer CI
+artifacts; specify the safe summary schema and explicit full-bundle consent
+before uploading. Define how users obtain matching execution environments for
+retained recordings and how unsupported identities are rejected.
+
+Hosted execution, public multi-tenant workload isolation, billing, arbitrary
+Compose/Kubernetes topologies, checkpoint exploration, and production timing
+claims are outside this MVP. Broader runtime and fault surfaces need separate
+design and evidence, not implicit inclusion through an application choice.
+
+== Coordination
+
+Planning and integration ownership remain in the coordinating thread.
+Implementation is delegated to DeepSeek subthreads on runner `sophie`, with
+isolated workspaces or explicit disjoint ownership and exact source revisions.
+Existing work must be preserved. Publishing repositories, releases, changes, or
+deployments requires the owner's applicable authorization.
+
+== Implementation
+
+Progress is tracked in link:IMPLEMENTATION.org[RFD 5 implementation checklist].
