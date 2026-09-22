@@ -21,23 +21,26 @@ const MACHINE: &str = "pc-i440fx-9.2";
 const CPU: &str = "qemu64";
 const MEMORY_MIB: u32 = 128;
 
-/// The QEMU time model that record and replay both launch. `shift=auto` lets
-/// QEMU adjust the virtual CPU speed against host real time.
+/// The QEMU time model that record and replay both launch. `shift=4` advances
+/// virtual time by 16 ns per counted instruction and `sleep=off` jumps idle
+/// virtual time to the next timer deadline, so guest time is a function of the
+/// fixed VM configuration and the work the guest performs rather than of host
+/// speed.
 ///
-/// RFD 4 pins `shift=4,sleep=off`, and Phase 0 validated that model as
-/// reproducible on the reference host, but the product cannot launch it yet:
-/// with `rr=record`, QEMU queues live serial input as a replay asynchronous
-/// event and flushes the queue only from `icount_account_warp_timer()`, which
-/// returns before `replay_async_events()` when `sleep=off`. A guest under that
-/// model therefore never receives the control commands a recording is driven
-/// with. `rfd/0004/EVIDENCE.adoc` records the measurement and the minimal
-/// reproduction, and `rfd/0004/IMPLEMENTATION.org` records that pinning this
-/// value is blocked on the RFD's model decision rather than on this code.
+/// This is the model RFD 4 pins and Phase 0 validated as reproducible on the
+/// reference host, but the change is blocked rather than mergeable: with
+/// `rr=record`, QEMU queues live serial input as a replay asynchronous event
+/// and flushes the queue only from `icount_account_warp_timer()`, which returns
+/// before `replay_async_events()` when `sleep=off`. A guest under this model
+/// therefore never receives the control commands a recording is driven with, so
+/// record mode cannot complete. `rfd/0004/EVIDENCE.adoc` records the
+/// measurement and the minimal reproduction, and this value can be launched
+/// only once the RFD's model question is settled.
 ///
 /// Changing this value is a versioned change: recordings made under another
 /// model are not comparable, and every host in the supported matrix must be
 /// re-validated.
-pub const TIME_MODEL: &str = "shift=auto";
+pub const TIME_MODEL: &str = "shift=4,sleep=off";
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// The largest number of command bytes written before the writer waits for the
@@ -1866,16 +1869,15 @@ mod tests {
 
     #[test]
     fn record_and_replay_launch_the_configured_time_model() {
-        // The literal is the model the product launches today. RFD 4 pins
-        // `shift=4,sleep=off` and Phase 0 validated that model on the reference
-        // host, but the product cannot launch it yet: with `rr=record` QEMU
-        // queues live serial input as a replay asynchronous event and only
-        // delivers it from `icount_account_warp_timer()`, which returns before
-        // `replay_async_events()` when `sleep=off`, so a guest under that model
-        // never receives the commands a recording is driven with. Pinning the
-        // model is therefore a versioned change that also updates this
+        // The literal is the model RFD 4 pins and Phase 0 validated. It is
+        // blocked rather than mergeable, because with `rr=record` QEMU queues
+        // live serial input as a replay asynchronous event and only flushes the
+        // queue from `icount_account_warp_timer()`, which returns before
+        // `replay_async_events()` when `sleep=off`, so a guest under this model
+        // never receives the commands a recording is driven with. Changing the
+        // value is therefore a versioned change that also updates this
         // assertion and re-validates every supported host.
-        assert_eq!(TIME_MODEL, "shift=auto");
+        assert_eq!(TIME_MODEL, "shift=4,sleep=off");
 
         let root = Path::new("/tmp/time-model");
         for (mode, rr) in [
