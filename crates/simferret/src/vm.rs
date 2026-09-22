@@ -20,6 +20,24 @@ use crate::protocol::{
 const MACHINE: &str = "pc-i440fx-9.2";
 const CPU: &str = "qemu64";
 const MEMORY_MIB: u32 = 128;
+
+/// The QEMU time model that record and replay both launch. `shift=auto` lets
+/// QEMU adjust the virtual CPU speed against host real time.
+///
+/// RFD 4 pins `shift=4,sleep=off`, and Phase 0 validated that model as
+/// reproducible on the reference host, but the product cannot launch it yet:
+/// with `rr=record`, QEMU queues live serial input as a replay asynchronous
+/// event and flushes the queue only from `icount_account_warp_timer()`, which
+/// returns before `replay_async_events()` when `sleep=off`. A guest under that
+/// model therefore never receives the control commands a recording is driven
+/// with. `rfd/0004/EVIDENCE.adoc` records the measurement and the minimal
+/// reproduction, and `rfd/0004/IMPLEMENTATION.org` records that pinning this
+/// value is blocked on the RFD's model decision rather than on this code.
+///
+/// Changing this value is a versioned change: recordings made under another
+/// model are not comparable, and every host in the supported matrix must be
+/// re-validated.
+pub const TIME_MODEL: &str = "shift=auto";
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// The largest number of command bytes written before the writer waits for the
@@ -922,7 +940,7 @@ impl QemuAdapter {
         arguments.extend([
             "-icount".into(),
             option_path(
-                &format!("shift=auto,rr={},rrfile=", mode.qemu_value()),
+                &format!("{TIME_MODEL},rr={},rrfile=", mode.qemu_value()),
                 &config.replay_log,
                 "",
             )?,
@@ -1841,11 +1859,47 @@ mod tests {
         let arguments = adapter(root)
             .arguments(&config(root), ExecutionMode::Replay, None)
             .unwrap();
-        assert!(
-            arguments.iter().any(|argument| {
-                argument == "shift=auto,rr=replay,rrfile=/tmp/replay/replay.bin"
-            })
-        );
+        assert!(arguments.iter().any(|argument| {
+            argument == format!("{TIME_MODEL},rr=replay,rrfile=/tmp/replay/replay.bin").as_str()
+        }));
+    }
+
+    #[test]
+    fn record_and_replay_launch_the_configured_time_model() {
+        // The literal is the model the product launches today. RFD 4 pins
+        // `shift=4,sleep=off` and Phase 0 validated that model on the reference
+        // host, but the product cannot launch it yet: with `rr=record` QEMU
+        // queues live serial input as a replay asynchronous event and only
+        // delivers it from `icount_account_warp_timer()`, which returns before
+        // `replay_async_events()` when `sleep=off`, so a guest under that model
+        // never receives the commands a recording is driven with. Pinning the
+        // model is therefore a versioned change that also updates this
+        // assertion and re-validates every supported host.
+        assert_eq!(TIME_MODEL, "shift=auto");
+
+        let root = Path::new("/tmp/time-model");
+        for (mode, rr) in [
+            (ExecutionMode::Record, "record"),
+            (ExecutionMode::Replay, "replay"),
+        ] {
+            let arguments = adapter(root)
+                .arguments(&config(root), mode, None)
+                .unwrap()
+                .into_iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let launched = arguments
+                .windows(2)
+                .filter(|pair| pair[0] == "-icount")
+                .map(|pair| pair[1].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                launched,
+                vec![format!(
+                    "{TIME_MODEL},rr={rr},rrfile=/tmp/time-model/replay.bin"
+                )]
+            );
+        }
     }
 
     #[test]

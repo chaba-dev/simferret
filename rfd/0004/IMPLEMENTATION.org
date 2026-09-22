@@ -29,25 +29,52 @@ earlier increments did and did not establish about fresh executions.
 :STATUS: TODO
 :END:
 
-- [ ] Select the pinned scale by the documented rule and record why that value
+The scale is selected and the model is validated on every host in the supported
+matrix. Two items cannot be completed under the model as recorded: with
+~sleep=off~ and ~rr=record~, QEMU queues live serial input as a replay
+asynchronous event and never flushes the queue, so a guest that waits for the
+control commands a recording is driven with never receives them. The
+measurement, the minimal reproduction, and the source-level cause are in
+~EVIDENCE.adoc~; the model question is the RFD's to settle. The same document
+records a patched-QEMU spike showing the limitation is one early return and that
+the pin completes under that patch, so unblocking is a decision about the model
+or about carrying a patch rather than an open technical question.
+
+- [X] Select the pinned scale by the documented rule and record why that value
   was chosen over its neighbors.
-- [ ] Set the validation deadline used to accept or reject a scale, and
+- [X] Set the validation deadline used to accept or reject a scale, and
   validate against the supported-host matrix named in the RFD.
-- [ ] Require zero varying time measurements across at least five complete runs
+  The deadline is the probe's per-run 180 s and is recorded with the selection;
+  the reference host and GitHub-hosted ~ubuntu-latest~ both complete inside it.
+- [X] Require zero varying time measurements across at least five complete runs
   on every host in the supported matrix.
-- [ ] Require guest measurements to be equal across supported hosts for
+  ~scripts/time-model-gate.sh~ enforces five complete runs and an explicit
+  ~reproducible~ verdict, and both hosts pass it.
+- [X] Require guest measurements to be equal across supported hosts for
   identical artifacts and the same model, not merely stable within each host.
+  The gate compares each host against the checked-in reference values and the
+  artifact identities, and the two hosts agree on every measurement exactly.
 - [ ] Pass the pinned model from the product's record and replay launch paths
   rather than configuring it separately, and assert that the launched options
   match the recorded identity.
+  Blocked by the record-mode limitation above. The launch paths read the single
+  ~TIME_MODEL~ constant in ~crates/simferret/src/vm.rs~, which records why it
+  cannot be pinned yet, and the launched argument vector is asserted by
+  ~record_and_replay_launch_the_configured_time_model~.
 - [ ] Confirm that a run recorded under the pinned model replays twice with
   matching normalized events, assertions, and semantic outcome digest.
-- [ ] Fail a host that cannot complete under the pinned model as an unsupported
+  Blocked by the same limitation: no recording can be made under the pinned
+  model, so the two replays it would compare do not exist. ~scripts/phase4-acceptance.sh~
+  performs the record and two-replay comparison and fails while writing the
+  first command.
+- [X] Fail a host that cannot complete under the pinned model as an unsupported
   execution rather than falling back to another model.
-- [ ] Run the time-model probe as a continuous-integration gate on x86-64
+- [X] Run the time-model probe as a continuous-integration gate on x86-64
   Linux, requiring every requested run to complete and the verdict to be
-  `reproducible` rather than merely invoking the diagnostic.
-- [ ] Define and document the re-validation trigger for changes to the pinned
+  ~reproducible~ rather than merely invoking the diagnostic.
+  The gate is implemented and wired into the ~qemu-replay~ job, and it passes on
+  the reference host and on GitHub-hosted ~ubuntu-latest~.
+- [X] Define and document the re-validation trigger for changes to the pinned
   QEMU or guest kernel.
 
 * Phase 1 — Identity, rejection, and migration

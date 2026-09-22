@@ -58,6 +58,8 @@ jobs:
       - run: nix develop --command ./scripts/qemu-replay-smoke-test.sh
       - run: nix develop --command ./scripts/qemu-network-replay-smoke-test.sh
       - run: nix develop --command ./scripts/time-model-probe-test.sh
+      - run: nix develop --command ./scripts/time-model-input-probe-test.sh
+      - run: nix develop --command ./scripts/time-model-gate-test.sh
       - run: nix develop --command ./scripts/rfd3-phase0-spike-test.sh
       - run: nix develop --command ./scripts/rfd3-phase1-evidence.sh
       - name: RFD 3 phase 2 guest runtime
@@ -99,6 +101,16 @@ jobs:
       - run: nix develop --command ./scripts/rfd3-phase4-acceptance.sh
       - run: nix develop --command ./scripts/qemu-replay-smoke.sh
       - run: nix develop --command ./scripts/qemu-network-replay-smoke.sh
+      # The Phase 0 time-model gate runs the real probe under the pinned model
+      # and fails unless every requested run completes, the verdict is
+      # `reproducible`, and the guest measurements equal the reference host's.
+      - run: nix develop --command ./scripts/time-model-gate.sh
+      # The known record-mode result: with rr=record and sleep=off, QEMU queues
+      # live serial input and never flushes the queue. Asserting it here makes a
+      # QEMU change that starts delivering input visible, because that would
+      # unblock pinning the model in the product.
+      - name: Pinned model host-input assertion
+        run: nix develop --command ./scripts/time-model-input-probe.sh --expect not-delivered
       - run: nix develop --command ./scripts/phase4-acceptance.sh
       - if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -113,6 +125,19 @@ jobs:
             .poc/qemu-network-replay-smoke/
             .poc/phase4-acceptance/
             .poc/rfd3-phase1-evidence/
+            .poc/rfd4-phase0-gate/gate.*/gate.txt
+            .poc/rfd4-phase0-gate/gate.*/probe.stdout
+            .poc/rfd4-phase0-gate/gate.*/probe.stderr
+            .poc/rfd4-phase0-gate/gate.*/run.*/evidence.txt
+            .poc/rfd4-phase0-gate/gate.*/run.*/incomplete.txt
+            .poc/rfd4-phase0-gate/gate.*/run.*/measurements.txt
+            .poc/rfd4-phase0-gate/gate.*/run.*/*.status
+            .poc/rfd4-phase0-gate/gate.*/run.*/*.duration-ns
+            .poc/rfd4-phase0-gate/gate.*/run.*/*.serial
+            .poc/rfd4-phase0-gate/gate.*/run.*/*.qemu.log
+            .poc/time-model-input-probe/run.*/evidence.txt
+            .poc/time-model-input-probe/run.*/serial.log
+            .poc/time-model-input-probe/run.*/qemu.log
             .poc/rfd3-phase4-acceptance/*/evidence.txt
             .poc/rfd3-phase4-acceptance/*/*.status
             .poc/rfd3-phase4-acceptance/*/*.duration-ns

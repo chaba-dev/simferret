@@ -133,3 +133,414 @@ comparable.
 
 Raw per-run serial output, replay logs, and durations remain in the untracked
 `.poc/rfd4-phase0/` directory.
+
+=== Validation on the reference host
+
+The validation deadline is the probe's per-run QEMU deadline, 180 s
+(`SIMFERRET_QEMU_TIMEOUT`), and the sample is the RFD's minimum of five complete
+runs. `scripts/time-model-gate.sh` fixes both rather than inheriting them from
+the caller: a different deadline, a smaller sample, or a sample larger than the
+probe's own bound is a configuration error before any run starts, and the gate
+fails a host unless every requested run completed, the verdict is an explicit
+`reproducible`, and the guest measurements equal the checked-in reference values
+exactly. Failures are classified rather than merged into one status: a bad
+record, an unsupported platform, or a probe that rejects its arguments is a
+configuration error; a host that did not complete the runs is an unsupported
+execution and no fallback model is attempted; and a completed experiment that
+disagrees with the reference record, or that is invalid on its own control
+checks, is a validation failure. The probe's own outcomes are mapped rather than
+merged, and an exit the probe does not document is not read as a statement about
+the host. Each invocation creates its own directory under the output root before
+anything is validated, with its result file, the probe's output, and the probe's
+run directory, so a configuration error is recorded where it happened and a
+failed rerun cannot leave an earlier success standing.
+
+The checked-in command is:
+
+[source,shell]
+----
+.agents/dev ./scripts/time-model-gate.sh
+----
+
+On the reference host (AMD Ryzen 5 3600, 12 threads, Linux 6.18.41, QEMU 11.1.0,
+guest kernel 6.18.49) it reports:
+
+[cols="1,2",options="header"]
+|===
+| Field | Value
+
+| `icount_options` | `shift=4,sleep=off`
+| `requested_runs` / `complete_runs` / `incomplete_runs` | 5 / 5 / 0
+| `verdict` | `reproducible`
+| `varying_time_metrics` | 0
+| `qemu_version` | `QEMU emulator version 11.1.0`
+| `qemu_sha256` | `a26dcb363d6817495c7fdfe824f0c60e9c0e6369d90fdbfda9648d40f8dbdbd7`
+| `initramfs_sha256` | `24d0dfffc169a4275657c61281097882447fd565ecff87eb619cc587a57e1b4c`
+| `kernel_sha256` | `d4c2d110cb9b82dad81517cc2f1f3a46d0e31c8937237cf3df59eeffb3d7070b`
+| replay log per run | 330,255 B, identical in all five runs
+| run wall time | 6.6–6.8 s per run, inside the 180 s deadline
+| guest measurements | equal to the reference host's recorded values
+|===
+
+The QEMU identity is the SHA-256 of the executable rather than its version
+string, so a rebuilt or patched QEMU with an unchanged version string cannot pass
+as the reference build. That matters here because the model's blocker is a QEMU
+behaviour, and the feasibility spike below builds a patched QEMU that reports the
+same version.
+
+The values a host must reproduce are checked in as
+`poc/time-model/reference-host-values.txt`, which also names the model they were
+measured under. The gate reads both from that one record, so it cannot compare a
+host against values measured under a different model:
+
+[cols="1,2",options="header"]
+|===
+| Measurement | Reference-host value
+
+| 20 ms sleep | `probe sleep requested_ns=20000000 observed_ns=21950896`
+| spin | `probe spin chunks=64 window_ns=20000000 state=13811787166479837696`
+| fixed computation | `probe race work=2000000 elapsed_ns=182041872 within_deadline=no`
+| 100 × 1 ms sleeps | `probe sleep_loop iterations=100 observed_ns=117777696`
+| control checksum | `probe checksum value=14786994027932720960`
+|===
+
+These are the same values the scale-selection table above reports for
+`shift=4,sleep=off` (21.951 ms, 64 chunks, 182.042 ms, 117.778 ms), measured
+again in a later session, so the model reproduces across sessions and not only
+within one experiment. Each gate invocation writes its own directory under the
+untracked `.poc/rfd4-phase0-gate/` tree, holding its result file, the probe's
+output, and the probe's run directory with the per-run serial output, replay
+logs, and durations.
+
+=== Cross-host equality
+
+Requiring zero variation within a host is not the RFD's rule; the rule is that
+the guest measurements are equal across the supported hosts for identical
+artifacts and the same model. The gate therefore compares each host against the
+reference host's checked-in values instead of only against itself, and it checks
+the artifacts that make the comparison meaningful: the SHA-256 of the QEMU
+executable, of the guest kernel, and of the initramfs the probe builds. A host
+whose guest measurements differ fails the gate rather than passing with a
+warning.
+
+The reference host is the half measured here. The `ubuntu-latest` half is
+measured by the `qemu-replay` job in `.github/workflows/ci.yml`, which runs
+`scripts/time-model-gate-test.sh` and then the gate itself. Its first green run
+(GitHub-hosted `ubuntu-latest`, QEMU 11.1.0, the same kernel and initramfs
+digests) reproduced every value exactly: 5 of 5 requested runs completed, the
+verdict was `reproducible`, the four time measurements and the control checksum
+were identical to the reference host's, and every replay log was 330,255 bytes.
+The two hosts therefore agree on the measurements rather than each being only
+internally stable, which is the rule this section exists to enforce. The run is
+retained at
+https://github.com/chaba-dev/simferret/actions/runs/35672759147/job/106572696097.
+
+=== Record mode cannot use the pinned model
+
+The gate validates the model for a guest that never waits for host input, which
+is what the probe does. The product's guests do wait: a recording is driven by
+control commands written to the guest's serial port. Measuring that case
+separates the model's reproducibility from its usability, and it fails.
+
+`scripts/time-model-input-probe.sh` boots `poc/time-model/input-probe.c`, waits
+for the guest's `READY`, writes one line, and reports whether the guest received
+it. The guest polls with a 100 ms timeout rather than blocking, so it also
+measures delivery while virtual time keeps advancing, and it has no poll limit:
+it polls until the line arrives or the probe stops the emulator.
+
+The order of operations is the measurement, and QEMU's monitor is what makes it
+causal rather than timing-dependent. The guest polls until the probe stops the
+emulator, so a bounded guest window cannot close before the write. The probe then
+stops the guest with an acknowledged monitor command (it waits for QEMU's reply,
+so a request QEMU has not acted on is not mistaken for a stopped guest), drains
+the output the guest produced before it stopped, writes the line, and resumes the
+guest with a second acknowledged command. A stopped guest cannot poll and cannot
+produce output, so the polling it does after the resume is polling after the
+write, and no report read after the resume can be one the guest produced earlier;
+without that ordering the result would rest on how the host happened to be
+scheduled, which is exactly what a reproducibility measurement must not do.
+After the wait the probe stops the emulator and reads its output to its end
+before closing the pipe, so a delivery report emitted while the emulator is being
+stopped is classified rather than lost. Only an output that ended in one piece
+supports a non-delivery claim: an end that never arrives, a report cut off
+mid-line, or the emulator's own deadline expiring all leave the experiment
+inconclusive, because in those cases the probe cannot say that nothing else was
+coming.
+
+`input=not-delivered` therefore means: the guest reported `READY`, produced a
+poll report after the resumed write, the write succeeded, the guest had not
+stopped polling for longer than the stall bound, the emulator was still running
+when the wait expired and was stopped by the probe, and its output then ended in
+one piece, with no delivery report seen before or during shutdown. The stall
+bound is a liveness heuristic rather than a proof — a host stalled while
+consuming output cannot tell old progress from new — but the ordering does not
+rest on it, because the acknowledged stop and resume do. Receiving the line is
+reported whatever else the experiment did, and a guest that never reported
+`READY`, a host that could not write the line, a guest that produced no poll
+report after the write, an emulator that exited on its own, an output that did
+not end or ended mid-report, or a deadline that expired is inconclusive, which
+satisfies no assertion. All four measurements used the pinned QEMU, the pinned
+kernel, and the same probe build:
+
+[cols="2,1,1",options="header"]
+|===
+| `-icount` options | Replay | Host input delivered
+
+| `shift=4,sleep=off` (pinned)
+| `rr=record`
+| *no*, the guest polled for the 84 s after boot, reporting 26,740 polls, and never received the line
+
+| `shift=4,sleep=off` (pinned)
+| none
+| yes
+
+| `shift=4`
+| `rr=record`
+| yes
+
+| `shift=auto` (what the product launches today)
+| `rr=record`
+| yes
+|===
+
+The command that reproduces each row is:
+
+[source,shell]
+----
+.agents/dev ./scripts/time-model-input-probe.sh                # pinned model, records
+.agents/dev ./scripts/time-model-input-probe.sh --live         # pinned model, no record
+.agents/dev ./scripts/time-model-input-probe.sh shift=4        # sleep=on control
+.agents/dev ./scripts/time-model-input-probe.sh shift=auto     # the product's current model
+----
+
+Continuous integration asserts the known result rather than leaving it to be
+re-checked by hand: the `qemu-replay` job runs
+`scripts/time-model-input-probe.sh --expect not-delivered`, so a QEMU change
+that starts delivering input under the pinned model fails the job with the
+reading that the pin may be unblocked. The same job runs the guest's own
+regression tests (`scripts/time-model-input-probe-test.sh`), which drive the real
+polling loop through stubs: a line that arrives after more than the polls the
+guest used to stop after is still reported as received, and the guest never
+reports giving up, so restoring either fails there rather than passing.
+
+The cause is in QEMU rather than in the host. With record/replay enabled, live
+character input is not delivered when it is read: QEMU queues it as a
+`REPLAY_ASYNC_EVENT_CHAR_READ` and delivers it only when the replay event queue is
+flushed, which happens in `replay_async_events()` from
+`icount_account_warp_timer()`. That function returns immediately when
+`icount_sleep` is false, which is what `sleep=off` sets. Under the pinned model
+the guest therefore never receives the bytes, whether it blocks on a read, polls
+with a timer, or busy-polls, and whether the host writes them before or after
+boot.
+
+The limitation is not specific to record mode. In QEMU 11.1.0
+`replay_async_events()` has exactly one caller, that function, and it is the
+single site that saves queued events in record mode and injects recorded ones in
+replay mode through `replay_read_events()`; `sleep=off` therefore skips
+asynchronous input in both directions. A guest that needs no host input still
+records and replays, which is why the time-model probe is unaffected, but a
+recording under this model cannot be made and an existing recording's
+asynchronous input would not be injected either. The spike below shows a patch
+restoring that single processing site for both modes.
+
+The same limitation reaches the product and the earlier increments' spikes:
+
+* `scripts/phase4-acceptance.sh` records with the product and fails with
+  `simferret: timed out writing command to guest` after the first command, with
+  `traffic.requests_attempted: 0` in the failure diagnostics.
+* `scripts/qemu-network-replay-smoke.sh` fails because the guest's TFTP fetch
+  times out: the SLIRP response is also a replay asynchronous event, so it is
+  queued rather than delivered.
+* `scripts/qemu-replay-smoke.sh`, which needs no host input, passes under the
+  same model, so the failures are specific to asynchronous input rather than to
+  record and replay as a mechanism.
+
+What this blocks: Phase 0's requirement that the product's record and replay
+launch paths pass the pinned model, and its requirement that a run recorded under
+the pinned model replays twice with matching events, assertions, and outcome
+digest. A recording cannot be made under the pinned model, so the second
+requirement cannot be satisfied by any implementation that does not first change
+how input reaches the guest. Until that is decided, the product's launch paths
+keep launching the model they can complete under, which
+`crates/simferret/src/vm.rs` names `TIME_MODEL` and documents there.
+
+The decision this leaves to the RFD is not a scale choice. It is one of: keep a
+fixed scale and drop `sleep=off`, which reintroduces the residual host-coupled
+variation the scale-selection section measured; fix QEMU's no-sleep replay path
+so queued asynchronous events are flushed at a deterministic point; or deliver
+input to the guest by a mechanism that does not depend on the replay event queue,
+which is the deterministic-ingress work this RFD already separates from the
+model.
+
+=== Feasibility spike: a patched QEMU that flushes the queue
+
+The blocker above is one early return. `poc/time-model/qemu-nosleep-replay-flush.patch`
+moves the flush before it, and `poc/time-model/qemu-nosleep-replay-spike.nix`
+builds the pinned QEMU with that patch applied. Neither file is wired into
+`flake.nix` or into any build the repository performs; they answer whether a
+minimal fix is possible, and carrying a patched QEMU remains a project decision.
+
+[source,diff]
+----
+ void icount_account_warp_timer(void)
+ {
+-    if (!icount_sleep) {
+-        return;
+-    }
+-
+     /*
+      * Nothing to do if the VM is stopped: QEMU_CLOCK_VIRTUAL timers
+      * do not fire, so computing the deadline does not make sense.
+      */
+     if (!runstate_is_running()) {
+         return;
+     }
+ 
++    /*
++     * Flush queued replay events before the sleep check. External input is
++     * queued as a replay asynchronous event and delivered by this flush, so
++     * returning first would leave a guest that waits for host input without
++     * it in both record and replay mode.
++     */
+     replay_async_events();
+ 
++    if (!icount_sleep) {
++        return;
++    }
++
+     /* warp clock deterministically in record/replay mode */
+     if (!replay_checkpoint(CHECKPOINT_CLOCK_WARP_ACCOUNT)) {
+         return;
+     }
+----
+
+The build is:
+
+[source,shell]
+----
+rev=$(jq -r '.nodes.nixpkgs.locked.rev' flake.lock)
+nix build --impure --no-link --print-out-paths --expr "
+  let pkgs = import (builtins.fetchTarball
+        \"https://github.com/NixOS/nixpkgs/archive/$rev.tar.gz\") {};
+  in import ./poc/time-model/qemu-nosleep-replay-spike.nix { inherit pkgs; }"
+----
+
+It produced `/nix/store/6a4jza3ydplb1k9l4kbk9gcsqy2iaka8-qemu-11.1.0`, whose
+`qemu-system-x86_64` reports the same `QEMU emulator version 11.1.0` and hashes
+to `f9c26bcdcd50ecbbccd923840bbcfaede6fddc675764cd99c93e12e97779faa8`. Every
+measurement below used that binary through `QEMU_SYSTEM_X86_64`, and the
+reference column is the pinned stock QEMU.
+
+Because the repository's own revision does not launch the pinned model, the
+pinned-model rows were produced as follows. The input probe and the gate ran
+against this revision's scripts with the patched binary. The product acceptance
+ran the blocked pin, checked out with `jj edit rfd-4-phase0-pin-blocked`, so the
+product itself launched `shift=4,sleep=off`; that revision is not part of this
+change. The two record and replay spikes hard-code `shift=auto`, so for the
+spike they were temporarily set to the pinned model
+(`sed -i 's/-icount "shift=auto,rr=/-icount "shift=4,sleep=off,rr/' scripts/qemu-replay-smoke.sh scripts/qemu-network-replay-smoke.sh`)
+and restored afterwards with `jj restore`. The gate row used a spike-local
+reference record: the checked-in record with `qemu_sha256` replaced by the
+patched binary's digest, passed through `SIMFERRET_TIME_MODEL_REFERENCE`.
+
+[cols="2,1,1",options="header"]
+|===
+| Check | Stock QEMU | Patched QEMU
+
+| Host input under the pinned model with `rr=record` (`time-model-input-probe.sh`)
+| not delivered; the guest polled for the whole wait (26,740 polls over 84 s)
+| delivered immediately after `READY`
+
+| Host input under the pinned model without record/replay (`--live`)
+| delivered
+| delivered
+
+| Product record and two replays under the pinned model (`phase4-acceptance.sh`)
+| fails with `simferret: timed out writing command to guest`
+| passes, with the two replays matching
+
+| Network record and replay under the pinned model (`qemu-network-replay-smoke.sh`)
+| fails when the guest's TFTP fetch times out
+| passes
+
+| Record and replay with no host input (`qemu-replay-smoke.sh`)
+| passes
+| passes
+
+| Gate under the pinned model (`time-model-gate.sh`)
+| passes against the checked-in reference record
+| fails against that record on the QEMU digest, and passes against a record carrying the patched digest, with every guest measurement identical to the reference host's
+|===
+
+The gate row is the behaviour the QEMU digest exists for: the patched binary
+reports the same version string, and only the digest distinguishes it.
+
+The acceptance run is the two-replay confirmation this increment cannot make
+under the pinned model otherwise. Its normalized artifacts are byte-identical to
+the artifacts recorded under the product's current model in the same session:
+`events.jsonl` SHA-256 `e95693c7adee291b3f40ce6457189a6832402021826428c510c2f7f0bb55bd4d`,
+`assertions.json` SHA-256
+`d95cf483f182e37ff31687b80599dd37d2a877336eb966cb42c754faed4ea83f`, and
+`semantic_outcome_sha256` `be5ec6342d82234bc8d28ad538cf1dca34d38e42106fd9e12aec3e918fc0c927`.
+Only the replay log differs, 3,539,432 bytes under the pinned model against
+6,384,125 bytes under the current model, which is a measurement rather than
+identity, as RFD 2 already scopes it.
+
+Replay semantics. The flush is not moved past a checkpoint; the no-sleep path
+simply stops skipping it. In record mode `replay_async_events()` writes the
+queued events at the current instruction count and then runs them, and
+`replay_checkpoint(CHECKPOINT_CLOCK_WARP_ACCOUNT)` still follows in every path
+that reaches it, in the same order as before. With `sleep=on` nothing changes:
+the running-state check, the flush, and the checkpoint happen in the same
+sequence, and a stopped VM still returns before the flush in both modes. With
+`sleep=off` the checkpoint and the clock warp are still skipped, exactly as they
+were, so the change adds the flush without touching checkpoint ordering. The
+events therefore keep their instruction-position semantics, which is what the
+two-replay comparison above measures.
+
+What an upstream submission would argue: `-icount sleep=off` is documented as
+giving deterministic execution times from the guest's point of view, and
+record/replay is documented as recording and replaying serial, network, and
+input-device input. Those two documented behaviours do not compose today,
+because the only flush site for asynchronous events sits behind the sleep check.
+Moving the flush ahead of that check keeps checkpoint ordering, changes nothing
+for `sleep=on`, and makes `sleep=off` usable for guests that receive input. The
+counter-argument to expect is that a change here should come with a record/replay
+test covering input under `sleep=off`; the measurements above are the basis for
+one.
+
+Recommendation: the fix looks minimal, effective, and upstreamable, and it does
+not perturb the model's measurements. Whether to carry a patched QEMU until an
+upstream release includes it is the project's decision; this increment does not
+do that, and the product keeps the model it can complete under.
+
+=== Re-validation trigger
+
+The model, the reference values, and the input result are valid only for the
+pinned QEMU and guest kernel they were measured with. Re-validate when any of
+these changes:
+
+* the pinned QEMU or guest kernel, in practice a `flake.lock` update that moves
+  `pkgs.qemu` or `pkgs.linuxPackages.kernel`;
+* the model recorded in `poc/time-model/reference-host-values.txt`;
+* `poc/time-model/probe.c`, which changes the guest and therefore the initramfs
+  digest the gate checks; or
+* `poc/time-model/input-probe.c`, which changes the input probe's own guest, so
+  the input result below must be re-measured; the gate does not check that
+  initramfs.
+
+Re-validation means running `scripts/time-model-gate.sh` on every host in the
+supported matrix and `scripts/time-model-input-probe.sh` for the models in the
+table above, then re-recording the results here and the values in the reference
+record. The continuous-integration gate re-validates the `ubuntu-latest` host on
+every pull request, so that half does not depend on someone remembering, and the
+same job asserts the known host-input result, so a QEMU change that fixes the
+no-sleep flush fails the job instead of waiting to be noticed.
+
+If the input probe starts delivering input under the pinned model with
+record/replay enabled, the observed input blocker may be resolved — but that
+alone does not unblock the pin. Re-run the pinned product record and two-replay
+acceptance (`scripts/phase4-acceptance.sh` with a build that launches the pinned
+model) and the supported-host validation before adopting it; the probe's recorded
+result is what makes the change visible rather than a silent difference in
+behavior.
