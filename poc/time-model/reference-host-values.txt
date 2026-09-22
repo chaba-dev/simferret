@@ -1,0 +1,38 @@
+# SimFerret pinned time-model reference values (RFD 4 Phase 0).
+#
+# The guest measurements, the artifact identities, and the model below were
+# produced by `scripts/time-model-probe.sh` under the pinned model on the
+# reference x86-64 Linux host (AMD Ryzen 5 3600, 12 threads, Linux 6.18.41),
+# with the pinned QEMU 11.1.0, the pinned guest kernel 6.18.49, and the
+# initramfs the probe builds from `poc/time-model/probe.c`. The run, its
+# deadline, and its reason are recorded in `rfd/0004/EVIDENCE.adoc`.
+#
+# `scripts/time-model-gate.sh` compares a host's validation run against these
+# values. They are exact rather than tolerances: the RFD requires the guest
+# measurements to be equal across the supported hosts for identical artifacts
+# and the same model, so a host that produces different values fails instead of
+# passing with a warning.
+#
+# The artifact identities are SHA-256 digests of the QEMU executable, the guest
+# kernel, and the probe's initramfs. The QEMU digest rather than only its version
+# string is what makes a rebuilt or patched QEMU visible: a binary with an
+# unchanged version string would otherwise pass silently.
+#
+# Re-validation trigger: any change to the pinned QEMU or guest kernel (in
+# practice a `flake.lock` update that moves either), to the model in
+# `crates/simferret/src/vm.rs`, or to the probe source makes these values stale.
+# Re-measure on the reference host, re-record them here and in
+# `rfd/0004/EVIDENCE.adoc`, and let the gate re-validate every host in the
+# supported matrix. Until then the gate fails, which is the intended outcome: a
+# host that cannot complete under the pinned model is an unsupported execution
+# rather than a reason to fall back to another model.
+icount_options=shift=4,sleep=off
+kernel_sha256=d4c2d110cb9b82dad81517cc2f1f3a46d0e31c8937237cf3df59eeffb3d7070b
+initramfs_sha256=24d0dfffc169a4275657c61281097882447fd565ecff87eb619cc587a57e1b4c
+qemu_version=QEMU emulator version 11.1.0
+qemu_sha256=a26dcb363d6817495c7fdfe824f0c60e9c0e6369d90fdbfda9648d40f8dbdbd7
+measurement=probe sleep requested_ns=20000000 observed_ns=21950896
+measurement=probe spin chunks=64 window_ns=20000000 state=13811787166479837696
+measurement=probe race work=2000000 elapsed_ns=182041872 within_deadline=no
+measurement=probe sleep_loop iterations=100 observed_ns=117777696
+measurement=probe checksum value=14786994027932720960

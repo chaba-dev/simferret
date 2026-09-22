@@ -1,0 +1,53 @@
+From: SimFerret Phase 0 spike <noreply@example.invalid>
+Subject: [PATCH] icount: flush replay async events with sleep=off
+
+Record/replay delivers external input (serial, network, input devices) through
+queued asynchronous events. They are written to the log and run when the queue
+is flushed from replay_async_events(), which icount_account_warp_timer() calls
+after its sleep check. With sleep=off that check returns first, so the queue is
+never flushed: a guest waiting for host input never receives it, in record mode
+and in replay mode alike.
+
+Flush the queue before the sleep check. The running-state check stays first, and
+the checkpoint and clock-warp logic stay behind the sleep check, so no existing
+path reorders the flush relative to CHECKPOINT_CLOCK_WARP_ACCOUNT; the no-sleep
+path simply stops skipping the flush.
+
+This is a spike patch retained for the RFD 4 Phase 0 record-mode blocker. It is
+not applied by the repository's build.
+---
+ accel/tcg/icount-common.c | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+--- a/accel/tcg/icount-common.c
++++ b/accel/tcg/icount-common.c
+@@ -392,10 +392,6 @@
+ 
+ void icount_account_warp_timer(void)
+ {
+-    if (!icount_sleep) {
+-        return;
+-    }
+-
+     /*
+      * Nothing to do if the VM is stopped: QEMU_CLOCK_VIRTUAL timers
+      * do not fire, so computing the deadline does not make sense.
+@@ -404,8 +400,18 @@
+         return;
+     }
+ 
++    /*
++     * Flush queued replay events before the sleep check. External input is
++     * queued as a replay asynchronous event and delivered by this flush, so
++     * returning first would leave a guest that waits for host input without
++     * it in both record and replay mode.
++     */
+     replay_async_events();
+ 
++    if (!icount_sleep) {
++        return;
++    }
++
+     /* warp clock deterministically in record/replay mode */
+     if (!replay_checkpoint(CHECKPOINT_CLOCK_WARP_ACCOUNT)) {
+         return;
