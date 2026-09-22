@@ -15,10 +15,11 @@ set -euo pipefail
 # record, `poc/time-model/reference-host-values.txt`, so the gate cannot
 # validate a model whose values were measured under another one. The record
 # names the model, the SHA-256 of the QEMU executable, the guest kernel, and the
-# initramfs, and one measurement per metric. The product does not launch this
-# model yet: `TIME_MODEL` in `crates/simferret/src/vm.rs` documents why pinning
-# it is blocked on the model decision, and `rfd/0004/EVIDENCE.adoc` records the
-# measurement and the minimal reproduction.
+# initramfs, and one measurement per metric. The product launches this model:
+# `TIME_MODEL` in `crates/simferret/src/vm.rs` pins it, and the pinned emulator the
+# flake builds carries the replay-flush patch `sleep=off` needs, so a recording can
+# be driven. `rfd/0004/EVIDENCE.adoc` records the measurement, the pin, and the
+# resolution.
 #
 # The deadline and the sample size are the RFD's acceptance rule, not the
 # caller's, so both are fixed here: the probe keeps its own overridable deadline

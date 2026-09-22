@@ -654,8 +654,9 @@ input_evidence_value() { # $1 case name, $2 key
 # warmed here rather than inside a case with a short wait.
 python3 -c 'pass'
 
-# The known result: the pinned model records but never delivers host input, and
-# the guest polls for the whole wait.
+# A recording under the pinned model that never delivers host input: the state
+# the stock emulator produces, and the case the probe has to classify without
+# help from the emulator's own behaviour.
 run_input_probe input-known-result not-delivered SIMFERRET_INPUT_PROBE_WAIT=6
 test "$(input_evidence_value input-known-result input)" = "not-delivered"
 test "$(input_evidence_value input-known-result polls_reported)" = "true"
@@ -755,8 +756,8 @@ fi
 test "$(input_evidence_value input-flood-then-stop input)" = "inconclusive"
 grep -Fq 'did not go quiet' "$test_root/input-flood-then-stop.stderr"
 
-# If input starts being delivered under the pinned model, the assertion fails
-# with the reading that matters: the pin may be unblocked.
+# The pinned emulator delivers input, so an assertion that expects non-delivery
+# fails on delivery, which is what an expectation mismatch means here.
 if run_input_probe input-unblocked not-delivered FAKE_QEMU_INPUT_BEHAVIOR=delivered; then
   echo "delivered input did not fail the known-result assertion" >&2
   exit 1

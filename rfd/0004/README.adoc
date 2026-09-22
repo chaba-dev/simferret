@@ -106,6 +106,16 @@ duration vary across recordings and hosts, and that those are measurements
 rather than replay identity. That scoping is correct and this increment leaves
 it intact.
 
+The pinned emulator carries a patch. `sleep=off` needs the replay flush that
+QEMU performs only from `icount_account_warp_timer()`, which returns before it
+when `sleep=off`, so a recording cannot be driven under the pinned model on an
+unpatched build. `poc/time-model/qemu-nosleep-replay-flush.patch` moves the flush
+ahead of the sleep check, `flake.nix` applies it to the pinned emulator, and the
+patch is carried until upstream includes it; dropping it is a versioned change,
+because recordings made under a different emulator are not comparable. The
+evidence document records the measurement, the patch, and the spike that
+established it.
+
 Replay is also not unconditional. A successful replay requires valid recorded
 artifacts and digests, a matching scenario and materialized choice plan, a
 matching SimFerret executable and rebuilt initial state, the specific verified

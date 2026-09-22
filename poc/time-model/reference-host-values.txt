@@ -14,7 +14,10 @@
 # passing with a warning.
 #
 # The artifact identities are SHA-256 digests of the QEMU executable, the guest
-# kernel, and the probe's initramfs. The QEMU digest rather than only its version
+# kernel, and the probe's initramfs. The QEMU digest is the pinned emulator the
+# flake builds, which carries `poc/time-model/qemu-nosleep-replay-flush.patch`;
+# re-measuring the pinned model against it reproduced every value below, so the
+# patch does not move the guest's measurements. The QEMU digest rather than only its version
 # string is what makes a rebuilt or patched QEMU visible: a binary with an
 # unchanged version string would otherwise pass silently.
 #
@@ -30,7 +33,7 @@ icount_options=shift=4,sleep=off
 kernel_sha256=d4c2d110cb9b82dad81517cc2f1f3a46d0e31c8937237cf3df59eeffb3d7070b
 initramfs_sha256=24d0dfffc169a4275657c61281097882447fd565ecff87eb619cc587a57e1b4c
 qemu_version=QEMU emulator version 11.1.0
-qemu_sha256=a26dcb363d6817495c7fdfe824f0c60e9c0e6369d90fdbfda9648d40f8dbdbd7
+qemu_sha256=2c6adfd8fc39a972ebb6051f7105f10f11cc2715efd1ff0b4e3385809a0fae0d
 measurement=probe sleep requested_ns=20000000 observed_ns=21950896
 measurement=probe spin chunks=64 window_ns=20000000 state=13811787166479837696
 measurement=probe race work=2000000 elapsed_ns=182041872 within_deadline=no
