@@ -1,0 +1,465 @@
+= Upstream QEMU report: flush replay async events with sleep=off
+
+This document is the upstream submission for
+link:qemu-nosleep-replay-flush.patch[`qemu-nosleep-replay-flush.patch`], the
+change this repository carries for its pinned emulator: it moves
+`replay_async_events()` ahead of the `icount_sleep` check in
+`icount_account_warp_timer()`, so that `-icount sleep=off` stops skipping the
+replay asynchronous event queue.
+
+It is a draft for the project owner to send, and nothing here has been
+submitted: the `Signed-off-by` trailer is the submitter's to add, and the
+proposed regression test is a proposal rather than something this repository
+can run, because it lives in QEMU's own test suite. The measurements it cites
+are recorded in link:../../rfd/0004/EVIDENCE.adoc[RFD 4 evidence], and the runs
+in the reproduction section were re-measured for this document against the
+pinned QEMU 11.1.0 with and without the patch.
+
+The ordering the report describes is still present on upstream `master` at
+commit `67166d97a3269285aa68c489f85c9ccdf78495e1` (`accel/tcg/icount-common.c`,
+`icount_account_warp_timer()`), and no commit there moves the flush, so the
+patch applies to `master` and not only to the pinned 11.1.0.
+
+== Submission
+
+QEMU takes patches on the `qemu-devel@nongnu.org` mailing list as
+`git format-patch` output with a `Signed-off-by` trailer, which
+`docs/devel/submitting-a-patch.rst` describes. The subject and body below are
+what a contributor would send; the diff is the patch this repository carries,
+and it applies to the pinned QEMU 11.1.0 and to upstream `master`.
+
+=== Subject
+
+[source]
+----
+[PATCH] icount: flush replay async events with sleep=off
+----
+
+=== Body
+
+[source]
+----
+With -icount sleep=off, icount_account_warp_timer() returns before
+replay_async_events(), so the replay asynchronous event queue is never
+flushed.  Live character input is delivered through that queue: with
+record/replay enabled, qemu_chr_be_write() queues the bytes as a
+REPLAY_ASYNC_EVENT_CHAR_READ instead of calling the device's chr_read
+handler, and only replay_async_events() runs a queued event.  A guest that
+waits for serial input therefore never receives it under sleep=off, in
+record mode and in replay mode alike, although QEMU documents sleep=off as
+giving "deterministic execution times from the guest point of view" and
+record/replay as recording and replaying serial port input.  In record mode
+the queued bytes are not written to the log either, because
+replay_save_events() is the same flush, so the recording is silently
+missing the input rather than delivering it late.
+
+Move the flush before the sleep check.  The running-state check stays
+first, so a stopped VM still does not process events, and the checkpoint
+and the clock warp stay behind the sleep check, so the sleep=on path is
+unchanged and the sleep=off path simply stops skipping the flush.  The call
+stays on the round-robin CPU thread with the replay mutex held, which is
+what replay_async_events() asserts and what gives the queued events their
+instruction position in the log.
+
+The flush has been behind this early return since 60618e2d7769 ("replay:
+rewrite async event handling", 2022) added the call to this function; the
+sleep=off early return itself goes back to e76d1798faa6 ("icount: decouple
+warp calls", 2016).
+
+Signed-off-by: <submitter name and address>
+----
+
+=== Patch
+
+The exact patch text is
+link:qemu-nosleep-replay-flush.patch[`poc/time-model/qemu-nosleep-replay-flush.patch`];
+the diff it carries is:
+
+[source,diff]
+----
+--- a/accel/tcg/icount-common.c
++++ b/accel/tcg/icount-common.c
+@@ -392,10 +392,6 @@
+ 
+ void icount_account_warp_timer(void)
+ {
+-    if (!icount_sleep) {
+-        return;
+-    }
+-
+     /*
+      * Nothing to do if the VM is stopped: QEMU_CLOCK_VIRTUAL timers
+      * do not fire, so computing the deadline does not make sense.
+@@ -404,8 +400,18 @@
+         return;
+     }
+ 
++    /*
++     * Flush queued replay events before the sleep check. External input is
++     * queued as a replay asynchronous event and delivered by this flush, so
++     * returning first would leave a guest that waits for host input without
++     * it in both record and replay mode.
++     */
+     replay_async_events();
+ 
++    if (!icount_sleep) {
++        return;
++    }
++
+     /* warp clock deterministically in record/replay mode */
+     if (!replay_checkpoint(CHECKPOINT_CLOCK_WARP_ACCOUNT)) {
+         return;
+----
+
+The file's commit message is a provenance note written for this repository: it
+calls the change a spike retained for Phase 0's record-mode blocker and says
+the repository's build did not apply it. That note is not the submission text,
+and the body above replaces it.
+
+== Problem
+
+`-icount sleep=off` is documented in `qemu-options.hx` (rendered into
+`docs/system/invocation.rst` and the man page) as the setting under which
+
+* the virtual time "will jump to the next timer deadline instantly whenever
+  the virtual cpu goes to sleep mode and will not advance if no timer is
+  enabled. This behavior gives deterministic execution times from the guest
+  point of view";
+
+and it is only incompatible with `shift=auto` and `align=on`, so a user who
+wants it pins a scale and has a supported configuration.
+
+Record/replay is documented in `docs/system/replay.rst` as recording and
+replaying exactly the input a deterministic execution cannot derive:
+
+* "Performs deterministic replay of all operations with keyboard and mouse
+  input devices, serial ports, and network."
+* "The following non-deterministic data from peripheral devices is saved into
+  the log: mouse and keyboard input, network packets, audio controller input,
+  serial port input, and hardware clocks".
+* "Serial ports input is recorded and replay automatically."
+
+The two documented behaviours do not compose. With `sleep=off` and
+record/replay enabled, a guest receives no live input at all, in record mode
+and in replay mode alike. The failure is not latency: the bytes are queued as
+an asynchronous replay event and the queue is never drained, so in record mode
+they are neither delivered to the device nor written to the log, and in replay
+mode the recorded events are never injected. A guest that waits for a control
+command never receives it; a guest that polls never sees the bytes; the run
+hangs or times out, which presents as a broken guest rather than as a missing
+flush.
+
+== Mechanism
+
+The exact function and ordering, as they are in the pinned QEMU 11.1.0 and on
+`master` (`accel/tcg/icount-common.c`):
+
+[source,c]
+----
+void icount_account_warp_timer(void)
+{
+    if (!icount_sleep) {
+        return;
+    }
+
+    /*
+     * Nothing to do if the VM is stopped: QEMU_CLOCK_VIRTUAL timers
+     * do not fire, so computing the deadline does not make sense.
+     */
+    if (!runstate_is_running()) {
+        return;
+    }
+
+    replay_async_events();
+
+    /* warp clock deterministically in record/replay mode */
+    if (!replay_checkpoint(CHECKPOINT_CLOCK_WARP_ACCOUNT)) {
+        return;
+    }
+
+    timer_del(timers_state.icount_warp_timer);
+    icount_warp_rt();
+}
+----
+
+The function is called from the round-robin TCG CPU thread,
+`rr_cpu_thread_fn()` in `accel/tcg/tcg-accel-ops-rr.c`, between
+`replay_mutex_lock()` and `replay_mutex_unlock()`, once per loop iteration
+whenever `icount_enabled()`. It is not the warp timer's callback - that is
+`icount_timer_cb()` - so `sleep=off` does not stop the function from being
+called; the early return is the only thing that skips its body.
+
+`replay_async_events()` (`replay/replay.c`) is the only site that drains the
+queue. It calls `replay_save_instructions()` and then `replay_save_events()` in
+record mode or `replay_read_events()` in replay mode, and it asserts that the
+replay mutex is held. `docs/devel/replay.rst` documents the contract directly:
+"EVENT_ASYNC. This is a group of events. When such an event is generated, it is
+stored in the queue and processed in `icount_account_warp_timer()`", and the
+declaration in `include/system/replay.h` describes the function as processing
+"the async events added to the queue (while recording)" or reading "the events
+from the file (while replaying)".
+
+Character input enters that queue in `qemu_chr_be_write()` (`chardev/char.c`):
+when the chardev is replay-enabled, record mode calls `replay_chr_be_write()`
+(`replay/replay-char.c`), which allocates a `CharEvent` and calls
+`replay_add_event(REPLAY_ASYNC_EVENT_CHAR_READ, ...)` instead of calling the
+device's receive handler. The event's runner calls `qemu_chr_be_write_impl()`,
+which is what invokes the handler the device registered - `serial_receive1()`
+for a 16550 UART, `pl011_receive()` for a PL011. `docs/devel/replay.rst`
+describes the event as "Character (e.g., serial port) device input initiated by
+the sender", and in replay mode host writes are dropped entirely, because
+`qemu_chr_be_write()` returns for `REPLAY_MODE_PLAY`.
+
+Under `sleep=off`, therefore, `replay_async_events()` is never called: the
+queue is never drained in record mode, and the log's asynchronous events are
+never read in replay mode. The stub in `stubs/icount.c` is a non-TCG
+placeholder and not a second processing site.
+
+== Minimal reproduction
+
+=== Measured with this project's host-input probe
+
+The probe boots `poc/time-model/input-probe.c` as the guest init, waits for the
+guest's `READY`, stops the guest through QEMU's monitor, writes one line while
+the guest cannot be polling, resumes it, and reports whether the line arrived.
+The acknowledged stop and resume are what make a non-delivery claim causal
+rather than timing-dependent; the measurement is recorded in
+link:../../rfd/0004/EVIDENCE.adoc[RFD 4 evidence]. The checked-in commands are:
+
+[source,shell]
+----
+QEMU_SYSTEM_X86_64=<stock>   .agents/dev ./scripts/time-model-input-probe.sh --expect not-delivered
+QEMU_SYSTEM_X86_64=<patched> .agents/dev ./scripts/time-model-input-probe.sh --expect delivered
+QEMU_SYSTEM_X86_64=<stock>   .agents/dev ./scripts/time-model-input-probe.sh --expect delivered shift=4
+----
+
+Both binaries are the pinned QEMU 11.1.0 and report the same version string;
+they differ only by this patch, and the stock and patched digests are recorded
+in the evidence. Re-measured for this document:
+
+[cols="2,2,2",options="header"]
+|===
+| Configuration | Stock QEMU | Patched QEMU
+
+| `shift=4,sleep=off`, `rr=record`
+| `input=not-delivered`: the guest reported `READY`, the host wrote the line
+  after an acknowledged stop, and the guest then polled 25,450 times over 84 s
+  without receiving it
+| `input=delivered`, immediately after `READY`
+
+| `shift=4` (`sleep=on`), `rr=record`
+| `input=delivered`
+| `input=delivered`, unchanged
+|===
+
+=== Minimal QEMU-only form
+
+The essential guest is the probe's guest: an init that prints `READY`, polls
+its console with a 100 ms timeout rather than blocking, and prints
+`GOT:<line> iterations=N` when a line arrives. The full source is 75 lines
+(`poc/time-model/input-probe.c`) and can be attached to a submission; the
+recipe below is what a maintainer can run without this repository's harness.
+One line is written to the guest's console once `READY` appears, and the
+observation is whether `GOT:hello-from-host` is printed within the window:
+
+[source,shell]
+----
+qemu-system-x86_64 -machine pc-i440fx-9.2,accel=tcg -cpu qemu64 -smp 1 -m 256M \
+  -nodefaults -no-user-config -display none -monitor none -serial stdio -no-reboot \
+  -net none -rtc base=2000-01-01T00:00:00,clock=vm \
+  -kernel bzImage -initrd initramfs.cpio.gz \
+  -append 'console=ttyS0 quiet loglevel=0 panic=-1 nokaslr random.trust_cpu=off init=/init' \
+  -icount shift=4,sleep=off,rr=record,rrfile=replay.bin
+----
+
+The same command with `sleep=on` (that is, `shift=4`) and with `rr=replay` on a
+recording made by the patched build gives the control and replay rows. The
+runs below were measured for this document on the pinned kernel and the same
+guest, with a 40 s window after the line was written:
+
+[cols="2,2,2",options="header"]
+|===
+| Configuration | Stock QEMU | Patched QEMU
+
+| `shift=4,sleep=off`, `rr=record`
+| no `GOT`: the guest polled 1,469 times in the window
+  (`WAITING iterations=14690`) and never received the line; the recording
+  contains no `EVENT_ASYNC_CHAR_READ` at all, so the input was dropped rather
+  than delayed
+| `GOT:hello-from-host iterations=13`, and the recording contains the
+  `EVENT_ASYNC_CHAR_READ` events
+
+| `shift=4` (`sleep=on`), `rr=record`
+| `GOT` as expected
+| `GOT`, unchanged
+
+| `shift=4,sleep=off`, `rr=replay` of the patched recording
+| no `GOT`: the guest prints `READY` and one poll report, then virtual time
+  stops advancing and the guest hangs, because the event pending in the log is
+  never injected
+| `GOT:hello-from-host iterations=13`, the same iteration as the recording, with
+  no live input at all
+|===
+
+The log check is QEMU's own `scripts/replay-dump.py`: the stock recording of
+the first row has no `EVENT_ASYNC_CHAR_READ`, and the patched recording has it.
+That is the part a reviewer may find most useful, because it shows the defect
+is data loss in record mode and a hang in replay mode rather than a delay.
+
+== Why the flush can move without disturbing checkpoint ordering
+
+* With `sleep=on` the sequence inside `icount_account_warp_timer()` is
+  unchanged: the running-state check, the flush,
+  `CHECKPOINT_CLOCK_WARP_ACCOUNT`, `timer_del()`, and `icount_warp_rt()` happen
+  in the same order, because the sleep check does not fire.
+* With `sleep=off` no checkpoint is taken before the change and none is taken
+  after it: `replay_checkpoint(CHECKPOINT_CLOCK_WARP_ACCOUNT)` is still behind
+  the sleep check, so the no-sleep path still skips the clock warp exactly as
+  it did. There is no ordering between the flush and that checkpoint to
+  disturb, because that path never reaches the checkpoint.
+* The flush keeps the context that gives it its meaning: the same thread (the
+  round-robin CPU thread), still inside `replay_mutex_lock()` and
+  `replay_mutex_unlock()`, so `replay_async_events()`'s
+  `g_assert(replay_mutex_locked())` still holds, and still preceded by
+  `replay_save_instructions()`, so an event keeps its instruction position in
+  the log instead of acquiring a host-dependent one.
+* The running-state check stays first, so a stopped VM still returns before the
+  flush, and input submitted while the guest is stopped is queued and delivered
+  on resume. That is the ordering this project's probe relies on to make its
+  measurement causal, and it is unchanged.
+* Measured: under the patched emulator the pinned model reproduces every
+  reference value exactly, and the product's record-and-two-replays run has
+  normalized events, assertions, and semantic outcome digest byte-identical to
+  the same run under the model in use
+  (link:../../rfd/0004/EVIDENCE.adoc[RFD 4 evidence]). The patch does not
+  perturb what a recording contains beyond adding the input it was dropping.
+
+== Counter-arguments to expect
+
+* *The change should come with a record/replay test covering input under
+  `sleep=off`.* This is the expected one, and it is fair: the fix is one early
+  return, and the behaviour it restores is a documented input path. The next
+  section proposes the test. This project's measurements are the basis for it,
+  but they are not a substitute, because they live here and they measure the
+  absence of delivery as a project-specific negative.
+* *Why not deliver the bytes where they are queued, in the chardev write
+  path?* Because the queue exists to place the event at a deterministic
+  instruction position: `replay_async_events()` calls
+  `replay_save_instructions()` before it saves the events, and a chardev write
+  arrives on the I/O thread at an arbitrary host point. Delivering it
+  immediately would give input a host-dependent position in the log and in the
+  guest, which is what record/replay exists to remove, and it would contradict
+  `docs/devel/replay.rst`, which says queued events are processed in
+  `icount_account_warp_timer()`.
+* *Is the function called often enough under `sleep=off` for this to work?*
+  Yes: it is called from the round-robin CPU thread's loop whenever icount is
+  enabled, unconditionally on `icount_sleep`, and the early return is the only
+  thing that skips the flush. The patched runs above deliver the line on the
+  guest's next poll after it is written.
+* *Does this change `sleep=on`?* No. The order of the running-state check, the
+  flush, and the checkpoint is identical when the sleep check does not fire,
+  and the `sleep=on` control runs deliver input before and after the patch.
+* *Should the flush move ahead of the running-state check instead, so input is
+  processed while the guest is stopped?* That would process events while
+  `QEMU_CLOCK_VIRTUAL` timers do not fire, which the function's own comment
+  says makes the deadline computation meaningless, and it is unnecessary:
+  queued events survive a stop and are delivered on resume, which is how the
+  probe orders its write against the guest's polling.
+
+== Proposed upstream regression test
+
+The test belongs in QEMU's functional record/replay suite, which already boots a
+guest and asserts a console pattern in both record and replay:
+
+* *Directory and harness.* `tests/functional/x86_64/test_replay.py`, class
+  `X86Replay`, which derives from `ReplayKernelBase` in
+  `tests/functional/replay_kernel.py` (itself a `LinuxKernelTest`) and uses
+  `self.get_vm()`, `vm.set_console()`, and
+  `wait_for_console_pattern()`. It needs one small extension in
+  `ReplayKernelBase`: `run_vm()` builds the `-icount` string as
+  `shift=<n>,rr=<mode>,rrfile=<path>`, and the new test needs `sleep=off`
+  appended, which no existing test does. Registration needs no new entry: the
+  architecture's `meson.build` already lists `replay` in its thorough suite,
+  which registers `func-x86_64-replay`.
+* *What it boots.* The assets the file already uses, the TuxBoot Buildroot
+  x86_64 `bzImage` and `rootfs.ext4.zst` from
+  `https://storage.tuxboot.com/buildroot/20241119/x86_64/`. They are
+  interactive: `tests/functional/x86_64/test_tuxrun.py` boots the same pair and
+  drives it with `tuxtest login:`, `root`, and shell commands, so the test
+  needs no new asset and no new guest.
+* *What it asserts.* The recording run starts with
+  `-icount shift=4,sleep=off,rr=record,rrfile=<path>`, waits for the login
+  prompt, sends `root` over the console, waits for the shell prompt, and sends a
+  command whose output is a fixed string (`echo rr-input-ok`), asserting that
+  the string appears. The replay run starts with
+  `-icount shift=4,sleep=off,rr=replay,rrfile=<path>`, sends no live input at
+  all, and asserts the same string appears from the log and that QEMU exits
+  successfully; the base harness already runs `scripts/replay-dump.py` over the
+  log. Before the fix the recording run reaches the login prompt but the login
+  it sends never arrives, so the test fails waiting for the shell prompt; after
+  it, both directions pass. Both directions matter because the flush site is
+  shared: a recording that silently omits the input and a replay that never
+  injects it are the same defect, and the replay half is the one a user meets
+  when replaying an existing recording.
+* *Cheaper alternative, not measured here.* If a test that downloads a guest
+  image is not wanted, the asset-free shape is a bare-metal TCG test combining
+  the existing input and record/replay wrappers under `tests/tcg/scripts/`: a
+  guest that reads its semihosting console, recorded with
+  `-icount shift=5,sleep=off` and input fed to the recording run only, then
+  replayed with no input, comparing the two outputs as `record_replay.sh`
+  already does. Semihosting console input reaches the guest through the same
+  queued character event, so it would exercise the same path, but that has not
+  been measured here and it needs a new wrapper that feeds input to the
+  recording run alone.
+
+=== What this project's probe already covers that the test should not duplicate
+
+`scripts/time-model-input-probe.sh` with `poc/time-model/input-probe.c` is a
+measurement instrument, not a regression test, and the upstream test should not
+inherit its machinery:
+
+* It establishes a *negative* result - input was not delivered - where the
+  failure mode is a guest that hangs. That needs the acknowledged stop and
+  resume on QEMU's monitor, the drain before the write, the stall bound, the
+  requirement that the emulator's output ended in one piece, and the
+  classification of inconclusive versus not-delivered, so that "nothing
+  arrived" cannot be confused with "the experiment did not run". An upstream
+  test asserts the positive behaviour - the guest's response to console input
+  appears - and fails by timeout or by a missing prompt, so it needs none of
+  that.
+* It compares several models (`shift=auto`, `shift=4`, and `shift=4,sleep=off`)
+  to separate the model from the mechanism. That comparison is this project's
+  question about which model to pin, not a QEMU regression, and upstream should
+  test one supported configuration.
+* It asserts the known non-delivery as a continuous-integration expectation
+  (`--expect not-delivered`), which is a guard for this project's pin: the job
+  fails if a QEMU change starts delivering input, which is the signal that the
+  pin may be unblocked. That expectation is the opposite of what upstream
+  wants, and this project inverts it when the pin moves to a QEMU that carries
+  the fix.
+* Its guest tests (`poc/time-model/input-probe-test.c` with
+  `scripts/time-model-input-probe-test.sh`) cover properties of this project's
+  probe guest - no poll limit, late delivery reported as received, no give-up
+  report - which are properties of the instrument rather than of QEMU.
+* The replay direction is not covered by the probe's continuous integration at
+  all: it follows from the single flush site in the source and was measured for
+  this document. The upstream test should cover it, because a regression there
+  is invisible to a record-only test.
+
+== References
+
+* link:qemu-nosleep-replay-flush.patch[`poc/time-model/qemu-nosleep-replay-flush.patch`]
+* link:../../rfd/0004/EVIDENCE.adoc[RFD 4 evidence]
+* link:input-probe.c[`poc/time-model/input-probe.c`] and
+  link:../../scripts/time-model-input-probe.sh[`scripts/time-model-input-probe.sh`]
+* Upstream sources cited: `accel/tcg/icount-common.c`,
+  `accel/tcg/tcg-accel-ops-rr.c`, `replay/replay.c`, `replay/replay-char.c`,
+  `replay/replay-events.c`, `chardev/char.c`, `include/system/replay.h`,
+  `qemu-options.hx`, `docs/system/replay.rst`, `docs/devel/replay.rst`, and
+  `docs/devel/submitting-a-patch.rst`.
+* Upstream tests cited: `tests/functional/replay_kernel.py`,
+  `tests/functional/x86_64/test_replay.py`,
+  `tests/functional/x86_64/test_tuxrun.py`, and
+  `tests/tcg/scripts/record_replay.sh`.
+* Commits cited: `60618e2d7769` ("replay: rewrite async event handling", 2022)
+  and `e76d1798faa6` ("icount: decouple warp calls", 2016).
