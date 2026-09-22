@@ -52,6 +52,10 @@ measurements. Current progress lives in the implementation checklist, not here.
 | link:../poc/time-model/qemu-nosleep-replay-flush.patch[`qemu-nosleep-replay-flush.patch`] with link:../poc/time-model/qemu-nosleep-replay-spike.nix[`qemu-nosleep-replay-spike.nix`]
 | The minimal QEMU change that flushes queued replay events with `sleep=off`, and the scratch expression that builds the pinned QEMU with it; neither is wired into the repository's build, and the measurements are in the evidence document
 
+| Upstream report
+| link:../poc/time-model/qemu-nosleep-replay-upstream.adoc[`qemu-nosleep-replay-upstream.adoc`]
+| The submission-ready report for the patch: the problem, the mechanism, the reproduction on a stock and a patched QEMU, why the flush can move without disturbing checkpoint ordering, the counter-arguments to expect, and the regression test proposed for QEMU's own functional suite; it is a draft for the owner to submit, not a submission
+
 | Probe source
 | link:../poc/time-model/probe.c[`poc/time-model/probe.c`]
 | The five guest measurements — sleep, spin, race, sleep_loop, and the checksum control — and what each one does and does not establish
