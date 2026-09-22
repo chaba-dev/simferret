@@ -16,6 +16,13 @@ set -euo pipefail
 # row per measurement, or leaves its output unterminated is recorded and skipped
 # rather than aborting the experiment, and fewer than two completed runs yields
 # an `inconclusive` verdict rather than a reproducibility claim.
+#
+# The script exits 2 when its own configuration is unusable or the experiment
+# could not be prepared, 3 when no run completed at all (the host did not
+# complete under this model), and 1 when the runs completed but the experiment
+# is invalid (the control checksum varied, or the spin count and state
+# disagree). A caller can therefore tell a setup problem, a host that cannot
+# complete, and a completed experiment that does not support a claim apart.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 probe_source="$repo_root/poc/time-model/probe.c"
@@ -33,13 +40,31 @@ incomplete_runs=()
 output_dir=""
 complete=false
 
-report_incomplete() {
+# An exit that is not one of the documented outcomes is a harness failure rather
+# than a statement about reproducibility, so it is reported as a configuration
+# error: every intentional outcome records itself before it exits, and an
+# untagged status is not read as a finding about the host.
+outcome=""
+finish() {
+  local status=$?
+
+  trap - EXIT
   if [[ "$complete" != true && -n "$output_dir" ]]; then
     echo "Time-model probe failed; diagnostics: $output_dir" >&2
   fi
+  case "$status:$outcome" in
+    0:*|2:*|3:unsupported|1:invalid-experiment)
+      ;;
+    *)
+      echo "The time-model probe failed unexpectedly, so the experiment's outcome is" >&2
+      echo "not a reproducibility finding; see the diagnostics above." >&2
+      exit 2
+      ;;
+  esac
+  exit "$status"
 }
 
-trap report_incomplete EXIT
+trap finish EXIT
 
 validate_positive_duration() {
   local name="$1"
@@ -48,7 +73,7 @@ validate_positive_duration() {
 
   if [[ ! "$value" =~ $pattern ]]; then
     echo "$name must be a finite, positive duration (for example, 5s or 0.1s)." >&2
-    exit 1
+    exit 2
   fi
 }
 
@@ -139,47 +164,67 @@ output_is_terminated() {
 
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
   echo "The time-model probe supports x86-64 Linux only." >&2
-  exit 1
+  exit 2
 fi
 validate_positive_duration SIMFERRET_QEMU_TIMEOUT "$qemu_timeout"
 validate_positive_duration SIMFERRET_QEMU_KILL_AFTER "$qemu_kill_after"
 if [[ ! "$runs" =~ ^[1-9][0-9]*$ ]] || ((runs > 50)); then
   echo "SIMFERRET_TIME_MODEL_RUNS must be an integer from 1 through 50." >&2
-  exit 1
+  exit 2
 fi
 if [[ ! "$icount_options" =~ ^[a-z0-9=,]+$ ]] || [[ "$icount_options" == *rr=* ]]; then
   echo "SIMFERRET_ICOUNT_OPTIONS must be icount options such as shift=auto or" >&2
   echo "shift=7,sleep=off, and must not set rr= or rrfile=." >&2
-  exit 1
+  exit 2
 fi
 if [[ -z "$kernel" || ! -f "$kernel" ]]; then
   echo "SIMFERRET_KERNEL must name the pinned x86-64 Linux bzImage." >&2
   echo "Run this script through .agents/dev." >&2
-  exit 1
+  exit 2
 fi
 if [[ ! -f "$probe_source" ]]; then
   echo "Time-model probe source not found: $probe_source" >&2
-  exit 1
+  exit 2
 fi
 for command in "$qemu" "$static_cc" cpio gzip mktemp od sha256sum timeout; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Required command not found: $command" >&2
-    exit 1
+    exit 2
   fi
 done
 
 umask 022
-mkdir -p "$output_root"
-output_dir="$(mktemp -d "$output_root/run.XXXXXXXX")"
+if ! mkdir -p "$output_root"; then
+  echo "The time-model probe cannot create its output root: $output_root" >&2
+  exit 2
+fi
+if ! output_dir="$(mktemp -d "$output_root/run.XXXXXXXX")"; then
+  echo "The time-model probe cannot create a run directory under $output_root" >&2
+  exit 2
+fi
 root="$output_dir/rootfs"
-mkdir -p "$root"
-"$static_cc" -static -Os -Wall -Wextra -Werror "$probe_source" -o "$root/init"
-find "$root" -exec touch -h -d @0 {} +
-(
+# The guest and its initramfs are the experiment's inputs, so a failure to build
+# them is a configuration error rather than a host that could not complete.
+if ! mkdir -p "$root"; then
+  echo "The time-model probe cannot create the guest root: $root" >&2
+  exit 2
+fi
+if ! "$static_cc" -static -Os -Wall -Wextra -Werror "$probe_source" -o "$root/init"; then
+  echo "The probe guest did not compile with $static_cc; the experiment cannot start." >&2
+  exit 2
+fi
+if ! find "$root" -exec touch -h -d @0 {} +; then
+  echo "The time-model probe cannot normalize the guest root's timestamps." >&2
+  exit 2
+fi
+if ! (
   cd "$root"
   find . -print0 | LC_ALL=C sort -z | cpio --null --create --format=newc \
     --owner=0:0 --reproducible --quiet
-) | gzip -n >"$output_dir/initramfs.cpio.gz"
+) | gzip -n >"$output_dir/initramfs.cpio.gz"; then
+  echo "The probe initramfs could not be built; the experiment cannot start." >&2
+  exit 2
+fi
 
 for index in $(seq 1 "$runs"); do
   started="$(date +%s%N)"
@@ -237,10 +282,13 @@ for index in $(seq 1 "$runs"); do
 done
 
 if [[ "${#complete_runs[@]}" -eq 0 ]]; then
+  outcome="unsupported"
   echo "No run produced a complete probe measurement." >&2
+  echo "This host did not complete under the pinned model, which is an unsupported" >&2
+  echo "execution rather than a reproducibility result." >&2
   echo "Try SIMFERRET_ICOUNT_OPTIONS=shift=auto or a smaller fixed shift, and a" >&2
   echo "longer SIMFERRET_QEMU_TIMEOUT." >&2
-  exit 1
+  exit 3
 fi
 
 # Aggregate over completed runs only, so a partial run cannot contribute a
@@ -263,6 +311,7 @@ done
 
 checksum_distinct="$(sed '/^$/d' "$output_dir/values-checksum.txt" | sort -u | wc -l)"
 if [[ "$checksum_distinct" -ne 1 ]]; then
+  outcome="invalid-experiment"
   echo "The control checksum varied across completed runs, so the experiment is invalid." >&2
   cat "$output_dir/values-checksum.txt" >&2
   exit 1
@@ -273,12 +322,21 @@ fi
 # the runs did not execute the same fixed work, which invalidates the experiment
 # rather than being a timing measurement. The state is compared as text, because
 # these are 64-bit values that a numeric comparison would round together.
-if ! sed '/^$/d' "$output_dir/values-spin.txt" |
+comparison_status=0
+sed '/^$/d' "$output_dir/values-spin.txt" |
   sed -E 's/^probe spin chunks=([0-9]+) .* state=([0-9]+)$/\1 \2/' |
-  awk '{ state = "state:" $2; if ($1 in seen && seen[$1] != state) exit 1; seen[$1] = state }'; then
+  awk '{ state = "state:" $2; if ($1 in seen && seen[$1] != state) exit 1; seen[$1] = state }' ||
+  comparison_status=$?
+if ((comparison_status == 1)); then
+  outcome="invalid-experiment"
   echo "The spin count and state disagree across completed runs, so the experiment is invalid." >&2
   cat "$output_dir/values-spin.txt" >&2
   exit 1
+fi
+if ((comparison_status != 0)); then
+  echo "The spin count and state comparison could not run (status $comparison_status), so" >&2
+  echo "the experiment's result is unknown." >&2
+  exit 2
 fi
 
 varying=0

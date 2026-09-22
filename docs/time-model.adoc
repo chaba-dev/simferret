@@ -26,7 +26,31 @@ measurements. Current progress lives in the implementation checklist, not here.
 
 | Implementation evidence
 | link:../rfd/0004/EVIDENCE.adoc[RFD 4 evidence]
-| The pinned-scale selection and its reason, plus the validation results produced while implementing the RFD
+| The pinned-scale selection and its reason, the Phase 0 validation on the reference host, the record-mode limitation that blocks pinning the model, and the re-validation trigger
+
+| Validation gate
+| link:../scripts/time-model-gate.sh[`scripts/time-model-gate.sh`]
+| One run of the real probe under the pinned model with a fixed 180 s deadline and at least five runs, failing unless every requested run completed, the verdict is `reproducible`, the QEMU, kernel, and initramfs digests match the reference host's, and the guest measurements equal its recorded values; it classifies a bad record as a configuration error, an incomplete host as an unsupported execution, and a disagreement with the reference as a validation failure, and each invocation writes its own result directory
+
+| Reference values
+| link:../poc/time-model/reference-host-values.txt[`poc/time-model/reference-host-values.txt`]
+| The model, the QEMU, kernel, and initramfs digests, and one measurement per metric that a host must reproduce, measured on the reference host
+
+| Gate regression tests
+| link:../scripts/time-model-gate-test.sh[`scripts/time-model-gate-test.sh`]
+| The gate contract with a faked probe: a varying verdict, an incomplete sample, a differing measurement, a different artifact, and a malformed or duplicated record all fail with their own classification, a host that cannot complete is reported as unsupported without a fallback model, and a failed rerun cannot leave an earlier success standing. It also covers the host-input assertion mode below
+
+| Host-input probe
+| link:../poc/time-model/input-probe.c[`poc/time-model/input-probe.c`] with link:../scripts/time-model-input-probe.sh[`scripts/time-model-input-probe.sh`]
+| Whether a guest that waits for host input receives it under a given model, reported as `delivered`, `not-delivered`, or `inconclusive` from a guest that polls until the probe stops it, with the write ordered by acknowledged stop and resume commands on QEMU's monitor, and with a non-delivery claim requiring the emulator's output to have ended in one piece, the measurement that shows the pinned model does not deliver while record/replay is enabled, and the `--expect` mode the continuous-integration job uses to assert that known result
+
+| Host-input guest tests
+| link:../poc/time-model/input-probe-test.c[`poc/time-model/input-probe-test.c`] with link:../scripts/time-model-input-probe-test.sh[`scripts/time-model-input-probe-test.sh`]
+| The guest loop driven by stubs: a line that arrives after more than the polls the guest used to stop after is still reported as received, and the guest never reports giving up, so restoring either fails rather than passing
+
+| QEMU patch spike
+| link:../poc/time-model/qemu-nosleep-replay-flush.patch[`qemu-nosleep-replay-flush.patch`] with link:../poc/time-model/qemu-nosleep-replay-spike.nix[`qemu-nosleep-replay-spike.nix`]
+| The minimal QEMU change that flushes queued replay events with `sleep=off`, and the scratch expression that builds the pinned QEMU with it; neither is wired into the repository's build, and the measurements are in the evidence document
 
 | Probe source
 | link:../poc/time-model/probe.c[`poc/time-model/probe.c`]
@@ -56,6 +80,14 @@ per-run serial output and replay logs stay in the output directory, which defaul
 to the untracked `.poc/time-model-probe` tree. `SIMFERRET_TIME_MODEL_RUNS` and
 `SIMFERRET_QEMU_TIMEOUT` adjust the run count and the per-run deadline.
 
+Phase 0 acceptance is the gate rather than the harness, because the harness
+reports variation instead of failing on it:
+
+[source,shell]
+----
+.agents/dev ./scripts/time-model-gate.sh
+----
+
 == What the investigation established
 
 * Under the default `shift=auto`, the same fixed computation measured 42.65 ms and
@@ -73,6 +105,21 @@ to the untracked `.poc/time-model-probe` tree. `SIMFERRET_TIME_MODEL_RUNS` and
 * Time, entropy, and ordering fault injection remain unimplemented, and the
   arrival timing of live host input has no deterministic position in guest virtual
   time; both are separate work.
+* The pinned model cannot be adopted for record mode yet: with `sleep=off` and
+  `rr=record`, QEMU queues live serial input as a replay asynchronous event and
+  never flushes the queue, so a guest that waits for the control commands a
+  recording is driven with never receives them. The measurement, the models it
+  was compared against, and the source-level cause are in
+  link:../rfd/0004/EVIDENCE.adoc[RFD 4 evidence], and
+  `scripts/time-model-input-probe.sh` reproduces them. Continuous integration
+  asserts that known result, so a QEMU change that fixes it fails the job
+  instead of going unnoticed.
+* The limitation is one early return in QEMU, and the spike recorded in
+  link:../rfd/0004/EVIDENCE.adoc[RFD 4 evidence] shows that moving the flush
+  ahead of it makes the pinned model record and replay: the product's record and
+  two replays then match, with the same normalized events, assertions, and
+  semantic outcome digest as the model in use. Adopting that patch is a project
+  decision, not an open technical question.
 
 == Related increments
 

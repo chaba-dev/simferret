@@ -261,10 +261,14 @@ grep -Fxq 'varying_time_metrics=1' "$test_root/varying.stdout"
 
 # A varying control checksum means the runs did not produce the same fixed-work
 # result, so the experiment is invalid.
+status=0
 if run_probe bad-checksum FAKE_QEMU_BEHAVIOR=bad-checksum; then
   echo "a varying control checksum unexpectedly passed" >&2
   exit 1
+else
+  status=$?
 fi
+test "$status" -eq 1
 grep -Fq 'control checksum varied' "$test_root/bad-checksum.stderr"
 
 # A timed-out run is recorded and skipped; the remaining runs still conclude.
@@ -277,13 +281,54 @@ grep -Fxq 'run_1_status=124' "$test_root/timeout-first.stdout"
 run_dir="$(find "$test_root/timeout-first.out" -mindepth 1 -maxdepth 1 -type d -name 'run.*')"
 grep -Fq 'run-1 status=124' "$run_dir/incomplete.txt"
 
-# No completed run at all is an invalid experiment.
+# No completed run at all is an unsupported execution: the host did not complete
+# under this model, which is distinct from an invalid experiment.
+status=0
 if run_probe all-timeout SIMFERRET_QEMU_TIMEOUT=1s SIMFERRET_TIME_MODEL_RUNS=2 \
   FAKE_QEMU_BEHAVIOR=timeout; then
   echo "an experiment with no completed run unexpectedly passed" >&2
   exit 1
+else
+  status=$?
 fi
+# A host that completed no run is exit 3, distinct from a configuration error.
+test "$status" -eq 3
 grep -Fq 'No run produced a complete probe measurement' "$test_root/all-timeout.stderr"
+grep -Fq 'unsupported' "$test_root/all-timeout.stderr"
+
+# A guest that does not compile is a configuration error before any run starts,
+# not a host that could not complete.
+status=0
+if run_probe unbuildable SIMFERRET_STATIC_CC=false \
+  FAKE_QEMU_STARTED_FILE="$test_root/unbuildable.started"; then
+  echo "an experiment whose guest did not compile unexpectedly passed" >&2
+  exit 1
+else
+  status=$?
+fi
+test "$status" -eq 2
+grep -Fq 'did not compile' "$test_root/unbuildable.stderr"
+test ! -e "$test_root/unbuildable.started"
+
+# A failure after setup is a harness failure rather than a reproducibility
+# finding, so the probe reports it as a configuration error and not as an
+# invalid experiment.
+mkdir -p "$test_root/bin"
+cat >"$test_root/bin/date" <<'EOF'
+#!/bin/sh
+echo "date is unavailable" >&2
+exit 1
+EOF
+chmod +x "$test_root/bin/date"
+status=0
+if run_probe harness-failure "PATH=$test_root/bin:$PATH" SIMFERRET_TIME_MODEL_RUNS=1; then
+  echo "a probe whose timestamping failed unexpectedly passed" >&2
+  exit 1
+else
+  status=$?
+fi
+test "$status" -eq 2
+grep -Fq 'failed unexpectedly' "$test_root/harness-failure.stderr"
 
 # A nonzero QEMU exit is treated like a timeout.
 if run_probe nonzero SIMFERRET_TIME_MODEL_RUNS=2 FAKE_QEMU_BEHAVIOR=nonzero; then
@@ -417,16 +462,24 @@ grep -Fxq 'complete_runs=1' "$test_root/single.stdout"
 
 # Invalid inputs must fail before QEMU starts.
 started_file="$test_root/started"
-for case_name in invalid-icount invalid-runs invalid-duration; do
+for case_name in invalid-icount invalid-runs invalid-duration unwritable-output; do
   case "$case_name" in
     invalid-icount) arguments=("SIMFERRET_ICOUNT_OPTIONS=shift=1,rr=record") ;;
     invalid-runs) arguments=("SIMFERRET_TIME_MODEL_RUNS=0") ;;
     invalid-duration) arguments=("SIMFERRET_QEMU_TIMEOUT=0") ;;
+    # A setup command that cannot run is a configuration error too: the
+    # experiment's own output cannot be created, so nothing is measured.
+    unwritable-output) arguments=("SIMFERRET_TIME_MODEL_OUTPUT=/dev/null") ;;
   esac
+  status=0
   if run_probe "$case_name" "${arguments[@]}" "FAKE_QEMU_STARTED_FILE=$started_file"; then
     echo "$case_name unexpectedly passed" >&2
     exit 1
+  else
+    status=$?
   fi
+  # A configuration error is exit 2, distinct from an invalid experiment.
+  test "$status" -eq 2
   if [[ -e "$started_file" ]]; then
     echo "$case_name started QEMU" >&2
     exit 1
