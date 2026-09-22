@@ -29,13 +29,13 @@ set -euo pipefail
 # old progress from new; the ordering does not rest on it, because the monitor
 # does.
 #
-# The pinned model fails this probe when record/replay is enabled: with
-# `rr=record`, QEMU queues live serial input as a replay asynchronous event and
-# delivers it only from `icount_account_warp_timer()`, which returns before
-# `replay_async_events()` when `sleep=off`. `rfd/0004/EVIDENCE.adoc` records the
-# measurement, the models that were compared, and what it blocks. The probe is
-# retained so the limitation can be re-checked whenever the pinned QEMU or guest
-# kernel changes.
+# The pinned emulator carries the patch that makes this probe deliver: with
+# `rr=record` and `sleep=off` alone, QEMU queues live serial input as a replay
+# asynchronous event and delivers it only from `icount_account_warp_timer()`,
+# which returns before `replay_async_events()`; the patch moves the flush ahead
+# of the sleep check. The assertion the continuous-integration job runs expects
+# delivery, and the probe is retained so the behaviour can be re-checked whenever
+# the pinned QEMU or guest kernel changes.
 #
 # usage: time-model-input-probe.sh [--live] [--expect delivered|not-delivered] [icount-options]
 #   --live            do not enable record/replay (the control that isolates

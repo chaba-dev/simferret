@@ -18,7 +18,7 @@ jobs:
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
           install_url: https://releases.nixos.org/nix/nix-2.35.1/install
-      - run: nix develop --command cargo fmt --all -- --check
+      - run: nix develop .#light --command cargo fmt --all -- --check
 
   lint:
     name: Lint
@@ -30,7 +30,7 @@ jobs:
         with:
           install_url: https://releases.nixos.org/nix/nix-2.35.1/install
       - run: bash -n .agents/dev .agents/setup scripts/*.sh
-      - run: nix develop --command cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
+      - run: nix develop .#light --command cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -45,7 +45,7 @@ jobs:
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
           install_url: https://releases.nixos.org/nix/nix-2.35.1/install
-      - run: nix develop --command cargo test --locked --workspace --all-targets --all-features
+      - run: nix develop .#light --command cargo test --locked --workspace --all-targets --all-features
 
   qemu-replay:
     name: QEMU record/replay
@@ -105,12 +105,12 @@ jobs:
       # and fails unless every requested run completes, the verdict is
       # `reproducible`, and the guest measurements equal the reference host's.
       - run: nix develop --command ./scripts/time-model-gate.sh
-      # The known record-mode result: with rr=record and sleep=off, QEMU queues
-      # live serial input and never flushes the queue. Asserting it here makes a
-      # QEMU change that starts delivering input visible, because that would
-      # unblock pinning the model in the product.
+      # The pinned model delivers input because the pinned emulator carries the
+      # replay-flush patch: without it, QEMU queues live serial input with
+      # sleep=off and never flushes the queue, so a recording cannot be driven.
+      # Asserting delivery here keeps that patch load-bearing.
       - name: Pinned model host-input assertion
-        run: nix develop --command ./scripts/time-model-input-probe.sh --expect not-delivered
+        run: nix develop --command ./scripts/time-model-input-probe.sh --expect delivered
       - run: nix develop --command ./scripts/phase4-acceptance.sh
       - if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

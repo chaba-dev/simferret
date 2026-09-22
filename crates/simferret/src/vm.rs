@@ -24,20 +24,26 @@ const MEMORY_MIB: u32 = 128;
 /// The QEMU time model that record and replay both launch. `shift=auto` lets
 /// QEMU adjust the virtual CPU speed against host real time.
 ///
-/// RFD 4 pins `shift=4,sleep=off`, and Phase 0 validated that model as
-/// reproducible on the reference host, but the product cannot launch it yet:
-/// with `rr=record`, QEMU queues live serial input as a replay asynchronous
-/// event and flushes the queue only from `icount_account_warp_timer()`, which
-/// returns before `replay_async_events()` when `sleep=off`. A guest under that
-/// model therefore never receives the control commands a recording is driven
-/// with. `rfd/0004/EVIDENCE.adoc` records the measurement and the minimal
-/// reproduction, and `rfd/0004/IMPLEMENTATION.org` records that pinning this
-/// value is blocked on the RFD's model decision rather than on this code.
+/// RFD 4 pins `shift=4,sleep=off`: a fixed scale, so the guest's virtual time
+/// advances with the instructions it executes and its idle timers advance
+/// deterministically rather than with host scheduling, and no idle sleep, so the
+/// guest's clock is not paced by the host either.
 ///
-/// Changing this value is a versioned change: recordings made under another
-/// model are not comparable, and every host in the supported matrix must be
-/// re-validated.
-pub const TIME_MODEL: &str = "shift=auto";
+/// The pinned QEMU carries `poc/time-model/qemu-nosleep-replay-flush.patch`,
+/// applied by the flake's pinned emulator. With `sleep=off` alone, QEMU queues
+/// live serial input as a replay asynchronous event and flushes the queue only
+/// from `icount_account_warp_timer()`, which returns before
+/// `replay_async_events()`; the patch moves the flush ahead of the sleep check,
+/// so a recording can be driven. It is carried until upstream includes the fix,
+/// and dropping it is a versioned change: recordings made under a different
+/// emulator are not comparable, and every host in the supported matrix must be
+/// re-validated. `rfd/0004/EVIDENCE.adoc` records the measurement, the pin, and
+/// the spike that established the patch.
+///
+/// Changing this value is a versioned change for the same reason: the model is
+/// part of VM identity, and recordings made under another model are not
+/// comparable.
+pub const TIME_MODEL: &str = "shift=4,sleep=off";
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// The largest number of command bytes written before the writer waits for the
@@ -1866,16 +1872,12 @@ mod tests {
 
     #[test]
     fn record_and_replay_launch_the_configured_time_model() {
-        // The literal is the model the product launches today. RFD 4 pins
-        // `shift=4,sleep=off` and Phase 0 validated that model on the reference
-        // host, but the product cannot launch it yet: with `rr=record` QEMU
-        // queues live serial input as a replay asynchronous event and only
-        // delivers it from `icount_account_warp_timer()`, which returns before
-        // `replay_async_events()` when `sleep=off`, so a guest under that model
-        // never receives the commands a recording is driven with. Pinning the
-        // model is therefore a versioned change that also updates this
-        // assertion and re-validates every supported host.
-        assert_eq!(TIME_MODEL, "shift=auto");
+        // The literal is the model the product launches. It is pinned by RFD 4
+        // and reaches QEMU through the pinned emulator, which carries the
+        // replay-flush patch `sleep=off` needs; changing either the value or the
+        // emulator is a versioned change that also updates this assertion and
+        // re-validates every supported host.
+        assert_eq!(TIME_MODEL, "shift=4,sleep=off");
 
         let root = Path::new("/tmp/time-model");
         for (mode, rr) in [

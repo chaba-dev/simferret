@@ -26,7 +26,7 @@ measurements. Current progress lives in the implementation checklist, not here.
 
 | Implementation evidence
 | link:../rfd/0004/EVIDENCE.adoc[RFD 4 evidence]
-| The pinned-scale selection and its reason, the Phase 0 validation on the reference host, the record-mode limitation that blocks pinning the model, and the re-validation trigger
+| The pinned-scale selection and its reason, the Phase 0 validation on the reference host, the record-mode limitation that the pinned emulator's carried patch resolves, and the re-validation trigger
 
 | Validation gate
 | link:../scripts/time-model-gate.sh[`scripts/time-model-gate.sh`]
@@ -42,15 +42,15 @@ measurements. Current progress lives in the implementation checklist, not here.
 
 | Host-input probe
 | link:../poc/time-model/input-probe.c[`poc/time-model/input-probe.c`] with link:../scripts/time-model-input-probe.sh[`scripts/time-model-input-probe.sh`]
-| Whether a guest that waits for host input receives it under a given model, reported as `delivered`, `not-delivered`, or `inconclusive` from a guest that polls until the probe stops it, with the write ordered by acknowledged stop and resume commands on QEMU's monitor, and with a non-delivery claim requiring the emulator's output to have ended in one piece, the measurement that shows the pinned model does not deliver while record/replay is enabled, and the `--expect` mode the continuous-integration job uses to assert that known result
+| Whether a guest that waits for host input receives it under a given model, reported as `delivered`, `not-delivered`, or `inconclusive` from a guest that polls until the probe stops it, with the write ordered by acknowledged stop and resume commands on QEMU's monitor, and with a non-delivery claim requiring the emulator's output to have ended in one piece, the measurement that shows the pinned emulator's carried patch delivers while record/replay is enabled, and the `--expect` mode the continuous-integration job uses to assert that result
 
 | Host-input guest tests
 | link:../poc/time-model/input-probe-test.c[`poc/time-model/input-probe-test.c`] with link:../scripts/time-model-input-probe-test.sh[`scripts/time-model-input-probe-test.sh`]
 | The guest loop driven by stubs: a line that arrives after more than the polls the guest used to stop after is still reported as received, and the guest never reports giving up, so restoring either fails rather than passing
 
 | QEMU patch spike
-| link:../poc/time-model/qemu-nosleep-replay-flush.patch[`qemu-nosleep-replay-flush.patch`] with link:../poc/time-model/qemu-nosleep-replay-spike.nix[`qemu-nosleep-replay-spike.nix`]
-| The minimal QEMU change that flushes queued replay events with `sleep=off`, and the scratch expression that builds the pinned QEMU with it; neither is wired into the repository's build, and the measurements are in the evidence document
+| link:../poc/time-model/qemu-nosleep-replay-flush.patch[`qemu-nosleep-replay-flush.patch`] with link:../flake.nix[`flake.nix`]
+| The minimal QEMU change that flushes queued replay events with `sleep=off`, applied by the flake to the pinned emulator; the measurements are in the evidence document, and the patch is carried until upstream includes it
 
 | Probe source
 | link:../poc/time-model/probe.c[`poc/time-model/probe.c`]
@@ -104,11 +104,7 @@ reports variation instead of failing on it:
   predictions of production timing.
 * Time, entropy, and ordering fault injection remain unimplemented, and the
   arrival timing of live host input has no deterministic position in guest virtual
-  time; both are separate work.
-* The pinned model cannot be adopted for record mode yet: with `sleep=off` and
-  `rr=record`, QEMU queues live serial input as a replay asynchronous event and
-  never flushes the queue, so a guest that waits for the control commands a
-  recording is driven with never receives them. The measurement, the models it
+  time; both are separate work.is carried by the pinned emulator and adopted by the product. The measurement, the models it
   was compared against, and the source-level cause are in
   link:../rfd/0004/EVIDENCE.adoc[RFD 4 evidence], and
   `scripts/time-model-input-probe.sh` reproduces them. Continuous integration

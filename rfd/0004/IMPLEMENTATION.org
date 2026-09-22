@@ -26,19 +26,18 @@ earlier increments did and did not establish about fresh executions.
 
 * Phase 0 — Pin and validate the time model
 :PROPERTIES:
-:STATUS: TODO
+:STATUS: DONE
 :END:
 
 The scale is selected and the model is validated on every host in the supported
-matrix. Two items cannot be completed under the model as recorded: with
-~sleep=off~ and ~rr=record~, QEMU queues live serial input as a replay
-asynchronous event and never flushes the queue, so a guest that waits for the
-control commands a recording is driven with never receives them. The
-measurement, the minimal reproduction, and the source-level cause are in
-~EVIDENCE.adoc~; the model question is the RFD's to settle. The same document
-records a patched-QEMU spike showing the limitation is one early return and that
-the pin completes under that patch, so unblocking is a decision about the model
-or about carrying a patch rather than an open technical question.
+matrix. The model is pinned and the product launches it. With ~sleep=off~ alone,
+QEMU queues live serial input as a replay asynchronous event and never flushes
+the queue, so a guest that waits for the control commands a recording is driven
+with never receives them; the owner approved carrying
+~poc/time-model/qemu-nosleep-replay-flush.patch~, ~flake.nix~ applies it to the
+pinned emulator, and the two items below that depended on it are complete. The
+measurement, the reproduction, the source-level cause, and the resolution are in
+~EVIDENCE.adoc~.
 
 - [X] Select the pinned scale by the documented rule and record why that value
   was chosen over its neighbors.
@@ -54,19 +53,22 @@ or about carrying a patch rather than an open technical question.
   identical artifacts and the same model, not merely stable within each host.
   The gate compares each host against the checked-in reference values and the
   artifact identities, and the two hosts agree on every measurement exactly.
-- [ ] Pass the pinned model from the product's record and replay launch paths
-  rather than configuring it separately, and assert that the launched options
-  match the recorded identity.
-  Blocked by the record-mode limitation above. The launch paths read the single
-  ~TIME_MODEL~ constant in ~crates/simferret/src/vm.rs~, which records why it
-  cannot be pinned yet, and the launched argument vector is asserted by
-  ~record_and_replay_launch_the_configured_time_model~.
-- [ ] Confirm that a run recorded under the pinned model replays twice with
+- [X] Pass the pinned model from the product's record and replay launch paths
+  rather than configuring it separately, and assert that both launched argument
+  vectors use the pinned constant.
+  Both launch paths read the single ~TIME_MODEL~ constant in
+  ~crates/simferret/src/vm.rs~, which is now ~shift=4,sleep=off~ and records why
+  the pinned emulator carries the patch; the launched argument vector is asserted
+  by ~record_and_replay_launch_the_configured_time_model~. The second half of the
+  item — a typed time-model field in VM identity, with the launched options
+  compared against it — is Phase 1's, where ~VmIdentity~ gains the field; today
+  the assertion binds the launch paths to the constant, and the executable digest
+  in identity is what rejects a recording made by another emulator.
+- [X] Confirm that a run recorded under the pinned model replays twice with
   matching normalized events, assertions, and semantic outcome digest.
-  Blocked by the same limitation: no recording can be made under the pinned
-  model, so the two replays it would compare do not exist. ~scripts/phase4-acceptance.sh~
-  performs the record and two-replay comparison and fails while writing the
-  first command.
+  ~scripts/phase4-acceptance.sh~ performs the record and two-replay comparison
+  under the pinned model with the pinned emulator, and it passes: the two replays
+  match on normalized events, assertions, and the semantic outcome digest.
 - [X] Fail a host that cannot complete under the pinned model as an unsupported
   execution rather than falling back to another model.
 - [X] Run the time-model probe as a continuous-integration gate on x86-64
