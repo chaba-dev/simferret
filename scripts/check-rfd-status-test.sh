@@ -67,12 +67,7 @@ run_missing_directory_failure() {
 }
 
 write_valid_rfd() {
-	local state="$1" discussion="$2" implementation_format="${3:-org}" implementation_name
-	case "${implementation_format}" in
-	org) implementation_name="IMPLEMENTATION.org" ;;
-	md) implementation_name="IMPLEMENTATION.md" ;;
-	*) printf 'unsupported test implementation format: %s\n' "${implementation_format}" >&2; exit 1 ;;
-	esac
+	local state="$1" discussion="$2"
 	mkdir -p "${rfd_root}/0001"
 	printf '\nlink:0001/README.adoc[1: Valid RFD]\n' >>"${rfd_root}/README.adoc"
 	cat >"${rfd_root}/0001/README.adoc" <<EOF
@@ -85,28 +80,15 @@ write_valid_rfd() {
 
 == Implementation
 
-See link:${implementation_name}[implementation checklist].
+See link:IMPLEMENTATION.adoc[implementation checklist].
 EOF
-	case "${implementation_format}" in
-	org)
-		cat >"${rfd_root}/0001/${implementation_name}" <<'EOF'
-#+TITLE: RFD 0001 implementation checklist
+	cat >"${rfd_root}/0001/IMPLEMENTATION.adoc" <<'EOF'
+= RFD 0001 implementation checklist
 
-Implements [[file:README.adoc][RFD 1: Valid RFD]].
+Implements link:README.adoc[RFD 1: Valid RFD].
 
-- [ ] Complete the work.
+* [ ] Complete the work.
 EOF
-		;;
-	md)
-		cat >"${rfd_root}/0001/${implementation_name}" <<'EOF'
-# RFD 0001 implementation checklist
-
-Implements [RFD 1: Valid RFD](README.adoc).
-
-- [ ] Complete the work.
-EOF
-		;;
-	esac
 }
 
 reset_fixtures; write_valid_rfd prediscussion ""
@@ -128,27 +110,41 @@ cat >"${rfd_root}/0002/README.adoc" <<'EOF'
 
 == Implementation
 
-See link:IMPLEMENTATION.org[implementation checklist].
+See link:IMPLEMENTATION.adoc[implementation checklist].
 EOF
 {
-	printf '#+TITLE: RFD 0002 implementation checklist\n\nImplements [[file:README.adoc][RFD 2: Second RFD]].\n'
+	printf '= RFD 0002 implementation checklist\n\nImplements link:README.adoc[RFD 2: Second RFD].\n'
 	for ((task = 1; task <= 100; task++)); do
-		printf -- '- [x] Finished task %s.\n' "${task}"
+		printf -- '* [x] Finished task %s.\n' "${task}"
 	done
-} >"${rfd_root}/0002/IMPLEMENTATION.org"
+} >"${rfd_root}/0002/IMPLEMENTATION.adoc"
 run_success "0001  prediscussion      0/1  Valid RFD"
 run_success "0002  prediscussion  100/100  Second RFD"
 assert_labels_align
 
 reset_fixtures; write_valid_rfd discussion https://example.com/pull/1
-cat >>"${rfd_root}/0001/IMPLEMENTATION.org" <<'EOF'
-- [X] Finished task.
-  - [x] Finished nested task.
-- [-] Partially finished task.
+cat >>"${rfd_root}/0001/IMPLEMENTATION.adoc" <<'EOF'
+* [x] Finished task.
+** [x] Finished nested task.
+* [-] Partially finished task.
+** [-] Partially finished nested task.
+* [*] Alternate checked task.
 
-#+BEGIN_SRC text
-- [x] Example, not a task.
-#+END_SRC
+----
+* [x] Example, not a task.
+----
+
+....
+** [x] Example, not a task.
+....
+
+////
+* [-] Example, not a task.
+////
+
+// * [x] Commented, not a task.
+
++ [x] A list continuation is not a task marker.
 EOF
 cat >>"${rfd_root}/0001/README.adoc" <<'EOF'
 
@@ -162,71 +158,60 @@ cat >>"${rfd_root}/0001/README.adoc" <<'EOF'
 link:NOT-A-CHECKLIST[Example link]
 ----
 EOF
-run_success "0001  discussion       2/4"
+run_success "0001  discussion       3/6"
 
-reset_fixtures; write_valid_rfd prediscussion "" md
-cat >>"${rfd_root}/0001/IMPLEMENTATION.md" <<'EOF'
-- [x] Finished task.
-+ [X] Another finished task.
+reset_fixtures; write_valid_rfd prediscussion ""
+cat >>"${rfd_root}/0001/IMPLEMENTATION.adoc" <<'EOF'
+* [x] Finished task.
+** [x] Another finished task.
 
-````text
-- [x] Example, not a task.
-~~~
-- [x] Still inside the four-backtick fence.
-```
-- [x] Still inside after a shorter same-marker fence.
-<!-- Unclosed comment marker inside the fence.
-````
-
-    - [x] Four-space-indented code, not a task.
-- [x] Visible task. <!-- inline note -->
+----
+* [x] Example, not a task.
+....
+** [x] Still inside the listing block.
+////
+* [x] A comment delimiter inside a listing block stays literal.
+----
+* [x] Visible task.
 EOF
 run_success "0001  prediscussion    3/4"
 
-reset_fixtures; write_valid_rfd prediscussion "" md
-printf '\n- [x]\n- [ ]\n' >>"${rfd_root}/0001/IMPLEMENTATION.md"
+reset_fixtures; write_valid_rfd prediscussion ""
+printf '\n* [x]\n* [ ]\n' >>"${rfd_root}/0001/IMPLEMENTATION.adoc"
 run_success "0001  prediscussion    1/3"
 
-reset_fixtures; write_valid_rfd prediscussion "" md
-cat >>"${rfd_root}/0001/IMPLEMENTATION.md" <<'EOF'
-<!--
-    -->
-- [x] Visible after an indented comment closer.
-- [x] Visible before comments. <!-- closed --> <!--
-- [ ] Hidden in the second comment.
+reset_fixtures; write_valid_rfd prediscussion ""
+cat >>"${rfd_root}/0001/IMPLEMENTATION.adoc" <<'EOF'
+////
+* [x] Hidden in a comment block.
+////
+* [x] Visible after a comment block.
+// * [ ] Hidden on a line comment.
+* [x] Visible after a line comment.
 EOF
 run_success "0001  prediscussion    2/3"
 
-reset_fixtures; write_valid_rfd prediscussion "" md
-cat >>"${rfd_root}/0001/IMPLEMENTATION.md" <<'EOF'
-    ```text
-- [x] Visible because an indented fence is code.
-    ```
-- [ ] Render `<!--` literally.
-- [x] Still visible after inline code.
-EOF
-run_success "0001  prediscussion    2/4"
-
-reset_fixtures; write_valid_rfd prediscussion "" md
-cat >>"${rfd_root}/0001/IMPLEMENTATION.md" <<'EOF'
-```invalid`info
-- [x] Visible after an invalid fence opener.
-```
+reset_fixtures; write_valid_rfd prediscussion ""
+cat >>"${rfd_root}/0001/IMPLEMENTATION.adoc" <<'EOF'
+....
+* [x] Hidden in a literal block.
+....
+* [x] Visible after a literal block.
 EOF
 run_success "0001  prediscussion    1/2"
 
 reset_fixtures; write_valid_rfd prediscussion ""
-printf '\n- [x]\n- [ ]\n' >>"${rfd_root}/0001/IMPLEMENTATION.org"
-run_success "0001  prediscussion    1/3"
+cat >>"${rfd_root}/0001/IMPLEMENTATION.adoc" <<'EOF'
+----not-a-delimiter
+* [x] Visible after an invalid delimiter.
+EOF
+run_success "0001  prediscussion    1/2"
 
 reset_fixtures; write_valid_rfd prediscussion ""
-cat >>"${rfd_root}/0001/IMPLEMENTATION.org" <<'EOF'
-#+BEGIN_SRC text
-#+END_EXAMPLE
-- [x] Still inside the source block.
-  #+END_SRC
+cat >>"${rfd_root}/0001/IMPLEMENTATION.adoc" <<'EOF'
+- [x] A hyphen is also an AsciiDoc list marker.
 EOF
-run_success "0001  prediscussion    0/1"
+run_success "0001  prediscussion    1/2"
 
 reset_fixtures; write_valid_rfd prediscussion ""
 cat >>"${rfd_root}/0001/README.adoc" <<'EOF'
@@ -248,7 +233,7 @@ reset_fixtures
 run_failure "no RFDs found"
 
 reset_fixtures; write_valid_rfd prediscussion ""
-rm "${rfd_root}/0001/IMPLEMENTATION.org"
+rm "${rfd_root}/0001/IMPLEMENTATION.adoc"
 run_failure "missing implementation checklist"
 
 reset_fixtures; write_valid_rfd prediscussion ""
@@ -308,204 +293,173 @@ printf '\n* [ ]\n' >>"${rfd_root}/0001/README.adoc"
 run_failure "implementation checkboxes belong in a separate implementation document"
 
 reset_fixtures; write_valid_rfd prediscussion ""
-printf '# RFD 0001 implementation checklist\n\nImplements [RFD 1](README.adoc).\n' >"${rfd_root}/0001/IMPLEMENTATION.md"
-run_failure "multiple implementation checklist formats"
+printf '\n// * [ ] Commented-out checkbox.\n' >>"${rfd_root}/0001/README.adoc"
+run_success
 
 reset_fixtures; write_valid_rfd prediscussion ""
-sed -i.bak '1s/.*/# invalid heading/' "${rfd_root}/0001/IMPLEMENTATION.org"
-rm "${rfd_root}/0001/IMPLEMENTATION.org.bak"
-run_failure "invalid implementation checklist heading"
+printf '\n+ [ ] Not an AsciiDoc checkbox.\n' >>"${rfd_root}/0001/README.adoc"
+run_success
 
 reset_fixtures; write_valid_rfd prediscussion ""
-sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.org"
-rm "${rfd_root}/0001/IMPLEMENTATION.org.bak"
-run_failure "implementation checklist must link to its RFD"
+cat >>"${rfd_root}/0001/README.adoc" <<'EOF'
 
-reset_fixtures; write_valid_rfd prediscussion ""
-sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.org"
-rm "${rfd_root}/0001/IMPLEMENTATION.org.bak"
-cat >>"${rfd_root}/0001/IMPLEMENTATION.org" <<'EOF'
-#+BEGIN_EXAMPLE
-[[file:README.adoc][RFD link shown as an example]]
-#+END_EXAMPLE
-EOF
-run_failure "implementation checklist must link to its RFD"
-
-reset_fixtures; write_valid_rfd prediscussion ""
-sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.org"
-rm "${rfd_root}/0001/IMPLEMENTATION.org.bak"
-printf '\n# [[file:README.adoc][comment only]]\n' >>"${rfd_root}/0001/IMPLEMENTATION.org"
-run_failure "implementation checklist must link to its RFD"
-
-reset_fixtures; write_valid_rfd prediscussion ""
-sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.org"
-rm "${rfd_root}/0001/IMPLEMENTATION.org.bak"
-cat >>"${rfd_root}/0001/IMPLEMENTATION.org" <<'EOF'
-#+BEGIN_COMMENT
-Implements [[file:README.adoc][comment only]].
-#+END_COMMENT
-EOF
-run_failure "implementation checklist must link to its RFD"
-
-reset_fixtures; write_valid_rfd prediscussion "" md
-sed -i.bak '1s/.*/# invalid heading/' "${rfd_root}/0001/IMPLEMENTATION.md"
-rm "${rfd_root}/0001/IMPLEMENTATION.md.bak"
-run_failure "invalid implementation checklist heading"
-
-reset_fixtures; write_valid_rfd prediscussion "" md
-sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.md"
-rm "${rfd_root}/0001/IMPLEMENTATION.md.bak"
-run_failure "implementation checklist must link to its RFD"
-
-reset_fixtures; write_valid_rfd prediscussion "" md
-sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.md"
-rm "${rfd_root}/0001/IMPLEMENTATION.md.bak"
-cat >>"${rfd_root}/0001/IMPLEMENTATION.md" <<'EOF'
-~~~text
-[RFD link shown as an example](README.adoc)
-~~~
-EOF
-run_failure "implementation checklist must link to its RFD"
-
-reset_fixtures; write_valid_rfd prediscussion "" md
-sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.md"
-rm "${rfd_root}/0001/IMPLEMENTATION.md.bak"
-cat >>"${rfd_root}/0001/IMPLEMENTATION.md" <<'EOF'
-<!--
---> <!--
-Implements [comment only](README.adoc).
--->
-EOF
-run_failure "implementation checklist must link to its RFD"
-
-reset_fixtures; write_valid_rfd prediscussion "" md
-sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.md"
-rm "${rfd_root}/0001/IMPLEMENTATION.md.bak"
-printf '\n`[RFD link shown as code](README.adoc)`\n' >>"${rfd_root}/0001/IMPLEMENTATION.md"
-run_failure "implementation checklist must link to its RFD"
-
-reset_fixtures; write_valid_rfd prediscussion "" md
-sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.md"
-rm "${rfd_root}/0001/IMPLEMENTATION.md.bak"
-printf '\n<!-- Implements [comment only](README.adoc). -->\n' >>"${rfd_root}/0001/IMPLEMENTATION.md"
-run_failure "implementation checklist must link to its RFD"
-
-reset_fixtures; write_valid_rfd prediscussion "" md
-sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.md"
-rm "${rfd_root}/0001/IMPLEMENTATION.md.bak"
-cat >>"${rfd_root}/0001/IMPLEMENTATION.md" <<'EOF'
-\` <!--
-Implements [comment only](README.adoc).
--->
-EOF
-run_failure "implementation checklist must link to its RFD"
-
-reset_fixtures; write_valid_rfd prediscussion "" md
-sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.md"
-rm "${rfd_root}/0001/IMPLEMENTATION.md.bak"
-cat >>"${rfd_root}/0001/IMPLEMENTATION.md" <<'EOF'
-` <!--
-Implements [comment only](README.adoc).
--->
-EOF
-run_failure "implementation checklist must link to its RFD"
-
-reset_fixtures; write_valid_rfd prediscussion "" md
-sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.md"
-rm "${rfd_root}/0001/IMPLEMENTATION.md.bak"
-cat >>"${rfd_root}/0001/IMPLEMENTATION.md" <<'EOF'
-<!--
--->Implements [comment only](README.adoc).
-EOF
-run_failure "implementation checklist must link to its RFD"
-
-reset_fixtures; write_valid_rfd prediscussion "" md
-sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.md"
-rm "${rfd_root}/0001/IMPLEMENTATION.md.bak"
-cat >>"${rfd_root}/0001/IMPLEMENTATION.md" <<'EOF'
-<!--
-    -->
-Implements [RFD 1: Valid RFD](README.adoc).
+----
+* [ ] Example checkbox inside a listing block.
+----
 EOF
 run_success
 
-reset_fixtures; write_valid_rfd prediscussion "" md
-printf '\n- [-] Invalid Markdown task state.\n' >>"${rfd_root}/0001/IMPLEMENTATION.md"
-run_failure "invalid Markdown task state"
-
-reset_fixtures; write_valid_rfd prediscussion "" md
-cat >>"${rfd_root}/0001/IMPLEMENTATION.md" <<'EOF'
-<!--
--->- [x] Hidden on the comment-closing line.
-EOF
-run_success "0001  prediscussion    0/1"
-
-reset_fixtures; write_valid_rfd prediscussion "" md
-cat >>"${rfd_root}/0001/IMPLEMENTATION.md" <<'EOF'
-<!--
---> <!--
-- [x] Hidden after the reopened comment.
--->
-- [x] Visible after the final closer.
-EOF
-run_success "0001  prediscussion    1/2"
+reset_fixtures; write_valid_rfd prediscussion ""
+printf '# RFD 0001 implementation checklist\n\nImplements [RFD 1](README.adoc).\n' >"${rfd_root}/0001/IMPLEMENTATION.md"
+run_failure "retired implementation checklist format: 0001/IMPLEMENTATION.md"
 
 reset_fixtures; write_valid_rfd prediscussion ""
-sed -i.bak '/link:IMPLEMENTATION.org/d' "${rfd_root}/0001/README.adoc"
+printf '#+TITLE: RFD 0001 implementation checklist\n\nImplements [[file:README.adoc][RFD 1: Valid RFD]].\n' >"${rfd_root}/0001/IMPLEMENTATION.org"
+run_failure "retired implementation checklist format: 0001/IMPLEMENTATION.org"
+
+reset_fixtures; write_valid_rfd prediscussion ""
+rm "${rfd_root}/0001/IMPLEMENTATION.adoc"
+printf '#+TITLE: RFD 0001 implementation checklist\n\nImplements [[file:README.adoc][RFD 1: Valid RFD]].\n' >"${rfd_root}/0001/IMPLEMENTATION.org"
+run_failure "missing implementation checklist"
+
+reset_fixtures; write_valid_rfd prediscussion ""
+sed -i.bak '1s/.*/== invalid heading/' "${rfd_root}/0001/IMPLEMENTATION.adoc"
+rm "${rfd_root}/0001/IMPLEMENTATION.adoc.bak"
+run_failure "invalid implementation checklist heading"
+
+reset_fixtures; write_valid_rfd prediscussion ""
+sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.adoc"
+rm "${rfd_root}/0001/IMPLEMENTATION.adoc.bak"
+run_failure "implementation checklist must link to its RFD"
+
+reset_fixtures; write_valid_rfd prediscussion ""
+sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.adoc"
+rm "${rfd_root}/0001/IMPLEMENTATION.adoc.bak"
+cat >>"${rfd_root}/0001/IMPLEMENTATION.adoc" <<'EOF'
+
+----
+Implements link:README.adoc[RFD link shown as a listing].
+----
+EOF
+run_failure "implementation checklist must link to its RFD"
+
+reset_fixtures; write_valid_rfd prediscussion ""
+sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.adoc"
+rm "${rfd_root}/0001/IMPLEMENTATION.adoc.bak"
+cat >>"${rfd_root}/0001/IMPLEMENTATION.adoc" <<'EOF'
+
+....
+Implements link:README.adoc[RFD link shown as a literal].
+....
+EOF
+run_failure "implementation checklist must link to its RFD"
+
+reset_fixtures; write_valid_rfd prediscussion ""
+sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.adoc"
+rm "${rfd_root}/0001/IMPLEMENTATION.adoc.bak"
+cat >>"${rfd_root}/0001/IMPLEMENTATION.adoc" <<'EOF'
+
+////
+Implements link:README.adoc[RFD link shown as a comment].
+////
+EOF
+run_failure "implementation checklist must link to its RFD"
+
+reset_fixtures; write_valid_rfd prediscussion ""
+sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.adoc"
+rm "${rfd_root}/0001/IMPLEMENTATION.adoc.bak"
+printf '\n// Implements link:README.adoc[RFD link shown as a line comment].\n' >>"${rfd_root}/0001/IMPLEMENTATION.adoc"
+run_failure "implementation checklist must link to its RFD"
+
+reset_fixtures; write_valid_rfd prediscussion ""
+sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.adoc"
+rm "${rfd_root}/0001/IMPLEMENTATION.adoc.bak"
+printf '\n`Implements link:README.adoc[RFD link shown as inline code].`\n' >>"${rfd_root}/0001/IMPLEMENTATION.adoc"
+run_failure "implementation checklist must link to its RFD"
+
+reset_fixtures; write_valid_rfd prediscussion ""
+sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.adoc"
+rm "${rfd_root}/0001/IMPLEMENTATION.adoc.bak"
+printf '\nImplements [[file:README.adoc][Org-style link]].\n' >>"${rfd_root}/0001/IMPLEMENTATION.adoc"
+run_failure "implementation checklist must link to its RFD"
+
+reset_fixtures; write_valid_rfd prediscussion ""
+sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.adoc"
+rm "${rfd_root}/0001/IMPLEMENTATION.adoc.bak"
+printf '\nImplements [Markdown-style link](README.adoc).\n' >>"${rfd_root}/0001/IMPLEMENTATION.adoc"
+run_failure "implementation checklist must link to its RFD"
+
+reset_fixtures; write_valid_rfd prediscussion ""
+sed -i.bak '/Implements/d' "${rfd_root}/0001/IMPLEMENTATION.adoc"
+rm "${rfd_root}/0001/IMPLEMENTATION.adoc.bak"
+cat >>"${rfd_root}/0001/IMPLEMENTATION.adoc" <<'EOF'
+
+////
+Implements link:README.adoc[comment only].
+////
+Implements link:README.adoc[RFD 1: Valid RFD].
+EOF
+run_success
+
+reset_fixtures; write_valid_rfd prediscussion ""
+printf '\n* [y] Invalid AsciiDoc task state.\n' >>"${rfd_root}/0001/IMPLEMENTATION.adoc"
+run_failure "invalid AsciiDoc task state"
+
+reset_fixtures; write_valid_rfd prediscussion ""
+printf '\n* [X] An uppercase state is not an AsciiDoc checkbox.\n' >>"${rfd_root}/0001/IMPLEMENTATION.adoc"
+run_failure "invalid AsciiDoc task state"
+
+reset_fixtures; write_valid_rfd prediscussion ""
+sed -i.bak '/link:IMPLEMENTATION.adoc/d' "${rfd_root}/0001/README.adoc"
 rm "${rfd_root}/0001/README.adoc.bak"
 run_failure "RFD must link to its implementation checklist"
 
 reset_fixtures; write_valid_rfd prediscussion ""
-sed -i.bak '/link:IMPLEMENTATION.org/d' "${rfd_root}/0001/README.adoc"
+sed -i.bak '/link:IMPLEMENTATION.adoc/d' "${rfd_root}/0001/README.adoc"
 rm "${rfd_root}/0001/README.adoc.bak"
 cat >>"${rfd_root}/0001/README.adoc" <<'EOF'
 
 ----
-link:IMPLEMENTATION.org[Example link]
+link:IMPLEMENTATION.adoc[Example link]
 ----
 EOF
 run_failure "RFD must link to its implementation checklist"
 
 reset_fixtures; write_valid_rfd prediscussion ""
-sed -i.bak '/link:IMPLEMENTATION.org/d' "${rfd_root}/0001/README.adoc"
+sed -i.bak '/link:IMPLEMENTATION.adoc/d' "${rfd_root}/0001/README.adoc"
 rm "${rfd_root}/0001/README.adoc.bak"
-printf '\n// link:IMPLEMENTATION.org[comment only]\n' >>"${rfd_root}/0001/README.adoc"
+printf '\n// link:IMPLEMENTATION.adoc[comment only]\n' >>"${rfd_root}/0001/README.adoc"
 run_failure "RFD must link to its implementation checklist"
 
 reset_fixtures; write_valid_rfd prediscussion ""
-sed -i.bak '/link:IMPLEMENTATION.org/d' "${rfd_root}/0001/README.adoc"
+sed -i.bak '/link:IMPLEMENTATION.adoc/d' "${rfd_root}/0001/README.adoc"
 rm "${rfd_root}/0001/README.adoc.bak"
-printf '\nlink:IMPLEMENTATION.org[truncated\n' >>"${rfd_root}/0001/README.adoc"
+printf '\nlink:IMPLEMENTATION.adoc[truncated\n' >>"${rfd_root}/0001/README.adoc"
 run_failure "RFD must link to its implementation checklist"
 
 reset_fixtures; write_valid_rfd prediscussion ""
-sed -i.bak '/link:IMPLEMENTATION.org/d' "${rfd_root}/0001/README.adoc"
+sed -i.bak '/link:IMPLEMENTATION.adoc/d' "${rfd_root}/0001/README.adoc"
 rm "${rfd_root}/0001/README.adoc.bak"
-printf '\nnolink:IMPLEMENTATION.org[not a link]\n' >>"${rfd_root}/0001/README.adoc"
+printf '\nnolink:IMPLEMENTATION.adoc[not a link]\n' >>"${rfd_root}/0001/README.adoc"
 run_failure "RFD must link to its implementation checklist"
 
 reset_fixtures; write_valid_rfd prediscussion ""
-sed -i.bak '/link:IMPLEMENTATION.org/d' "${rfd_root}/0001/README.adoc"
+sed -i.bak '/link:IMPLEMENTATION.adoc/d' "${rfd_root}/0001/README.adoc"
 rm "${rfd_root}/0001/README.adoc.bak"
-printf '\nA literal backtick is \\`; link:IMPLEMENTATION.org[visible].\n' >>"${rfd_root}/0001/README.adoc"
+printf '\nA literal backtick is \\`; link:IMPLEMENTATION.adoc[visible].\n' >>"${rfd_root}/0001/README.adoc"
 run_success
 
 reset_fixtures; write_valid_rfd prediscussion ""
-sed -i.bak '/link:IMPLEMENTATION.org/d' "${rfd_root}/0001/README.adoc"
+sed -i.bak '/link:IMPLEMENTATION.adoc/d' "${rfd_root}/0001/README.adoc"
 rm "${rfd_root}/0001/README.adoc.bak"
-printf '\n``link:IMPLEMENTATION.org[code only]``\n' >>"${rfd_root}/0001/README.adoc"
+printf '\n``link:IMPLEMENTATION.adoc[code only]``\n' >>"${rfd_root}/0001/README.adoc"
 run_failure "RFD must link to its implementation checklist"
 
 reset_fixtures; write_valid_rfd prediscussion ""
-sed -i.bak '/link:IMPLEMENTATION.org/d' "${rfd_root}/0001/README.adoc"
+sed -i.bak '/link:IMPLEMENTATION.adoc/d' "${rfd_root}/0001/README.adoc"
 rm "${rfd_root}/0001/README.adoc.bak"
-printf '\n`link:IMPLEMENTATION.org[code]`; link:IMPLEMENTATION.org[visible]\n' >>"${rfd_root}/0001/README.adoc"
+printf '\n`link:IMPLEMENTATION.adoc[code]`; link:IMPLEMENTATION.adoc[visible]\n' >>"${rfd_root}/0001/README.adoc"
 run_success
-
-reset_fixtures; write_valid_rfd prediscussion "" md
-sed -i.bak '/link:IMPLEMENTATION.md/d' "${rfd_root}/0001/README.adoc"
-rm "${rfd_root}/0001/README.adoc.bak"
-run_failure "RFD must link to its implementation checklist"
 
 reset_fixtures; write_valid_rfd draft ""
 run_failure "invalid state: draft"

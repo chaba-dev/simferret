@@ -17,7 +17,7 @@ measurements. Current progress lives in the implementation checklist, not here.
 | The proposal, the determinism, compatibility, and controllability needs it separates, what it excludes, and its acceptance criteria
 
 | Implementation checklist
-| link:../rfd/0004/IMPLEMENTATION.org[RFD 0004 implementation checklist]
+| link:../rfd/0004/IMPLEMENTATION.adoc[RFD 0004 implementation checklist]
 | Phase 0 (pin and validate the model), Phase 1 (identity, rejection, and migration), Phase 2 (contract and documentation), and the exit criteria
 
 | Pre-RFD measurement

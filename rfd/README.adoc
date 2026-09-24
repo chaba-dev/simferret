@@ -44,23 +44,24 @@ pull-request URL once discussion starts. `labels` is a comma-separated set of
 searchable topics. The document is the single source of truth for this metadata;
 the index intentionally does not duplicate it.
 
-Implementation progress lives separately in `rfd/NNNN/IMPLEMENTATION.org` or
-`rfd/NNNN/IMPLEMENTATION.md`; the implementation checklist must use exactly one
-of these formats. Its first line is `#+TITLE: RFD NNNN implementation checklist`
-for Org or `# RFD NNNN implementation checklist` for Markdown. The checklist
-contains the standalone sentence `Implements [[file:README.adoc][...]].` for Org
-or `Implements [...](README.adoc).` for Markdown. The RFD links with
-`link:IMPLEMENTATION.org[...]` or
-`link:IMPLEMENTATION.md[...]`. The RFD and checklist thus link to each other,
+Implementation progress lives separately in `rfd/NNNN/IMPLEMENTATION.adoc`; it
+is the only implementation checklist format. Its first line is
+`= RFD NNNN implementation checklist`, and it contains the standalone sentence
+`Implements link:README.adoc[...].`. The RFD links with
+`link:IMPLEMENTATION.adoc[...]`. The RFD and checklist thus link to each other,
 keeping the design and decision record stable while implementation tasks are
-checked off. The index at `rfd/README.adoc` links to every RFD with
+checked off. Each phase records its status in a `Status: DONE.` or
+`Status: TODO.` line, which documents the phase and does not set the RFD's
+state. The index at `rfd/README.adoc` links to every RFD with
 `link:NNNN/README.adoc[...]`.
 
-Checklist tasks use `-`, `+`, or `*` bullets followed by `[ ]`, `[x]`, `[X]`,
-or Org's partial `[-]` state. Only `[x]` and `[X]` count as complete. Markdown
-tasks may be indented by up to three spaces; four-space indentation is treated
-as code. Examples that resemble tasks belong in fenced Markdown blocks or Org
-`SRC` or `EXAMPLE` blocks so they are excluded from status totals.
+Checklist tasks are AsciiDoc checklist items: `*` bullets (`**` for nested
+tasks) followed by `[ ]`, `[x]`, or the alternate checked `[*]`, plus the
+project's partial `[-]` marker, which AsciiDoc renders as text. Only `[x]` and
+`[*]` count as complete; an uppercase `[X]`, which AsciiDoc does not recognize
+as a checkbox, is rejected. Examples that resemble tasks belong in listing
+(`----`), literal (`....`), or comment (`////`) blocks, in `//` line comments,
+or in inline code spans so they are excluded from status totals.
 
 == States
 
@@ -78,11 +79,10 @@ Implementation checklist progress does not determine the RFD's state.
 == Lifecycle
 
 Reserve the next unused four-digit number and create `rfd/NNNN/README.adoc` and
-one implementation checklist (`IMPLEMENTATION.org` or `IMPLEMENTATION.md`) on a
-branch. Cross-link the two documents. Use `prediscussion` while writing or
-`ideation` for a topic placeholder. When the document is ready for review, open
-a pull request, set the state to `discussion`, and add that pull request as the
-discussion URL.
+its `IMPLEMENTATION.adoc` checklist on a branch. Cross-link the two documents.
+Use `prediscussion` while writing or `ideation` for a topic placeholder. When
+the document is ready for review, open a pull request, set the state to
+`discussion`, and add that pull request as the discussion URL.
 
 Before merging a proposal that represents project direction, move it to
 `published`. Once the described work is entirely implemented, update it to

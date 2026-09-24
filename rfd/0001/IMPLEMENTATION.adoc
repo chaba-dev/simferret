@@ -1,0 +1,104 @@
+= RFD 0001 implementation checklist
+
+Implements link:README.adoc[RFD 1: Deterministic execution proof of concept].
+
+== Objective
+
+Prove exact record/replay of one bounded client/server execution with a
+controlled server restart, using the documented Rust/QEMU boundaries, before
+expanding SimFerret's application or fault surface.
+
+== Repository foundation
+
+Status: DONE.
+
+* [x] Create the Rust workspace and `simferret` binary target.
+
+== Delivery rules
+
+Each phase records its commands and decisive output. A phase is complete only when
+its automated checks pass from a clean checkout in the documented environment.
+New platform features discovered during the PoC are deferred unless they are
+required by an acceptance criterion in the RFD.
+
+== Phase 0 — Manual QEMU replay spike
+
+Status: DONE.
+
+* [x] Select and pin a QEMU version and minimal x86-64 Linux image.
+* [x] Boot the image under TCG with one vCPU and no uncontrolled network or
+  mutable host mounts.
+* [x] Record and replay a fixed guest command using QEMU `icount` record/replay.
+* [x] Verify replay twice and record any unsupported machine or device options.
+* [x] Save exact commands, durations, versions, and output digests in an evidence
+  document beside this checklist.
+
+== Phase 1 — Fixture and event protocol
+
+Status: DONE.
+
+* [x] Implement the minimal echo server, workload client, checker, and guest
+  agent.
+* [x] Define a versioned framed command and structured-event protocol for the
+  controlled host/guest channel.
+* [x] Define explicit normalization rules for non-semantic event fields.
+* [x] Test safety, controlled-outage, and bounded-liveness assertion evaluation
+  outside the VM.
+* [x] Require at least one request attempt while the server is stopped and a
+  bounded failed or unavailable result.
+* [x] Add an intentional response-corruption mode that proves property failures
+  propagate to a nonzero result.
+
+== Phase 2 — Rust record path
+
+Status: DONE.
+
+* [x] Parse the echo restart scenario and generate a stable choice plan from its
+  seed.
+* [x] Keep QEMU command-line and QMP interaction behind one VM adapter rather
+  than invoking QEMU from fixture or scenario code.
+* [x] Launch QEMU in record mode and drive the finite scenario without wall-clock
+  sleeps controlling semantic choices.
+* [x] Terminate and restart the server at an explicit recorded choice point.
+* [x] Persist the manifest, scenario, choice plan, replay log, normalized events,
+  assertion results, semantic outcome digest, and diagnostic logs atomically
+  under one run identifier.
+* [x] Print a replay command and return an exit status derived from assertions
+  and infrastructure health.
+
+== Phase 3 — Rust replay path
+
+Status: DONE.
+
+* [x] Validate artifact digests and environment compatibility before replay.
+* [x] Launch QEMU from the recorded initial state in replay mode.
+* [x] Detect early termination, hangs, surplus events, missing events, and event
+  divergence with an actionable first-difference report.
+* [x] Compare normalized event, assertion, and semantic outcome artifacts.
+* [x] Prove two consecutive replays produce byte-identical semantic artifacts.
+
+== Phase 4 — Acceptance and evidence
+
+Status: DONE.
+
+* [x] Automate the record-and-replay demonstration in a supported environment.
+* [x] Verify a different seed changes the materialized request or fault plan.
+* [x] Verify at least one request encounters the stopped server and reports a
+  bounded failed or unavailable result.
+* [x] Verify artifact or replay-identity tampering is rejected.
+* [x] Verify intentional fixture corruption fails its safety assertion and CLI
+  exit status.
+* [x] Record record/replay duration, artifact sizes, fidelity limitations, and
+  all observed divergence in `EVIDENCE.adoc`.
+* [x] Recommend one next increment without implementing it.
+
+== Exit criteria
+
+* [x] Every acceptance criterion in the RFD has linked automated or captured
+  evidence.
+* [x] The PoC can be demonstrated from a clean checkout without undocumented
+  interactive setup.
+* [x] The implementation uses the documented ownership boundaries rather than
+  invoking QEMU throughout fixture or scenario code.
+* [x] No custom VMM or broad QEMU fork exists without recorded evidence that an
+  upstream interface was insufficient.

@@ -430,7 +430,7 @@ probe is evidence that useful measurement can precede a representative service.
 
 == Implementation
 
-Delivery phases are tracked in link:IMPLEMENTATION.org[RFD 4 implementation checklist].
+Delivery phases are tracked in link:IMPLEMENTATION.adoc[RFD 4 implementation checklist].
 The pre-RFD measurement, its aggregate results, its caveats, and the commands
 that reproduce it are retained beside the probe in
 link:../../poc/time-model/EVIDENCE.adoc[the time-model evidence]; the raw
