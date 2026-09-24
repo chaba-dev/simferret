@@ -1,6 +1,6 @@
 :authors: Darwin Wu <tough.pasta0068@wunli88.com>
-:state: prediscussion
-:discussion:
+:state: discussion
+:discussion: https://github.com/chaba-dev/simferret/pull/49
 :labels: ci, product, replay
 
 = RFD 5 CI execution and historical results MVP
@@ -20,7 +20,7 @@ test verdict; upload status is reported separately.
 
 These product choices were agreed in the
 https://ampcode.com/threads/T-01a0ca68-a003-73a0-a12d-21735b1462ef[planning thread].
-This RFD remains prediscussion until its implementation contracts are reviewed;
+This RFD is under review before publication as project direction;
 the acceptance sequence below is a proposed way to deliver the agreed scope,
 not evidence of implemented capabilities.
 
