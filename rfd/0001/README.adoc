@@ -277,7 +277,7 @@ none is selected by this RFD.
 == Implementation
 
 Delivery phases are tracked in
-link:IMPLEMENTATION.org[RFD 1 implementation checklist], with measured results
+link:IMPLEMENTATION.adoc[RFD 1 implementation checklist], with measured results
 in the adjacent link:EVIDENCE.adoc[evidence record].
 
 == References

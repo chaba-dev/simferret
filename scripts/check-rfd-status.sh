@@ -67,84 +67,20 @@ adoc_has_checkbox() {
 			else if ($0 == delimiter) { blocked = 0; delimiter = "" }
 			next
 		}
-		!blocked && $0 ~ /^[[:space:]]*[-+*]+[[:space:]]+\[[ *xX-]\]([[:space:]]|$)/ { found = 1 }
+		!blocked && $0 !~ /^[[:space:]]*\/\// && $0 ~ /^[[:space:]]*[-*]+[[:space:]]+\[[ *xX-]\]([[:space:]]|$)/ { found = 1 }
 		END { exit !found }
 	' "$1"
 }
 
 implementation_has_backlink() {
-	local source="$1" format="$2"
-	awk -v format="${format}" '
-		function comment_opening(text, i, j, run, candidate, closing, slashes) {
-			for (i = 1; i <= length(text); i++) {
-				slashes = 0; for (j = i - 1; j > 0 && substr(text, j, 1) == "\\"; j--) slashes++
-				if (substr(text, i, 1) == "`" && slashes % 2 == 0) {
-					run = 0; while (substr(text, i + run, 1) == "`") run++
-					closing = 0
-					for (j = i + run; j <= length(text); j++) {
-						if (substr(text, j, 1) != "`") continue
-						candidate = 0; while (substr(text, j + candidate, 1) == "`") candidate++
-						if (candidate == run) { closing = j; break }
-						j += candidate - 1
-					}
-					if (closing) { i = closing + run - 1; continue }
-					i += run - 1; continue
-				}
-				if (substr(text, i, 4) == "<!--") return i
-			}
-			return 0
+	local source="$1"
+	awk '
+		$0 == "----" || $0 == "...." || $0 == "////" {
+			if (!blocked) { blocked = 1; delimiter = $0 }
+			else if ($0 == delimiter) { blocked = 0; delimiter = "" }
+			next
 		}
-		function markdown_visible(text, visible, opening, closing) {
-			if (html_comment) {
-				closing = index(text, "-->"); if (!closing) return ""
-				text = substr(text, closing + 3); html_comment = 0
-				while ((opening = comment_opening(text))) {
-					text = substr(text, opening + 4); closing = index(text, "-->")
-					if (!closing) { html_comment = 1; return "" }
-					text = substr(text, closing + 3)
-				}
-				return ""
-			}
-			visible = ""
-			while (1) {
-				opening = comment_opening(text)
-				if (!opening) return visible text
-				visible = visible substr(text, 1, opening - 1)
-				text = substr(text, opening + 4); closing = index(text, "-->")
-				if (!closing) { html_comment = 1; return visible }
-				text = substr(text, closing + 3)
-			}
-		}
-		{
-			lower = tolower($0)
-			if (format == "org" && !blocked && lower ~ /^[[:space:]]*#\+begin_(src|example|comment)([[:space:]]|$)/) {
-				blocked = 1; block_kind = lower; sub(/^[[:space:]]*#\+begin_/, "", block_kind); sub(/[[:space:]].*$/, "", block_kind); next
-			}
-			trimmed = lower; sub(/^[[:space:]]*/, "", trimmed); sub(/[[:space:]]*$/, "", trimmed)
-			if (format == "org" && blocked && trimmed == "#+end_" block_kind) { blocked = 0; block_kind = ""; next }
-			if (format == "md") {
-				line = $0; leading = 0
-				while (substr(line, leading + 1, 1) == " " && leading < 4) leading++
-				line = substr(line, leading + 1)
-				marker = substr(line, 1, 1)
-				if (leading <= 3 && (marker == "`" || marker == "~")) {
-					marker_length = 0
-					while (substr(line, marker_length + 1, 1) == marker) marker_length++
-					rest = substr(line, marker_length + 1)
-					if (!blocked && !html_comment && marker_length >= 3 && (marker == "~" || index(rest, "`") == 0)) {
-						blocked = 1; fence_marker = marker; fence_length = marker_length; next
-					}
-					if (blocked && marker == fence_marker && marker_length >= fence_length && rest ~ /^[[:space:]]*$/) {
-						blocked = 0; next
-					}
-				}
-				if (blocked) next
-				if (leading > 3 && !html_comment) next
-				line = markdown_visible(line); sub(/[[:space:]]*$/, "", line)
-			}
-			if (!blocked && format == "org" && $0 ~ /^Implements \[\[file:README\.adoc\]\[[^]]+\]\]\.$/) found = 1
-			if (!blocked && format == "md" && line ~ /^Implements \[[^]]+\]\(README\.adoc\)\.$/) found = 1
-		}
+		!blocked && $0 !~ /^[[:space:]]*\/\// && $0 ~ /^Implements link:README\.adoc\[[^]]+\]\.$/ { found = 1 }
 		END { exit !found }
 	' "${source}"
 }
@@ -299,124 +235,51 @@ for entry in "${entries[@]}"; do
 	number="$(printf '%s\n' "${entry_name}" | sed 's/^0*//')"
 	[[ -n "${number}" ]] || number="0"
 	task_summary="-"
-	implementations=()
-	[[ -f "${entry}/IMPLEMENTATION.org" ]] && implementations+=("${entry}/IMPLEMENTATION.org")
-	[[ -f "${entry}/IMPLEMENTATION.md" ]] && implementations+=("${entry}/IMPLEMENTATION.md")
-
-	if [[ "${#implementations[@]}" -eq 0 ]]; then
-		printf "%smissing implementation checklist%s: %s/IMPLEMENTATION.org or IMPLEMENTATION.md\n" "${color_red}" "${color_reset}" "${entry_name}" >&2
+	implementation="${entry}/IMPLEMENTATION.adoc"
+	if [[ ! -f "${implementation}" ]]; then
+		printf "%smissing implementation checklist%s: %s/IMPLEMENTATION.adoc\n" "${color_red}" "${color_reset}" "${entry_name}" >&2
 		failures=$((failures + 1))
-	elif [[ "${#implementations[@]}" -gt 1 ]]; then
-		printf "%smultiple implementation checklist formats%s: %s\n" "${color_red}" "${color_reset}" "${entry_name}" >&2
-		failures=$((failures + 1))
-	else
-		implementation="${implementations[0]}"
-		implementation_name="$(basename "${implementation}")"
+	fi
+	for retired in org md; do
+		if [[ -f "${entry}/IMPLEMENTATION.${retired}" ]]; then
+			printf "%sretired implementation checklist format%s: %s/IMPLEMENTATION.%s (use IMPLEMENTATION.adoc)\n" "${color_red}" "${color_reset}" "${entry_name}" "${retired}" >&2
+			failures=$((failures + 1))
+		fi
+	done
+	if [[ -f "${implementation}" ]]; then
+		implementation_name="IMPLEMENTATION.adoc"
 		read -r implementation_total implementation_completed implementation_invalid < <(
-			awk -v format="${implementation_name##*.}" '
-			  function comment_opening(text, i, j, run, candidate, closing, slashes) {
-			    for (i = 1; i <= length(text); i++) {
-			      slashes = 0; for (j = i - 1; j > 0 && substr(text, j, 1) == "\\"; j--) slashes++
-			      if (substr(text, i, 1) == "`" && slashes % 2 == 0) {
-			        run = 0; while (substr(text, i + run, 1) == "`") run++
-			        closing = 0
-			        for (j = i + run; j <= length(text); j++) {
-			          if (substr(text, j, 1) != "`") continue
-			          candidate = 0; while (substr(text, j + candidate, 1) == "`") candidate++
-			          if (candidate == run) { closing = j; break }
-			          j += candidate - 1
-			        }
-			        if (closing) { i = closing + run - 1; continue }
-			        i += run - 1; continue
-			      }
-			      if (substr(text, i, 4) == "<!--") return i
-			    }
-			    return 0
+			awk '
+			  $0 == "----" || $0 == "...." || $0 == "////" {
+			    if (!blocked) { blocked = 1; delimiter = $0 }
+			    else if ($0 == delimiter) { blocked = 0; delimiter = "" }
+			    next
 			  }
-			  function markdown_visible(text, visible, opening, closing) {
-			    if (html_comment) {
-			      closing = index(text, "-->"); if (!closing) return ""
-			      text = substr(text, closing + 3); html_comment = 0
-			      while ((opening = comment_opening(text))) {
-			        text = substr(text, opening + 4); closing = index(text, "-->")
-			        if (!closing) { html_comment = 1; return "" }
-			        text = substr(text, closing + 3)
-			      }
-			      return ""
-			    }
-			    visible = ""
-			    while (1) {
-			      opening = comment_opening(text)
-			      if (!opening) return visible text
-			      visible = visible substr(text, 1, opening - 1)
-			      text = substr(text, opening + 4); closing = index(text, "-->")
-			      if (!closing) { html_comment = 1; return visible }
-			      text = substr(text, closing + 3)
-			    }
-			  }
+			  !blocked && $0 ~ /^[[:space:]]*\/\// { next }
 			  {
-			    lower = tolower($0)
-			    if (format == "org" && !blocked && lower ~ /^[[:space:]]*#\+begin_(src|example|comment)([[:space:]]|$)/) {
-			      blocked = 1; block_kind = lower; sub(/^[[:space:]]*#\+begin_/, "", block_kind); sub(/[[:space:]].*$/, "", block_kind); next
-			    }
-			    trimmed = lower; sub(/^[[:space:]]*/, "", trimmed); sub(/[[:space:]]*$/, "", trimmed)
-			    if (format == "org" && blocked && trimmed == "#+end_" block_kind) { blocked = 0; block_kind = ""; next }
-			    if (format == "md") {
-			      line = $0; leading = 0
-			      while (substr(line, leading + 1, 1) == " " && leading < 4) leading++
-			      line = substr(line, leading + 1)
-			      marker = substr(line, 1, 1)
-			      if (leading <= 3 && (marker == "`" || marker == "~")) {
-			        marker_length = 0
-			        while (substr(line, marker_length + 1, 1) == marker) marker_length++
-			        rest = substr(line, marker_length + 1)
-			        if (!blocked && !html_comment && marker_length >= 3 && (marker == "~" || index(rest, "`") == 0)) {
-			          blocked = 1; fence_marker = marker; fence_length = marker_length; next
-			        }
-			        if (blocked && marker == fence_marker && marker_length >= fence_length && rest ~ /^[[:space:]]*$/) {
-			          blocked = 0; next
-			        }
-			      }
-			      if (blocked) next
-			      if (leading > 3 && !html_comment) next
-			      line = markdown_visible(line); sub(/[[:space:]]*$/, "", line)
-			    }
 			    if (blocked) next
-			    task = format == "md" ? line : $0
-			    if (format == "md") {
-			      if (task !~ /^[-+*][[:space:]]+\[[^]]\]([[:space:]]|$)/) next
-			      if (task !~ /^[-+*][[:space:]]+\[[ xX]\]([[:space:]]|$)/) {
-			        printf "  invalid Markdown task state: %s\n", task > "/dev/stderr"; invalid++; next
-			      }
-			    } else {
-			      if (task !~ /^[[:space:]]*[-+*][[:space:]]+\[[^]]\]([[:space:]]|$)/) next
-			      if (task !~ /^[[:space:]]*[-+*][[:space:]]+\[[ xX-]\]([[:space:]]|$)/) {
-			        printf "  invalid Org task state: %s\n", task > "/dev/stderr"; invalid++; next
-			      }
+			    task = $0
+			    if (task !~ /^[[:space:]]*[-*]+[[:space:]]+\[[^]]\]([[:space:]]|$)/) next
+			    if (task !~ /^[[:space:]]*[-*]+[[:space:]]+\[[ x*-]\]([[:space:]]|$)/) {
+			      printf "  invalid AsciiDoc task state: %s\n", task > "/dev/stderr"; invalid++; next
 			    }
 			    total++
-			    if (task ~ /^[[:space:]]*[-+*][[:space:]]+\[[xX]\]([[:space:]]|$)/) completed++
+			    if (task ~ /^[[:space:]]*[-*]+[[:space:]]+\[[x*]\]([[:space:]]|$)/) completed++
 			  }
 			  END { printf "%d %d %d\n", total, completed, invalid }
 			' "${implementation}"
 		)
 		failures=$((failures + implementation_invalid))
 		task_summary="${implementation_completed}/${implementation_total}"
-		case "${implementation_name}" in
-		IMPLEMENTATION.org)
-			expected_heading="#+TITLE: RFD ${entry_name} implementation checklist" ;;
-		IMPLEMENTATION.md)
-			expected_heading="# RFD ${entry_name} implementation checklist" ;;
-		esac
-		if [[ "$(head -n 1 "${implementation}")" != "${expected_heading}" ]]; then
+		if [[ "$(head -n 1 "${implementation}")" != "= RFD ${entry_name} implementation checklist" ]]; then
 			printf "%sinvalid implementation checklist heading%s: %s/%s\n" "${color_red}" "${color_reset}" "${entry_name}" "${implementation_name}" >&2
 			failures=$((failures + 1))
 		fi
-		if ! implementation_has_backlink "${implementation}" "${implementation_name##*.}"; then
+		if ! implementation_has_backlink "${implementation}"; then
 			printf "%simplementation checklist must link to its RFD%s: %s/%s\n" "${color_red}" "${color_reset}" "${entry_name}" "${implementation_name}" >&2
 			failures=$((failures + 1))
 		fi
-		if ! adoc_contains "${source}" "link:${implementation_name}["; then
+		if ! adoc_contains "${source}" "link:IMPLEMENTATION.adoc["; then
 			printf "%sRFD must link to its implementation checklist%s: %s/README.adoc\n" "${color_red}" "${color_reset}" "${entry_name}" >&2
 			failures=$((failures + 1))
 		fi

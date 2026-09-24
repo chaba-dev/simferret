@@ -128,4 +128,4 @@ deployments requires the owner's applicable authorization.
 
 == Implementation
 
-Progress is tracked in link:IMPLEMENTATION.org[RFD 5 implementation checklist].
+Progress is tracked in link:IMPLEMENTATION.adoc[RFD 5 implementation checklist].

@@ -336,7 +336,7 @@ single-guest scenario isolates the network replay question first.
 == Implementation
 
 Delivery phases are tracked in
-link:IMPLEMENTATION.org[RFD 2 implementation checklist], with preliminary
+link:IMPLEMENTATION.adoc[RFD 2 implementation checklist], with preliminary
 results in the adjacent link:EVIDENCE.adoc[evidence record].
 
 == References
