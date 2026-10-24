@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RFD 3 Phase 0 spike prototype for OCI normalization and canonical identity.
+"""RFD 20 Phase 0 spike prototype for OCI normalization and canonical identity.
 
 This is throwaway spike code. The Phase 1 Rust assembler replaces it. The
 prototype exists to answer the Phase 0 questions about layer semantics, digest

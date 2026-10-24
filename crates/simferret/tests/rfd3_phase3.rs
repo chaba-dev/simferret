@@ -1,4 +1,4 @@
-//! RFD 3 Phase 3 acceptance: the workload-driven scenario and the host checker.
+//! RFD 20 Phase 3 acceptance: the workload-driven scenario and the host checker.
 //!
 //! The complete record and passive-replay pipeline is exercised end to end in
 //! `run.rs`'s unit tests against a deterministic fake VM, and the checked-in

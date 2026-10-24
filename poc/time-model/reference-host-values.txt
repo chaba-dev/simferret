@@ -1,11 +1,11 @@
-# SimFerret pinned time-model reference values (RFD 4 Phase 0).
+# SimFerret pinned time-model reference values (RFD 21 Phase 0).
 #
 # The guest measurements, the artifact identities, and the model below were
 # produced by `scripts/time-model-probe.sh` under the pinned model on the
 # reference x86-64 Linux host (AMD Ryzen 5 3600, 12 threads, Linux 6.18.41),
 # with the pinned QEMU 11.1.0, the pinned guest kernel 6.18.49, and the
 # initramfs the probe builds from `poc/time-model/probe.c`. The run, its
-# deadline, and its reason are recorded in `rfd/0004/EVIDENCE.adoc`.
+# deadline, and its reason are recorded in RFD 21's evidence (https://chaba-rfds.pages.dev/rfd/0021/).
 #
 # `scripts/time-model-gate.sh` compares a host's validation run against these
 # values. They are exact rather than tolerances: the RFD requires the guest
@@ -25,7 +25,7 @@
 # practice a `flake.lock` update that moves either), to the model in
 # `crates/simferret/src/vm.rs`, or to the probe source makes these values stale.
 # Re-measure on the reference host, re-record them here and in
-# `rfd/0004/EVIDENCE.adoc`, and let the gate re-validate every host in the
+# RFD 21's evidence (https://chaba-rfds.pages.dev/rfd/0021/), and let the gate re-validate every host in the
 # supported matrix. Until then the gate fails, which is the intended outcome: a
 # host that cannot complete under the pinned model is an unsupported execution
 # rather than a reason to fall back to another model.

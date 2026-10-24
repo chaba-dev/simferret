@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the representative local OCI image layouts used by the RFD 3 Phase 0
+"""Build the representative local OCI image layouts used by the RFD 20 Phase 0
 spike.
 
 This is throwaway spike code and is deliberately independent of the prototype

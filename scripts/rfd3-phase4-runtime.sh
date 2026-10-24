@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RFD 3 phase 4 guest-visible conformance tests.
+# RFD 20 phase 4 guest-visible conformance tests.
 #
 # The conformance check assembles a real OCI layout, extracts its encoded guest
 # template, and runs a workload that changes root and drops to nonzero
@@ -15,11 +15,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
-  echo "The RFD 3 Phase 4 conformance tests support x86-64 Linux only." >&2
+  echo "The RFD 20 Phase 4 conformance tests support x86-64 Linux only." >&2
   exit 1
 fi
 if [[ "$(id -u)" -ne 0 ]]; then
-  echo "The RFD 3 Phase 4 conformance tests require root (chroot, setuid, mknod)." >&2
+  echo "The RFD 20 Phase 4 conformance tests require root (chroot, setuid, mknod)." >&2
   echo "Run: sudo env \"PATH=\$PATH\" SIMFERRET_BUSYBOX=\"\$SIMFERRET_BUSYBOX\" $0" >&2
   exit 1
 fi
@@ -60,12 +60,12 @@ for line in sys.stdin:
         print(message["executable"])
 ' | tail -1
   )"; then
-    echo "cargo could not build the RFD 3 Phase 4 test binary." >&2
+    echo "cargo could not build the RFD 20 Phase 4 test binary." >&2
     exit 1
   fi
 fi
 if [[ -z "$binary" || ! -x "$binary" ]]; then
-  echo "Cannot locate the RFD 3 Phase 4 test binary." >&2
+  echo "Cannot locate the RFD 20 Phase 4 test binary." >&2
   exit 1
 fi
 

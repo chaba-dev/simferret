@@ -24,7 +24,7 @@ const MEMORY_MIB: u32 = 128;
 /// The QEMU time model that record and replay both launch. `shift=auto` lets
 /// QEMU adjust the virtual CPU speed against host real time.
 ///
-/// RFD 4 pins `shift=4,sleep=off`: a fixed scale, so the guest's virtual time
+/// RFD 21 pins `shift=4,sleep=off`: a fixed scale, so the guest's virtual time
 /// advances with the instructions it executes and its idle timers advance
 /// deterministically rather than with host scheduling, and no idle sleep, so the
 /// guest's clock is not paced by the host either.
@@ -37,7 +37,7 @@ const MEMORY_MIB: u32 = 128;
 /// so a recording can be driven. It is carried until upstream includes the fix,
 /// and dropping it is a versioned change: recordings made under a different
 /// emulator are not comparable, and every host in the supported matrix must be
-/// re-validated. `rfd/0004/EVIDENCE.adoc` records the measurement, the pin, and
+/// re-validated. RFD 21's evidence (https://chaba-rfds.pages.dev/rfd/0021/) records the measurement, the pin, and
 /// the spike that established the patch.
 ///
 /// Changing this value is a versioned change for the same reason: the model is
@@ -1872,7 +1872,7 @@ mod tests {
 
     #[test]
     fn record_and_replay_launch_the_configured_time_model() {
-        // The literal is the model the product launches. It is pinned by RFD 4
+        // The literal is the model the product launches. It is pinned by RFD 21
         // and reaches QEMU through the pinned emulator, which carries the
         // replay-flush patch `sleep=off` needs; changing either the value or the
         // emulator is a versioned change that also updates this assertion and

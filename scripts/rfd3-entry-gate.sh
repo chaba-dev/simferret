@@ -6,7 +6,7 @@ output_root="${SIMFERRET_RFD3_ENTRY_OUTPUT:-$repo_root/.poc/rfd3-entry-gate}"
 cc="${CC:-cc}"
 
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
-  echo "The RFD 3 entry gate supports x86-64 Linux only." >&2
+  echo "The RFD 20 entry gate supports x86-64 Linux only." >&2
   exit 1
 fi
 for command in "$cc" python3; do

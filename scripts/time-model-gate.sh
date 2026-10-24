@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# SimFerret pinned time-model gate (RFD 4 Phase 0).
+# SimFerret pinned time-model gate (RFD 21 Phase 0).
 #
 # The time-model probe reports variation rather than failing on it, because
 # variation is the finding it exists to detect. This gate is the opposite: it
@@ -18,7 +18,7 @@ set -euo pipefail
 # initramfs, and one measurement per metric. The product launches this model:
 # `TIME_MODEL` in `crates/simferret/src/vm.rs` pins it, and the pinned emulator the
 # flake builds carries the replay-flush patch `sleep=off` needs, so a recording can
-# be driven. `rfd/0004/EVIDENCE.adoc` records the measurement, the pin, and the
+# be driven. RFD 21's evidence (https://chaba-rfds.pages.dev/rfd/0021/) records the measurement, the pin, and the
 # resolution.
 #
 # The deadline and the sample size are the RFD's acceptance rule, not the

@@ -1,4 +1,4 @@
-//! RFD 3 Phase 1 acceptance: the typed workload specification and canonical
+//! RFD 20 Phase 1 acceptance: the typed workload specification and canonical
 //! assembler.
 //!
 //! The suite builds standalone binary and local OCI image-layout sources,

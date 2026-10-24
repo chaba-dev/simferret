@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Focused regression tests for the RFD 3 Phase 0 workload and OCI spike.
+# Focused regression tests for the RFD 20 Phase 0 workload and OCI spike.
 #
 # The QEMU invocation is faked so the orchestration, source-removal, and
 # replay-comparison behavior is exercised quickly. The prototype's layer
@@ -733,4 +733,4 @@ for supervisor_case in writer silent; do
     "$supervisor_root/$supervisor_case.stdout"
 done
 
-printf 'RFD 3 Phase 0 spike regression tests passed.\n'
+printf 'RFD 20 Phase 0 spike regression tests passed.\n'

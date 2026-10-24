@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# RFD 3 Phase 0 workload and OCI spike.
+# RFD 20 Phase 0 workload and OCI spike.
 #
 # Builds one external static executable and two local OCI image layouts, applies
 # representative base and upper layers twice into stable canonical trees,
@@ -31,7 +31,7 @@ complete=false
 
 report_incomplete() {
   if [[ "$complete" != true && -n "$output_dir" ]]; then
-    echo "RFD 3 Phase 0 spike failed; diagnostics: $output_dir" >&2
+    echo "RFD 20 Phase 0 spike failed; diagnostics: $output_dir" >&2
   fi
 }
 
@@ -63,14 +63,14 @@ json_field() {
 }
 
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
-  echo "The RFD 3 Phase 0 spike supports x86-64 Linux only." >&2
+  echo "The RFD 20 Phase 0 spike supports x86-64 Linux only." >&2
   exit 1
 fi
 validate_positive_duration SIMFERRET_QEMU_TIMEOUT "$qemu_timeout"
 validate_positive_duration SIMFERRET_QEMU_KILL_AFTER "$qemu_kill_after"
 require_file SIMFERRET_KERNEL "$kernel"
-require_file "RFD 3 workload fixture" "$fixture_source"
-require_file "RFD 3 supervisor" "$supervisor_source"
+require_file "RFD 20 workload fixture" "$fixture_source"
+require_file "RFD 20 supervisor" "$supervisor_source"
 
 for command in "$qemu" "$static_cc" "$dynamic_cc" "$python" "$readelf" cpio gzip mktemp sha256sum timeout; do
   if ! command -v "$command" >/dev/null 2>&1; then

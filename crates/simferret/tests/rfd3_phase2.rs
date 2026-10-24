@@ -2,7 +2,7 @@
 // only there. The checked-in script runs it as PID 1 in a fresh PID namespace.
 #![cfg(target_os = "linux")]
 
-//! RFD 3 Phase 2 acceptance: the guest process runtime.
+//! RFD 20 Phase 2 acceptance: the guest process runtime.
 //!
 //! The runtime changes the child root, drops to nonzero credentials, and
 //! creates the overlay device nodes, so these tests require root. They skip

@@ -1,4 +1,4 @@
-//! RFD 3 Phase 1: typed workload specification and canonical assembler.
+//! RFD 20 Phase 1: typed workload specification and canonical assembler.
 //!
 //! One standalone static binary or one local `linux/amd64` OCI image layout is
 //! normalized into one content-addressed guest workload: a canonical filesystem

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RFD 3 Phase 3 acceptance: workload-driven scenario and passive replay.
+# RFD 20 Phase 3 acceptance: workload-driven scenario and passive replay.
 #
 # Builds one external static fixture and one dynamically linked fixture, packages
 # the static fixture as both a standalone binary workload and a local OCI image
@@ -28,7 +28,7 @@ store_name=".workload-store"
 interpreter_path="/lib64/ld-linux-x86-64.so.2"
 
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
-  echo "RFD 3 phase 3 acceptance supports x86-64 Linux only." >&2
+  echo "RFD 20 phase 3 acceptance supports x86-64 Linux only." >&2
   exit 1
 fi
 if [[ -z "$kernel" || ! -f "$kernel" ]]; then

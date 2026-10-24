@@ -1,4 +1,4 @@
-//! RFD 3 Phase 2: the guest process runtime.
+//! RFD 20 Phase 2: the guest process runtime.
 //!
 //! The agent stays PID 1 outside an immutable workload template. For every
 //! invocation it materializes a fresh writable root from that template, applies

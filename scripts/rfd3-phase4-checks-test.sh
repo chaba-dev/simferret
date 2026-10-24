@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression harness for the RFD 3 Phase 4 evidence checks.
+# Regression harness for the RFD 20 Phase 4 evidence checks.
 #
 # The acceptance script must fail closed: an unreadable tree, a failed
 # measurement producer, a leaked canary in either encoding, an unexpected file
@@ -421,4 +421,4 @@ expect_fail "a negative value" \
 expect_fail "a non-numeric value" \
   "is not a nonnegative integer" require_nonnegative_integers "measurement" 1 unknown
 
-printf 'RFD 3 phase 4 evidence check regression tests passed.\n'
+printf 'RFD 20 phase 4 evidence check regression tests passed.\n'

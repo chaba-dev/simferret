@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RFD 3 phase 2 guest process runtime tests.
+# RFD 20 phase 2 guest process runtime tests.
 #
 # The runtime changes the child root, drops to nonzero credentials, and creates
 # the overlay device nodes, so these tests require root. The guest-wide cleanup
@@ -14,11 +14,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
-  echo "The RFD 3 Phase 2 runtime tests support x86-64 Linux only." >&2
+  echo "The RFD 20 Phase 2 runtime tests support x86-64 Linux only." >&2
   exit 1
 fi
 if [[ "$(id -u)" -ne 0 ]]; then
-  echo "The RFD 3 Phase 2 runtime tests require root (chroot, setuid, mknod)." >&2
+  echo "The RFD 20 Phase 2 runtime tests require root (chroot, setuid, mknod)." >&2
   echo "Run: sudo env \"PATH=\$PATH\" SIMFERRET_BUSYBOX=\"\$SIMFERRET_BUSYBOX\" $0" >&2
   exit 1
 fi
@@ -56,7 +56,7 @@ for line in sys.stdin:
 ' | tail -1)"
 fi
 if [[ -z "$binary" || ! -x "$binary" ]]; then
-  echo "Cannot locate the RFD 3 Phase 2 test binary." >&2
+  echo "Cannot locate the RFD 20 Phase 2 test binary." >&2
   exit 1
 fi
 
