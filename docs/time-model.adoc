@@ -17,7 +17,7 @@ measurements. Current progress lives in the implementation checklist, not here.
 | The proposal, the determinism, compatibility, and controllability needs it separates, what it excludes, and its acceptance criteria
 
 | Implementation checklist
-| link:https://chaba-rfds.pages.dev/rfd/0021/[RFD 21 implementation checklist]
+| link:https://github.com/chaba-dev/simferret/blob/83ebd1fadc50cf391a8e8002939a69870335ec7e/rfd/0004/IMPLEMENTATION.adoc[RFD 21 implementation checklist]
 | Phase 0 (pin and validate the model), Phase 1 (identity, rejection, and migration), Phase 2 (contract and documentation), and the exit criteria
 
 | Pre-RFD measurement
@@ -25,7 +25,7 @@ measurements. Current progress lives in the implementation checklist, not here.
 | The exploratory probe results under `shift=auto`, `shift=auto,sleep=off`, `shift=7`, `shift=7,sleep=off`, and `shift=4,sleep=off`, with their caveats and the exploratory `shift=10` observation
 
 | Implementation evidence
-| link:https://chaba-rfds.pages.dev/rfd/0021/[RFD 21 evidence]
+| link:https://github.com/chaba-dev/simferret/blob/83ebd1fadc50cf391a8e8002939a69870335ec7e/rfd/0004/EVIDENCE.adoc[RFD 21 evidence]
 | The pinned-scale selection and its reason, the Phase 0 validation on the reference host, the record-mode limitation that the pinned emulator's carried patch resolves, and the re-validation trigger
 
 | Validation gate
@@ -110,12 +110,12 @@ reports variation instead of failing on it:
   arrival timing of live host input has no deterministic position in guest virtual
   time; both are separate work.is carried by the pinned emulator and adopted by the product. The measurement, the models it
   was compared against, and the source-level cause are in
-  link:https://chaba-rfds.pages.dev/rfd/0021/[RFD 21 evidence], and
+  link:https://github.com/chaba-dev/simferret/blob/83ebd1fadc50cf391a8e8002939a69870335ec7e/rfd/0004/EVIDENCE.adoc[RFD 21 evidence], and
   `scripts/time-model-input-probe.sh` reproduces them. Continuous integration
   asserts that known result, so a QEMU change that fixes it fails the job
   instead of going unnoticed.
 * The limitation is one early return in QEMU, and the spike recorded in
-  link:https://chaba-rfds.pages.dev/rfd/0021/[RFD 21 evidence] shows that moving the flush
+  link:https://github.com/chaba-dev/simferret/blob/83ebd1fadc50cf391a8e8002939a69870335ec7e/rfd/0004/EVIDENCE.adoc[RFD 21 evidence] shows that moving the flush
   ahead of it makes the pinned model record and replay: the product's record and
   two replays then match, with the same normalized events, assertions, and
   semantic outcome digest as the model in use. Adopting that patch is a project

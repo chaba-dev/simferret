@@ -659,7 +659,7 @@ if [[ -n "$expectation" ]]; then
     echo "The experiment is inconclusive: $inconclusive_reason." >&2
   elif [[ "$expectation" == "not-delivered" ]]; then
     echo "Input delivery under the pinned model may unblock the pin: re-measure and" >&2
-    echo "re-record RFD 21's evidence (https://chaba-rfds.pages.dev/rfd/0021/) before changing the model the product launches." >&2
+    echo "re-record RFD 21's evidence (https://github.com/chaba-dev/simferret/blob/83ebd1fadc50cf391a8e8002939a69870335ec7e/rfd/0004/EVIDENCE.adoc) before changing the model the product launches." >&2
   fi
   echo "Artifacts: $output_dir" >&2
   exit 1

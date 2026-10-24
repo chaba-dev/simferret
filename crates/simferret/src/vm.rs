@@ -37,7 +37,7 @@ const MEMORY_MIB: u32 = 128;
 /// so a recording can be driven. It is carried until upstream includes the fix,
 /// and dropping it is a versioned change: recordings made under a different
 /// emulator are not comparable, and every host in the supported matrix must be
-/// re-validated. RFD 21's evidence (https://chaba-rfds.pages.dev/rfd/0021/) records the measurement, the pin, and
+/// re-validated. RFD 21's evidence (https://github.com/chaba-dev/simferret/blob/83ebd1fadc50cf391a8e8002939a69870335ec7e/rfd/0004/EVIDENCE.adoc) records the measurement, the pin, and
 /// the spike that established the patch.
 ///
 /// Changing this value is a versioned change for the same reason: the model is

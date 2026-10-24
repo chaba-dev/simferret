@@ -18,7 +18,7 @@ set -euo pipefail
 # initramfs, and one measurement per metric. The product launches this model:
 # `TIME_MODEL` in `crates/simferret/src/vm.rs` pins it, and the pinned emulator the
 # flake builds carries the replay-flush patch `sleep=off` needs, so a recording can
-# be driven. RFD 21's evidence (https://chaba-rfds.pages.dev/rfd/0021/) records the measurement, the pin, and the
+# be driven. RFD 21's evidence (https://github.com/chaba-dev/simferret/blob/83ebd1fadc50cf391a8e8002939a69870335ec7e/rfd/0004/EVIDENCE.adoc) records the measurement, the pin, and the
 # resolution.
 #
 # The deadline and the sample size are the RFD's acceptance rule, not the
