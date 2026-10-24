@@ -402,7 +402,6 @@ Jujutsu. To enter the environment directly, run
 Run repository commands through the development environment:
 
 ```shell
-make check-rfds
 nix --extra-experimental-features 'nix-command flakes' flake check
 .agents/dev cargo fmt --all -- --check
 .agents/dev cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
