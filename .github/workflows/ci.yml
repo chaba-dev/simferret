@@ -25,7 +25,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - run: make check-rfds
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
           install_url: https://releases.nixos.org/nix/nix-2.35.1/install
@@ -41,7 +40,6 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - run: make check-rfds
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
           install_url: https://releases.nixos.org/nix/nix-2.35.1/install
@@ -62,7 +60,7 @@ jobs:
       - run: nix develop --command ./scripts/time-model-gate-test.sh
       - run: nix develop --command ./scripts/rfd3-phase0-spike-test.sh
       - run: nix develop --command ./scripts/rfd3-phase1-evidence.sh
-      - name: RFD 3 phase 2 guest runtime
+      - name: RFD 20 phase 2 guest runtime
         # The runtime changes root, drops credentials, and creates device nodes,
         # and its guest-wide cleanup barrier needs a private PID namespace, so
         # the test binary is built unprivileged and then run as PID 1 under sudo.
@@ -77,7 +75,7 @@ jobs:
           nix develop --command sudo --preserve-env=PATH,SIMFERRET_BUSYBOX \
             env SIMFERRET_PHASE2_TEST_BINARY="$binary" \
             ./scripts/rfd3-phase2-runtime.sh
-      - name: RFD 3 phase 4 guest-visible conformance
+      - name: RFD 20 phase 4 guest-visible conformance
         # The conformance check changes root, drops credentials, and creates
         # device nodes, and its guest-wide cleanup barrier needs a private PID
         # namespace, so the test binary is built unprivileged and then run as

@@ -32,7 +32,7 @@
         # The pinned emulator, built from the repository's patch rather than from
         # a second expression: `sleep=off` needs the replay flush the patch
         # restores, and only the system target the project runs is built.
-        # `rfd/0004/README.adoc` records why it is carried and what dropping it
+        # RFD 21 (https://chaba-rfds.pages.dev/rfd/0021/) records why it is carried and what dropping it
         # means.
         qemuPinned = (pkgs.qemu.override {
           hostCpuTargets = [ "x86_64-softmmu" ];

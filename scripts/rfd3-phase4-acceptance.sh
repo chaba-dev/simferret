@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RFD 3 Phase 4 acceptance: unprivileged acceptance and evidence.
+# RFD 20 Phase 4 acceptance: unprivileged acceptance and evidence.
 #
 # Runs the checked-in Phase 3 record-and-two-replay demonstration for the
 # standalone binary and both local OCI source forms, then adds the Phase 4
@@ -35,7 +35,7 @@ ambient_canary="SIMFERRET_PHASE4_AMBIENT_CANARY"
 ambient_value="ambient-canary-value"
 
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
-  echo "RFD 3 phase 4 acceptance supports x86-64 Linux only." >&2
+  echo "RFD 20 phase 4 acceptance supports x86-64 Linux only." >&2
   exit 1
 fi
 if [[ -z "$kernel" || ! -f "$kernel" ]]; then

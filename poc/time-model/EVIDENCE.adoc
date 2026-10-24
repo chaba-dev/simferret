@@ -129,7 +129,7 @@ The remaining measurements, with the value each configuration produced:
 |===
 
 `shift=10` is a separate observation from an earlier exploratory run, not from
-this probe: it used the RFD 3 workload fixture rather than `poc/time-model`, and
+this probe: it used the RFD 20 workload fixture rather than `poc/time-model`, and
 default `sleep` behavior. No guest output appeared within a 180-second deadline
 and the replay log reached 117 MB. Those raw artifacts were not retained. It
 therefore establishes only that no guest output was observed before the
@@ -205,7 +205,7 @@ and comparisons against runs 3 to 5 found 1,030 to 1,036 differing bytes.
 Equal size across five runs is therefore not evidence of equal content, and the
 raw replay log is not a suitable identity for comparing independent recordings.
 The payloads of the differing regions were not decoded, so their meaning is
-undetermined. This is consistent with RFD 2's evidence, which already records
+undetermined. This is consistent with RFD 19's evidence, which already records
 that replay-log size and wall-clock duration vary across recordings and hosts
 and that they are measurements rather than replay identity.
 

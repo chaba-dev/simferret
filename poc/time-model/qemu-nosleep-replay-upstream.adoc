@@ -11,7 +11,7 @@ It is a draft for the project owner to send, and nothing here has been
 submitted: the `Signed-off-by` trailer is the submitter's to add, and the
 proposed regression test is a proposal rather than something this repository
 can run, because it lives in QEMU's own test suite. The measurements it cites
-are recorded in link:../../rfd/0004/EVIDENCE.adoc[RFD 4 evidence], and the runs
+are recorded in link:https://github.com/chaba-dev/simferret/blob/83ebd1fadc50cf391a8e8002939a69870335ec7e/rfd/0004/EVIDENCE.adoc[RFD 21 evidence], and the runs
 in the reproduction section were re-measured for this document against the
 pinned QEMU 11.1.0 with and without the patch.
 
@@ -224,7 +224,7 @@ guest's `READY`, stops the guest through QEMU's monitor, writes one line while
 the guest cannot be polling, resumes it, and reports whether the line arrived.
 The acknowledged stop and resume are what make a non-delivery claim causal
 rather than timing-dependent; the measurement is recorded in
-link:../../rfd/0004/EVIDENCE.adoc[RFD 4 evidence]. The checked-in commands are:
+link:https://github.com/chaba-dev/simferret/blob/83ebd1fadc50cf391a8e8002939a69870335ec7e/rfd/0004/EVIDENCE.adoc[RFD 21 evidence]. The checked-in commands are:
 
 [source,shell]
 ----
@@ -331,7 +331,7 @@ is data loss in record mode and a hang in replay mode rather than a delay.
   reference value exactly, and the product's record-and-two-replays run has
   normalized events, assertions, and semantic outcome digest byte-identical to
   the same run under the model in use
-  (link:../../rfd/0004/EVIDENCE.adoc[RFD 4 evidence]). The patch does not
+  (link:https://github.com/chaba-dev/simferret/blob/83ebd1fadc50cf391a8e8002939a69870335ec7e/rfd/0004/EVIDENCE.adoc[RFD 21 evidence]). The patch does not
   perturb what a recording contains beyond adding the input it was dropping.
 
 == Counter-arguments to expect
@@ -449,7 +449,7 @@ inherit its machinery:
 == References
 
 * link:qemu-nosleep-replay-flush.patch[`poc/time-model/qemu-nosleep-replay-flush.patch`]
-* link:../../rfd/0004/EVIDENCE.adoc[RFD 4 evidence]
+* link:https://github.com/chaba-dev/simferret/blob/83ebd1fadc50cf391a8e8002939a69870335ec7e/rfd/0004/EVIDENCE.adoc[RFD 21 evidence]
 * link:input-probe.c[`poc/time-model/input-probe.c`] and
   link:../../scripts/time-model-input-probe.sh[`scripts/time-model-input-probe.sh`]
 * Upstream sources cited: `accel/tcg/icount-common.c`,

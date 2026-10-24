@@ -1,5 +1,5 @@
 /*
- * Test-only workload for the RFD 3 Phase 0 supervisor cleanup regression.
+ * Test-only workload for the RFD 20 Phase 0 supervisor cleanup regression.
  *
  * The supervisor regression test execs this program as the primary guest
  * workload. It reads its mode from /mode inside the workload root and leaves a

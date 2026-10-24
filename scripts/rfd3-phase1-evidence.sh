@@ -7,7 +7,7 @@ cc="${CC:-cc}"
 binary="$repo_root/target/x86_64-unknown-linux-musl/release/simferret"
 
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
-  echo "The RFD 3 Phase 1 evidence run supports x86-64 Linux only." >&2
+  echo "The RFD 20 Phase 1 evidence run supports x86-64 Linux only." >&2
   exit 1
 fi
 for command in "$cc" python3 cargo du find jq sha256sum stat cmp; do

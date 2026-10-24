@@ -1,5 +1,5 @@
 /*
- * RFD 3 Phase 0 spike guest supervisor.
+ * RFD 20 Phase 0 spike guest supervisor.
  *
  * Boots one external workload inside a private chroot, feeds it a fixed command
  * sequence, drains its output while it runs, then kills and reaps every

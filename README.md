@@ -4,7 +4,7 @@ SimFerret is an experimental deterministic simulation platform for finding and
 reproducing failures in unmodified software.
 
 The project is currently in design and proof-of-concept development. See the
-[Requests for Discussion](rfd/README.adoc) for architecture decisions and
+[Requests for Discussion](https://chaba-rfds.pages.dev) for architecture decisions and
 implementation plans.
 
 ## Architecture
@@ -24,7 +24,7 @@ Rust owns scenario choices, VM lifecycle, artifacts, event normalization, and
 assertions. QEMU owns deterministic machine execution and its replay log. All
 guest-affecting host input crosses a recorded boundary; uncontrolled network,
 host filesystems, entropy, and wall clocks are outside the initial replay
-contract. [RFD 1](rfd/0001/README.adoc) records the architecture and
+contract. [RFD 18](https://chaba-rfds.pages.dev/rfd/0018/) records the architecture and
 defines the bounded echo/restart proof of concept.
 
 ## QEMU replay spike
@@ -112,7 +112,7 @@ under `.poc/phase4-acceptance/`. CI runs the same command on Ubuntu.
 
 ## Network replay spike
 
-The RFD 2 Phase 0 spike adds an explicit RTL8139 NIC with its option ROM
+The RFD 19 Phase 0 spike adds an explicit RTL8139 NIC with its option ROM
 disabled, restricted QEMU user networking, and a mandatory replay filter. It
 fetches content across the NIC, proves a peer-specific administrative outage,
 restores connectivity, passively replays the run twice after removing fixture
@@ -131,7 +131,7 @@ durations, identities, digests, serial output, and QEMU diagnostics under
 `.poc/qemu-network-replay-smoke/`. Set `SIMFERRET_NETWORK_REQUESTS` from 1
 through 1000 for bounded traffic-scaling experiments.
 
-## RFD 2 network scenario
+## RFD 19 network scenario
 
 The proof-of-concept scenario, choice-plan, and guest protocols remain at
 version 1. The seeded choice plan records
@@ -151,9 +151,9 @@ choice plan before launch, uses an empty adapter-owned TFTP directory for
 passive replay, and verifies normalized events, assertion bytes, and the
 semantic outcome digest on every replay.
 
-## RFD 3 workload packaging spike
+## RFD 20 workload packaging spike
 
-The RFD 3 Phase 0 spike packages an external executable instead of the built-in
+The RFD 20 Phase 0 spike packages an external executable instead of the built-in
 fixture. It compiles one static and one dynamically linked workload, builds
 local OCI image layouts that carry them, applies representative base and upper
 layers twice into one stable canonical filesystem digest, normalizes every
@@ -184,9 +184,9 @@ The suite also runs the guest supervisor's cleanup path as PID 1 of a private PI
 namespace, which needs unprivileged user namespaces or passwordless `sudo`; the
 test reports which one it used and fails if neither is available.
 
-## RFD 3 workload specification and canonical assembler
+## RFD 20 workload specification and canonical assembler
 
-The RFD 3 Phase 1 assembler replaces the Phase 0 prototype with a typed,
+The RFD 20 Phase 1 assembler replaces the Phase 0 prototype with a typed,
 versioned workload specification and a bounded canonical normalizer. A workload
 is one of two tagged source forms:
 
@@ -260,7 +260,7 @@ Phase 1 acceptance tests:
 .agents/dev cargo test --locked --workspace --all-targets --all-features
 ```
 
-## RFD 3 guest process runtime
+## RFD 20 guest process runtime
 
 The PID-1 agent supervises one packaged workload at a time. The immutable
 template is assembled below `/workload`, outside the agent, its tools, and the
@@ -308,9 +308,9 @@ sudo env "PATH=$PATH" SIMFERRET_BUSYBOX="$SIMFERRET_BUSYBOX" \
 
 Selecting the workload in `simferret run`, recording its identity in the run
 manifest, driving the live protocol from the scenario checker, and the recorded
-passive replay are implemented by the RFD 3 Phase 3 integration below.
+passive replay are implemented by the RFD 20 Phase 3 integration below.
 
-## RFD 3 workload scenario and passive replay
+## RFD 20 workload scenario and passive replay
 
 `simferret run` accepts an optional `--workload SPECIFICATION`. When it is
 present the scenario is parsed as the versioned workload-driven acceptance
@@ -344,9 +344,9 @@ after deleting the live source:
 ./scripts/rfd3-phase3-acceptance.sh
 ```
 
-## RFD 3 acceptance and evidence
+## RFD 20 acceptance and evidence
 
-The complete RFD 3 demonstration runs unprivileged on x86-64 Linux:
+The complete RFD 20 demonstration runs unprivileged on x86-64 Linux:
 
 ```shell
 .agents/dev ./scripts/rfd3-phase4-acceptance.sh
@@ -402,7 +402,6 @@ Jujutsu. To enter the environment directly, run
 Run repository commands through the development environment:
 
 ```shell
-make check-rfds
 nix --extra-experimental-features 'nix-command flakes' flake check
 .agents/dev cargo fmt --all -- --check
 .agents/dev cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings

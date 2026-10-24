@@ -1,4 +1,4 @@
-//! RFD 3 Phase 3: the host-side workload scenario checker.
+//! RFD 20 Phase 3: the host-side workload scenario checker.
 //!
 //! The guest runtime reports process and byte facts only. This module owns the
 //! application meaning of the recorded output frames: it reconstructs each

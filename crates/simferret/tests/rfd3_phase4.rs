@@ -4,7 +4,7 @@
 // exactly as the guest owns its process table.
 #![cfg(target_os = "linux")]
 
-//! RFD 3 Phase 4 acceptance: guest-visible conformance and input exclusion.
+//! RFD 20 Phase 4 acceptance: guest-visible conformance and input exclusion.
 //!
 //! Phase 1 proves the canonical view on the host and Phase 3 proves the packaged
 //! workload records and replays in the real guest. This suite closes the

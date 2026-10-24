@@ -20,5 +20,4 @@
 
 # RFDs
 
-- Follow the lifecycle and source conventions in `rfd/README.adoc`.
-- Keep design documents in `rfd/NNNN/README.adoc` and implementation progress in the adjacent `IMPLEMENTATION.adoc` file.
+- RFDs are published at https://chaba-rfds.pages.dev. Their source lives in the shared chaba-dev/rfds repository (https://github.com/chaba-dev/rfds), which is private to the organization; follow its lifecycle and source conventions there, not in this repository.

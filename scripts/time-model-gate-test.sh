@@ -316,7 +316,7 @@ EOF
 chmod +x "$test_root/fake-static-cc"
 
 # The gate validates the model the checked-in reference values were measured
-# under. That record must name the model RFD 4 pins, because the gate is the
+# under. That record must name the model RFD 21 pins, because the gate is the
 # Phase 0 acceptance gate for that model rather than for whatever the probe
 # happens to run.
 pinned_time_model="$(sed -n 's/^icount_options=//p' "$reference_source")"

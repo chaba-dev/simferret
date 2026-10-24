@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RFD 3 Phase 4 evidence checks.
+# RFD 20 Phase 4 evidence checks.
 #
 # The acceptance script and its regression harness share these checks, so the
 # harness proves the same code the acceptance run relies on. Every check treats
